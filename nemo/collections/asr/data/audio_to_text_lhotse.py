@@ -14,6 +14,7 @@
 
 from typing import Dict, Optional, Tuple
 
+import lhotse.lazy
 import torch.utils.data
 from lhotse import CutSet
 from lhotse.dataset import AudioSamples, CutMix
