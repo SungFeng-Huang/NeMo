@@ -1,10 +1,10 @@
 # @package _global_
 
 # to execute this experiment run:
-# python train.py experiment=local-1
+# python train.py experiment=a100/fix_time_emb
 
 defaults:
-  - a100
+  - /experiment/a100
 
 model:
   voicebox:
