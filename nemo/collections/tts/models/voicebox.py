@@ -279,6 +279,17 @@ class VoiceboxModel(TextToWaveform):
             else:
                 logging.info(f"Skipping fix, {subset} subset exists.")
 
+    def _download_gigaspeech(self, target_dir, dataset_parts):
+        """ Download LibriTTS corpus. """
+        from lhotse.recipes.gigaspeech import download_gigaspeech, prepare_gigaspeech
+        download_gigaspeech(password=self._cfg.password, target_dir=target_dir, dataset_parts=dataset_parts, host="tsinghua")
+
+    def _prepare_gigaspeech(self, corpus_dir, output_dir, textgrid_dir, dataset_parts):
+        from lhotse.recipes.gigaspeech import download_gigaspeech, prepare_gigaspeech
+        logging.info(f"mkdir -p {output_dir}")
+        os.makedirs(output_dir, exist_ok=True)
+        pass
+
     def prepare_data(self) -> None:
         """ Pytorch Lightning hook.
 
@@ -289,20 +300,19 @@ class VoiceboxModel(TextToWaveform):
         if self._cfg.ds_name == "libriheavy":
             self._download_libriheavy(target_dir=self._cfg.libriheavy_dir, dataset_parts=self._cfg.subsets)
             self._prepare_libriheavy(libriheavy_dir=self._cfg.libriheavy_dir, output_dir=self._cfg.manifests_dir, textgrid_dir=self._cfg.textgrid_dir, dataset_parts=self._cfg.subsets)
-        elif self._cfg.ds_name == "libritts":
-            def get_subset(manifest_filepath):
-                return '_'.join(manifest_filepath.split('/')[-1].split('.')[0].split('_')[2:])
-
+        else:
             dataset_parts = [
-                subset for subset in self._cfg.subsets 
-                if subset in [
-                    get_subset(self._cfg.train_ds.manifest_filepath),
-                    get_subset(self._cfg.validation_ds.manifest_filepath),
-                    get_subset(self._cfg.test_ds.manifest_filepath)
-                ]
+                self._cfg.train_ds.subset,
+                self._cfg.validation_ds.subset,
+                self._cfg.test_ds.subset
             ]
-            self._download_libritts(target_dir=self._cfg.corpus_dir, dataset_parts=dataset_parts)
-            self._prepare_libritts(corpus_dir=self._cfg.corpus_dir, output_dir=self._cfg.manifests_dir, textgrid_dir=self._cfg.textgrid_dir, dataset_parts=dataset_parts)
+            if self._cfg.ds_name == "libritts":
+                self._download_libritts(target_dir=self._cfg.corpus_dir, dataset_parts=dataset_parts)
+                self._prepare_libritts(corpus_dir=self._cfg.corpus_dir, output_dir=self._cfg.manifests_dir, textgrid_dir=self._cfg.textgrid_dir, dataset_parts=dataset_parts)
+            elif self._cfg.ds_name == "gigaspeech":
+                self._download_gigaspeech(target_dir=self._cfg.corpus_dir, dataset_parts=dataset_parts)
+                # self._prepare_gigaspeech(corpus_dir=self._cfg.corpus_dir, output_dir=self._cfg.manifests_dir, textgrid_dir=self._cfg.textgrid_dir, dataset_parts=dataset_parts)
+                exit()
 
     def setup(self, stage: Optional[str] = None):
         """Called at the beginning of fit, validate, test, or predict.

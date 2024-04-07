@@ -10,13 +10,6 @@ defaults:
 # this allows you to overwrite only specified parameters
 
 model:
-  librilight_dir: /datasets/LibriLight/
-  manifests_dir: data/parsed/LibriHeavy
-  libriheavy_dir: data/download/LibriHeavy
-  textgrid_dir: data/aligned/textgrids
-    
-  corpus_dir: ${.librilight_dir}
-    
   duration_predictor:
     depth: 8  # for english
 
@@ -35,8 +28,8 @@ model:
       max_steps: ${....trainer.max_steps}
 
   train_ds:
+    subset: large
     max_duration: 16 # ~1600 frames of paper settings
-    manifest_filepath: ${model.manifests_dir}/libriheavy_cuts_large.jsonl.gz
     lhotse:
       batch_duration: 600 # ~ 60k phones per batch
 
