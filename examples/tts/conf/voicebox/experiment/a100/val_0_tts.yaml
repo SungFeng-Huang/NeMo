@@ -4,16 +4,9 @@
 # python train.py experiment=a100/val_0_tts
 
 defaults:
-  - /experiment/a100
-
-model:
-  validation_ds:
-    min_duration: 4
-    max_duration: 8
-    lhotse:
-      batch_duration: 240
-
-  val_0_tts: True
+  - /experiment@_global_:
+    - a100
+    - tricks/val_0_tts
 
 # task name, determines output directory path
 task_name: "a100-val_0_tts"

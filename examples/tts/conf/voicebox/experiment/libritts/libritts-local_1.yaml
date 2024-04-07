@@ -11,11 +11,6 @@ defaults:
 # this allows you to overwrite only specified parameters
 
 model:
-  # manifests_dir: data/parsed/LibriTTS
-  # textgrid_dir: data/aligned/LibriTTS/textgrid
-  
-  # corpus_dir: data/download/LibriTTS/LibriTTS
-
   duration_predictor:
     depth: 4
     heads: 2

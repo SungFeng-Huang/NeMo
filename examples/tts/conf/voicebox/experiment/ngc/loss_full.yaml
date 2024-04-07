@@ -4,15 +4,12 @@
 # python train.py experiment=ngc
 
 defaults:
-  - ngc
+  - /experiment@_global_:
+    - ngc
+    - tricks/loss_full
 
 # all parameters below will be merged with parameters from default configurations set above
 # this allows you to overwrite only specified parameters
 
-model:
-  optim:
-    sched:
-      warmup_steps: 0
-
 # task name, determines output directory path
-task_name: "ngc-no_warmup"
+task_name: "ngc-loss_full"

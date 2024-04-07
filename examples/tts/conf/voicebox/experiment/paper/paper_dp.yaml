@@ -1,10 +1,10 @@
 # @package _global_
 
 # to execute this experiment run:
-# python train.py experiment=paper_eval
+# python train.py experiment=local-1
 
 defaults:
-  - default
+  - /experiment/default
 
 # all parameters below will be merged with parameters from default configurations set above
 # this allows you to overwrite only specified parameters
@@ -13,21 +13,25 @@ model:
   duration_predictor:
     depth: 8  # for english
 
-  init_from_ptl_ckpt:
-    model0:
-      path: ???
-      include:
-        - duration_predictor
-    model1:
-      path: ???
-      include:
-        - voicebox
+  freeze_updates:
+    enabled: True
+    modules:
+      voicebox: -1  # steps to freeze from start (-1: to the end)
+    
+  optim:
+    name: adam
+    lr: 1e-4
+
+    sched:
+      name: WarmupAnnealing
+      warmup_steps: 5000
+      max_steps: ${....trainer.max_steps}
 
   train_ds:
+    subset: large
     max_duration: 16 # ~1600 frames of paper settings
-    manifest_filepath: ${model.manifests_dir}/libriheavy_cuts_large.jsonl.gz
     lhotse:
-      batch_duration: 300
+      batch_duration: 600 # ~ 60k phones per batch
 
   validation_ds:
     lhotse:
@@ -40,17 +44,25 @@ model:
 trainer:
   devices: auto
   max_epochs: null
-  max_steps: 500000 # audio model steps
-  
-  gradient_clip_algorithm: norm
-  gradient_clip_val: .2
+  max_steps: 600000 # duration model steps
+
+exp_manager:
+  # save_dir = ${exp_dir}/${name}/${version}
+  exp_dir: null # defaults to ./nemo_experiments
+  name: ${task_name}
+  version: null # defaults to datetime
+
+  resume_if_exists: False
+  create_checkpoint_callback: True
+  # checkpoint_callback_params:
+  #   monitor: val_loss_total
 
 # task name, determines output directory path
 task_name: "paper"
 
 # set False to skip model training
-train: False
+train: True
 
 # evaluate on test set, using best model weights achieved during training
 # lightning chooses best weights based on the metric specified in checkpoint callback
-test: True
+test: False
