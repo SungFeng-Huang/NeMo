@@ -17,7 +17,7 @@ sample_rate: 16000
 train_ds:
   subset: "M"
   defer_setup: true
-  manifest_filepath: ${..manifests_dir}/${..ds_name}_cuts_${.subset}.jsonl.gz
+  manifest_filepath: ${..manifests_dir}/${..ds_name}_cuts_${.subset}.speech.jsonl.gz
   sample_rate: ${..sample_rate}
   batch_size: 16 # you may increase batch_size if your memory allows
   shuffle: true
@@ -46,7 +46,7 @@ train_ds:
 validation_ds:
   subset: "DEV"
   defer_setup: true
-  manifest_filepath: ${..manifests_dir}/${..ds_name}_cuts_${.subset}.jsonl.gz
+  manifest_filepath: ${..manifests_dir}/${..ds_name}_cuts_${.subset}.speech.jsonl.gz
   sample_rate: ${..sample_rate}
   batch_size: 16
   shuffle: false
@@ -75,7 +75,7 @@ validation_ds:
 test_ds:
   subset: "TEST"
   defer_setup: true
-  manifest_filepath: ${..manifests_dir}/${..ds_name}_cuts_${.subset}.jsonl.gz
+  manifest_filepath: ${..manifests_dir}/${..ds_name}_cuts_${.subset}.speech.jsonl.gz
   sample_rate: ${..sample_rate}
   batch_size: 16
   shuffle: false
