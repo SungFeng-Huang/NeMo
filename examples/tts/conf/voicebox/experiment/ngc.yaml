@@ -8,6 +8,7 @@ defaults:
     - default
     - tricks/size/ngc
     - tricks/adam_warmup
+    - tricks/gradient_clip
   - override /dataset: libriheavy-small
 
 # all parameters below will be merged with parameters from default configurations set above
@@ -21,10 +22,6 @@ model:
 
   ds_kwargs:
     num_workers: 8
-
-trainer:
-  gradient_clip_algorithm: norm
-  gradient_clip_val: .2
 
 exp_manager:
   checkpoint_callback_params:

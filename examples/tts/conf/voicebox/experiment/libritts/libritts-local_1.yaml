@@ -4,7 +4,10 @@
 # python train.py experiment=libritts/libritts-local_1
 
 defaults:
-  - default
+  - /experiment@_global_:
+    - default
+    - tricks/no_diffusion
+    - tricks/loss_full
   - override /dataset: libritts
 
 # all parameters below will be merged with parameters from default configurations set above
@@ -18,8 +21,6 @@ model:
   voicebox:
     depth: 4
     heads: 2
-    no_diffusion: True
-    loss_masked: False
     frac_lengths_mask: [0.3, 0.5]
 
   # cfm_wrapper:
