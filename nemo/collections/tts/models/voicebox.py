@@ -280,15 +280,44 @@ class VoiceboxModel(TextToWaveform):
                 logging.info(f"Skipping fix, {subset} subset exists.")
 
     def _download_gigaspeech(self, target_dir, dataset_parts):
-        """ Download LibriTTS corpus. """
+        """ Download GigaSpeech corpus. """
         from lhotse.recipes.gigaspeech import download_gigaspeech, prepare_gigaspeech
         download_gigaspeech(password=self._cfg.password, target_dir=target_dir, dataset_parts=dataset_parts, host="tsinghua")
 
     def _prepare_gigaspeech(self, corpus_dir, output_dir, textgrid_dir, dataset_parts):
         from lhotse.recipes.gigaspeech import download_gigaspeech, prepare_gigaspeech
+        from lhotse import CutSet
+
         logging.info(f"mkdir -p {output_dir}")
         os.makedirs(output_dir, exist_ok=True)
-        pass
+
+        gigaspeech_punctuations = ['<COMMA>', '<PERIOD>', '<QUESTIONMARK>', '<EXCLAMATIONPOINT>']
+        gigaspeech_garbage_utterance_tags = ['<SIL>', '<NOISE>', '<MUSIC>', '<OTHER>']
+
+        for subset in dataset_parts:
+            manifest_path = os.path.join(output_dir, f"gigaspeech_cuts_{subset}.jsonl.gz")
+            # prepare or load recordings/supervisions manifest
+            manifest = prepare_gigaspeech(corpus_dir=corpus_dir, dataset_parts=subset, output_dir=output_dir, num_jobs=self._cfg.ds_kwargs.num_workers)
+            
+            # turn into CutSet
+            manifest = manifest[subset]
+            cuts = CutSet.from_manifests(
+                recordings=manifest["recordings"],
+                supervisions=manifest["supervisions"],
+                output_path=None
+            )
+
+            # remove punctuations
+            for punctuation in gigaspeech_punctuations:
+                cuts = cuts.transform_text(lambda text: ' '.join(text.replace(punctuation, '').strip().split()))
+            # filter non-speech
+            cuts = cuts.filter_supervisions(lambda s: s.text not in gigaspeech_garbage_utterance_tags)
+
+            # trim cuts according to supervision segments
+            cuts = cuts.trim_to_supervisions(keep_overlapping=False)
+            
+            logging.info(f"Writing {subset} subset.")
+            cuts.to_file(manifest_path)
 
     def prepare_data(self) -> None:
         """ Pytorch Lightning hook.
@@ -302,16 +331,16 @@ class VoiceboxModel(TextToWaveform):
             self._prepare_libriheavy(libriheavy_dir=self._cfg.libriheavy_dir, output_dir=self._cfg.manifests_dir, textgrid_dir=self._cfg.textgrid_dir, dataset_parts=self._cfg.subsets)
         else:
             dataset_parts = [
-                self._cfg.train_ds.subset,
                 self._cfg.validation_ds.subset,
-                self._cfg.test_ds.subset
+                self._cfg.test_ds.subset,
+                self._cfg.train_ds.subset,
             ]
             if self._cfg.ds_name == "libritts":
                 self._download_libritts(target_dir=self._cfg.corpus_dir, dataset_parts=dataset_parts)
                 self._prepare_libritts(corpus_dir=self._cfg.corpus_dir, output_dir=self._cfg.manifests_dir, textgrid_dir=self._cfg.textgrid_dir, dataset_parts=dataset_parts)
             elif self._cfg.ds_name == "gigaspeech":
-                self._download_gigaspeech(target_dir=self._cfg.corpus_dir, dataset_parts=dataset_parts)
-                # self._prepare_gigaspeech(corpus_dir=self._cfg.corpus_dir, output_dir=self._cfg.manifests_dir, textgrid_dir=self._cfg.textgrid_dir, dataset_parts=dataset_parts)
+                # self._download_gigaspeech(target_dir=self._cfg.corpus_dir, dataset_parts=dataset_parts)
+                self._prepare_gigaspeech(corpus_dir=self._cfg.corpus_dir, output_dir=self._cfg.manifests_dir, textgrid_dir=self._cfg.textgrid_dir, dataset_parts=dataset_parts)
                 exit()
 
     def setup(self, stage: Optional[str] = None):
