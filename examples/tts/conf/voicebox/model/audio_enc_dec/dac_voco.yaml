@@ -1,4 +1,5 @@
-_target_: nemo.collections.tts.modules.voicebox_modules.EncodecVoco
+_target_: nemo.collections.tts.modules.voicebox_modules.DACVoco
 sampling_rate: 16000
-pretrained_vocos_path: '16khz'
+pretrained_path: '16khz'
 # bandwidth_id: 2
+factorized_latent: False

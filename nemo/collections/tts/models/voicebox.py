@@ -871,8 +871,10 @@ class VoiceboxModel(TextToWaveform):
     @torch.no_grad()
     def parse_input(self, batch):
         # voicebox's sampling rate
-        audio = batch["audio_24k"]
-        audio_lens = batch["audio_lens_24k"]
+        # audio = batch["audio_24k"]
+        # audio_lens = batch["audio_lens_24k"]
+        audio = batch["audio"]
+        audio_lens = batch["audio_lens"]
         tokens = batch["tokens"]
         token_lens = batch["token_lens"]
         texts = batch["texts"]
@@ -1001,8 +1003,10 @@ class VoiceboxModel(TextToWaveform):
         # for i in range(ori_mel.shape[0]):
         #     gen_mel[i, :] = out_spec[i, ori_mel_lens[i]:ori_mel_lens[i]+gen_mel.shape[1]]
 
-        ori_audio = batch["audio_24k"]
-        ori_audio_lens = batch["audio_lens_24k"]
+        # ori_audio = batch["audio_24k"]
+        # ori_audio_lens = batch["audio_lens_24k"]
+        ori_audio = batch["audio"]
+        ori_audio_lens = batch["audio_lens"]
         gen_audio = self.voicebox.audio_enc_dec.decode(gen_mel)
         gen_audio_lens = torch.clamp(ori_audio_lens, max=gen_audio.shape[-1])
 
@@ -1025,8 +1029,10 @@ class VoiceboxModel(TextToWaveform):
 
     def training_step(self, batch: List, batch_idx: int) -> STEP_OUTPUT:
         # voicebox's sampling rate
-        audio = batch["audio_24k"]
-        audio_lens = batch["audio_lens_24k"]
+        # audio = batch["audio_24k"]
+        # audio_lens = batch["audio_lens_24k"]
+        audio = batch["audio"]
+        audio_lens = batch["audio_lens"]
         tokens = batch["tokens"]
         token_lens = batch["token_lens"]
         texts = batch["texts"]
@@ -1078,8 +1084,10 @@ class VoiceboxModel(TextToWaveform):
             return self.val_vb_0_tts(batch, batch_idx)
 
         # voicebox's sampling rate
-        audio = batch["audio_24k"]
-        audio_lens = batch["audio_lens_24k"]
+        # audio = batch["audio_24k"]
+        # audio_lens = batch["audio_lens_24k"]
+        audio = batch["audio"]
+        audio_lens = batch["audio_lens"]
         tokens = batch["tokens"]
         token_lens = batch["token_lens"]
         texts = batch["texts"]

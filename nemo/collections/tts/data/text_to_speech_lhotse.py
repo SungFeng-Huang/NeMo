@@ -40,7 +40,8 @@ class LhotseTextToSpeechDataset(torch.utils.data.Dataset):
             'sample_id': NeuralType(tuple('B'), LengthsType(), optional=True),
         }
 
-    def __init__(self, normalizer=None, text_normalizer_call_kwargs=None, tokenizer=None, corpus_dir=None, textgrid_dir=None, use_word_postfix=False, use_word_ghost_silence=False, num_workers=0, load_audio=True):
+    def __init__(self, normalizer=None, text_normalizer_call_kwargs=None, tokenizer=None,
+                 corpus_dir=None, textgrid_dir=None, use_word_postfix=False, use_word_ghost_silence=False, num_workers=0, load_audio=True, sampling_rate=24000):
         super().__init__()
         self.tokenizer = tokenizer
 
@@ -76,6 +77,7 @@ class LhotseTextToSpeechDataset(torch.utils.data.Dataset):
 
         self.use_word_postfix = use_word_postfix
         self.use_word_ghost_silence = use_word_ghost_silence
+        self.sampling_rate = sampling_rate
 
     def change_prefix(self, cut):
         # Some corpus, e.g., LibriHeavy, whose manifest includes given path prefix, which might not match our folder structure.
@@ -156,16 +158,16 @@ class LhotseTextToSpeechDataset(torch.utils.data.Dataset):
         })
 
         if hasattr(self, 'load_audio'):
-            # audio, audio_lens, _cuts = self.load_audio(cuts)
+            audio, audio_lens, _cuts = self.load_audio(cuts.resample(self.sampling_rate))
             # audio_22050, audio_lens_22050, _cuts = self.load_audio(cuts.resample(22050))
-            audio_24k, audio_lens_24k, _cuts = self.load_audio(cuts.resample(24000))
+            # audio_24k, audio_lens_24k, _cuts = self.load_audio(cuts.resample(24000))
             batch.update({
-                # "audio": audio,
-                # "audio_lens": audio_lens,
+                "audio": audio,
+                "audio_lens": audio_lens,
                 # "audio_22050": audio_22050,
                 # "audio_lens_22050": audio_lens_22050,
-                "audio_24k": audio_24k,
-                "audio_lens_24k": audio_lens_24k,
+                # "audio_24k": audio_24k,
+                # "audio_lens_24k": audio_lens_24k,
             })
         else:
             _cuts = cuts

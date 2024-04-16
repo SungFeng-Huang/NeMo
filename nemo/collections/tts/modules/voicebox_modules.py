@@ -162,17 +162,17 @@ class EncodecVoco(_EncodecVoco, LightningModule):
         self.freeze()
 
 
-class DACVoco(AudioEncoderDecoder):
+class DACVoco(AudioEncoderDecoder, LightningModule):
     def __init__(
         self,
         *,
         sampling_rate = 16000,
-        pretrained_vocos_path = '16khz',
+        pretrained_path = '16khz',
         bandwidth_id = None,
         factorized_latent = False,
     ):
         super().__init__()
-        model_path = dac.utils.download(model_type="16khz")
+        model_path = dac.utils.download(model_type=pretrained_path)
         self.model = dac.DAC.load(model_path)
         self.sampling_rate = sampling_rate
         assert self.sampling_rate == self.model.sample_rate
@@ -189,15 +189,18 @@ class DACVoco(AudioEncoderDecoder):
     def latent_dim(self):
         return self.model.latent_dim if not self.factorized_latent else self.model.codebook_dim * self.bandwidth_id
 
+    @torch.no_grad()
     def encode(self, audio):
         audio = rearrange(audio, 'b t -> b 1 t')
         audio = self.model.preprocess(audio, self.sampling_rate)
         z, codes, latents, _, _ = self.model.encode(
             audio, self.bandwidth_id
         )
-        return z if not self.factorized_latent else latents
+        return rearrange(z if not self.factorized_latent else latents, 'b d n -> b n d')
 
+    @torch.no_grad()
     def decode(self, latents):
+        latents = rearrange(latents, 'b n d -> b d n')
         if self.factorized_latent:
             z_q, z_p, codes = self.model.quantizer.from_latents(latents)
         else:
