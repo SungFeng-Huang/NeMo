@@ -9,7 +9,7 @@ defaults:
     - tricks/size/a100
     - tricks/loss_full
     - tricks/vb_only
-    - tricks/adam_warmup
+    # - tricks/adam_warmup
     - tricks/gradient_clip
 
 # all parameters below will be merged with parameters from default configurations set above
