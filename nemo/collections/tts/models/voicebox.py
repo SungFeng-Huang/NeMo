@@ -512,7 +512,7 @@ class VoiceboxModel(TextToWaveform):
         # mfa align if needed
         if alignments is None:
             if textgrids is None:
-                alignments = [self.mfa_align(audio=audio[i], texts=text, sampling_rate=24000) for i, text in enumerate(texts)]
+                alignments = [self.mfa_align(audio=audio[i], texts=text, sampling_rate=self.voicebox.audio_enc_dec.sampling_rate) for i, text in enumerate(texts)]
             else:
                 alignments = [parse_mfa_textgrid(tg, None) for tg in textgrids]
 
@@ -821,9 +821,9 @@ class VoiceboxModel(TextToWaveform):
                 _pred_audio = self.voicebox.audio_enc_dec.decode(pred_x1[None, plot_id, :mel_len[plot_id]])[0].detach().cpu().numpy()
                 _orig_audio = audio[plot_id, :audio_len[plot_id]].detach().cpu().numpy()
                 tb_writer.add_audio(f"val_vb/{plot_id}/pred_audio", _pred_audio / max(np.abs(_pred_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
-                tb_writer.add_audio(f"val_vb/{plot_id}/orig_audio", _orig_audio / max(np.abs(_orig_audio)), self.global_step, sample_rate=24000)
+                tb_writer.add_audio(f"val_vb/{plot_id}/orig_audio", _orig_audio / max(np.abs(_orig_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
                 # tb_writer.add_audio(f"val_vb/{plot_id}/pred_audio", _pred_audio / np.sqrt(np.mean(_pred_audio ** 2)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
-                # tb_writer.add_audio(f"val_vb/{plot_id}/orig_audio", _orig_audio / np.sqrt(np.mean(_orig_audio ** 2)), self.global_step, sample_rate=24000)
+                # tb_writer.add_audio(f"val_vb/{plot_id}/orig_audio", _orig_audio / np.sqrt(np.mean(_orig_audio ** 2)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
 
         return losses, outputs
 
@@ -864,7 +864,7 @@ class VoiceboxModel(TextToWaveform):
             pred_audio = self.voicebox.audio_enc_dec.decode(pred_x1)[plot_id].detach().cpu().numpy()
             orig_audio = audio[plot_id].detach().cpu().numpy()
             tb_writer.add_audio("train_vb/pred_audio", pred_audio / max(np.abs(pred_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
-            tb_writer.add_audio("train_vb/orig_audio", orig_audio / max(np.abs(orig_audio)), self.global_step, sample_rate=24000)
+            tb_writer.add_audio("train_vb/orig_audio", orig_audio / max(np.abs(orig_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
 
         return losses, outputs
     
@@ -1023,7 +1023,7 @@ class VoiceboxModel(TextToWaveform):
                 _gen_audio = gen_audio[i, :gen_audio_lens[i]].cpu().numpy()
                 _ori_audio = ori_audio[i, :ori_audio_lens[i]].cpu().numpy()
                 tb_writer.add_audio(f"val_vb/{i}/gen_audio", _gen_audio / max(np.abs(_gen_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
-                tb_writer.add_audio(f"val_vb/{i}/ori_audio", _ori_audio / max(np.abs(_ori_audio)), self.global_step, sample_rate=24000)
+                tb_writer.add_audio(f"val_vb/{i}/ori_audio", _ori_audio / max(np.abs(_ori_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
 
         return
 
