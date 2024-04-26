@@ -180,6 +180,7 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
         bandwidth_id = self.model.n_codebooks if not bandwidth_id else bandwidth_id
         self.register_buffer('bandwidth_id', torch.tensor([bandwidth_id]))
         self.register_buffer('factorized_latent', torch.BoolTensor([factorized_latent]))
+        self.freeze()
 
     @property
     def downsample_factor(self):
@@ -189,7 +190,6 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
     def latent_dim(self):
         return self.model.latent_dim if not self.factorized_latent else self.model.codebook_dim * self.bandwidth_id
 
-    @torch.no_grad()
     def encode(self, audio):
         audio = rearrange(audio, 'b t -> b 1 t')
         audio = self.model.preprocess(audio, self.sampling_rate)
@@ -198,7 +198,6 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
         )
         return rearrange(z if not self.factorized_latent else latents, 'b d n -> b n d')
 
-    @torch.no_grad()
     def decode(self, latents):
         latents = rearrange(latents, 'b n d -> b d n')
         if self.factorized_latent:

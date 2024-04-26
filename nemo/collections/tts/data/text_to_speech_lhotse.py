@@ -172,7 +172,7 @@ class LhotseTextToSpeechDataset(torch.utils.data.Dataset):
         else:
             _cuts = cuts
 
-        if "texts" in _cuts[0].supervisions[0].custom:
+        if _cuts[0].supervisions[0].custom is not None and "texts" in _cuts[0].supervisions[0].custom:
             texts = [c.supervisions[0].custom["texts"][0] for c in _cuts]
         else:
             texts = [c.supervisions[0].text for c in _cuts]

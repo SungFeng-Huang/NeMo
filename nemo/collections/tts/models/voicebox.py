@@ -279,51 +279,163 @@ class VoiceboxModel(TextToWaveform):
             else:
                 logging.info(f"Skipping fix, {subset} subset exists.")
 
-    def _download_gigaspeech(self, target_dir, dataset_parts):
+    def _download_gigaspeech(self, target_dir, dataset_parts, source="huggingface"):
         """ Download GigaSpeech corpus. """
-        from lhotse.recipes.gigaspeech import download_gigaspeech, prepare_gigaspeech
-        download_gigaspeech(password=self._cfg.password, target_dir=target_dir, dataset_parts=dataset_parts, host="tsinghua")
+        if source == "lhotse":
+            from lhotse.recipes.gigaspeech import download_gigaspeech, prepare_gigaspeech
+            download_gigaspeech(password=self._cfg.password, target_dir=target_dir, dataset_parts=dataset_parts, host="tsinghua")
+        elif source == "huggingface":
+            import datasets
+            from datasets import load_dataset
+            for part in dataset_parts:
+                part = part.lower()
+                if part not in ["xs", "s", "m", "l", "xl"]: # dev/test will auto-downloaded w/ train set
+                    continue
+                ds = load_dataset("esb/datasets", "gigaspeech", subconfig=part, download_config=datasets.DownloadConfig(resume_download=True))
+                print(ds)
 
-    def _prepare_gigaspeech(self, corpus_dir, output_dir, textgrid_dir, dataset_parts):
-        from lhotse.recipes.gigaspeech import download_gigaspeech, prepare_gigaspeech
-        from lhotse import CutSet
+    def _prepare_gigaspeech(self, corpus_dir, output_dir, textgrid_dir, dataset_parts, source="huggingface"):
+        if source == "lhotse":
+            from lhotse.recipes.gigaspeech import download_gigaspeech, prepare_gigaspeech
+            from lhotse import CutSet
 
-        logging.info(f"mkdir -p {output_dir}")
-        os.makedirs(output_dir, exist_ok=True)
+            logging.info(f"mkdir -p {output_dir}")
+            os.makedirs(output_dir, exist_ok=True)
 
-        gigaspeech_punctuations = ['<COMMA>', '<PERIOD>', '<QUESTIONMARK>', '<EXCLAMATIONPOINT>']
-        gigaspeech_garbage_utterance_tags = ['<SIL>', '<NOISE>', '<MUSIC>', '<OTHER>']
+            gigaspeech_punctuations = ['<COMMA>', '<PERIOD>', '<QUESTIONMARK>', '<EXCLAMATIONPOINT>']
+            gigaspeech_garbage_utterance_tags = ['<SIL>', '<NOISE>', '<MUSIC>', '<OTHER>']
 
-        for subset in dataset_parts:
-            manifest_path = os.path.join(output_dir, f"gigaspeech_cuts_{subset}.speech.jsonl.gz")
-            if manifest_path not in [self._cfg.train_ds.manifest_filepath, self._cfg.validation_ds.manifest_filepath, self._cfg.test_ds.manifest_filepath]:
-                continue
-            if not os.path.exists(manifest_path):
-                # prepare or load recordings/supervisions manifest
-                manifest = prepare_gigaspeech(corpus_dir=corpus_dir, dataset_parts=subset, output_dir=output_dir, num_jobs=self._cfg.ds_kwargs.num_workers)
+            for subset in dataset_parts:
+                manifest_path = os.path.join(output_dir, f"gigaspeech_cuts_{subset}.speech.jsonl.gz")
+                if manifest_path not in [self._cfg.train_ds.manifest_filepath, self._cfg.validation_ds.manifest_filepath, self._cfg.test_ds.manifest_filepath]:
+                    continue
+                if not os.path.exists(manifest_path):
+                    # prepare or load recordings/supervisions manifest
+                    manifest = prepare_gigaspeech(corpus_dir=corpus_dir, dataset_parts=subset, output_dir=output_dir, num_jobs=self._cfg.ds_kwargs.num_workers)
+                    
+                    # turn into CutSet
+                    manifest = manifest[subset]
+                    cuts = CutSet.from_manifests(
+                        recordings=manifest["recordings"],
+                        supervisions=manifest["supervisions"],
+                        output_path=None
+                    )
+
+                    # remove punctuations
+                    for punctuation in gigaspeech_punctuations:
+                        cuts = cuts.transform_text(lambda text: ' '.join(text.replace(punctuation, '').strip().split()))
+                    # filter non-speech
+                    cuts = cuts.filter_supervisions(lambda s: s.text not in gigaspeech_garbage_utterance_tags)
+
+                    # trim cuts according to supervision segments
+                    cuts = cuts.trim_to_supervisions(keep_overlapping=False)
+                    
+                    logging.info(f"Writing {subset} subset.")
+                    cuts.to_file(manifest_path)
                 
-                # turn into CutSet
-                manifest = manifest[subset]
-                cuts = CutSet.from_manifests(
-                    recordings=manifest["recordings"],
-                    supervisions=manifest["supervisions"],
-                    output_path=None
-                )
+                else:
+                    logging.info(f"Skipping fix, {subset} subset exists.")
+        elif source == "huggingface":
+            import datasets
+            from datasets import load_dataset, Audio
+            from lhotse import RecordingSet, Recording, AudioSource, SupervisionSegment, SupervisionSet, CutSet, fix_manifests, validate_recordings_and_supervisions
+            from lhotse.recipes.utils import manifests_exist
 
-                # remove punctuations
-                for punctuation in gigaspeech_punctuations:
-                    cuts = cuts.transform_text(lambda text: ' '.join(text.replace(punctuation, '').strip().split()))
-                # filter non-speech
-                cuts = cuts.filter_supervisions(lambda s: s.text not in gigaspeech_garbage_utterance_tags)
+            def has_valid_audio(ex):
+                try:
+                    assert ex["text"] != ""
+                    sf.read(ex["audio"]["path"])
+                except Exception:
+                    return False
+                return True
 
-                # trim cuts according to supervision segments
-                cuts = cuts.trim_to_supervisions(keep_overlapping=False)
-                
-                logging.info(f"Writing {subset} subset.")
-                cuts.to_file(manifest_path)
-            
-            else:
-                logging.info(f"Skipping fix, {subset} subset exists.")
+            _part = None
+            for part in dataset_parts:
+                if part.lower() in ["xs", "s", "m", "l", "xl"]: # dev/test will auto-downloaded w/ train set
+                    _part = part.lower()
+                    break
+            ds = load_dataset("esb/datasets", "gigaspeech", subconfig=_part, download_config=datasets.DownloadConfig(resume_download=True))
+            ds = ds.cast_column("audio", Audio(decode=False))
+            ds = ds.filter(has_valid_audio)
+            ds = ds.cast_column("audio", Audio(decode=True))
+            print(ds)
+            # for split in ["train", "validation", "test"]:
+            for split in ["train", "validation"]:
+                # if split == "train":
+                #     part = _part
+                if split == "validation":
+                    part = "DEV"
+                elif split == "test":
+                    part = "TEST"
+                _part = part.lower()
+                output_dir = Path(output_dir)
+                    
+                logging.info(f"Processing GigaSpeech subset: {part}")
+                if manifests_exist(
+                    part=part, output_dir=output_dir, prefix="gigaspeech", suffix="speech.jsonl.gz"
+                ):
+                    logging.info(f"GigaSpeech subset: {part} already prepared - skipping.")
+                    continue
+
+                with RecordingSet.open_writer(
+                    output_dir / f"gigaspeech_recordings_{part}.speech.jsonl.gz"
+                ) as rec_writer, SupervisionSet.open_writer(
+                    output_dir / f"gigaspeech_supervisions_{part}.speech.jsonl.gz"
+                ) as sup_writer, CutSet.open_writer(
+                    output_dir / f"gigaspeech_cuts_{part}.speech.jsonl.gz"
+                ) as cut_writer:
+                    for data in tqdm(ds[split]):
+                        audio_path = Path(data["audio"]["path"])
+                        ds_root = audio_path.parents[3]
+                        tg_path = ds_root / "MFA" / audio_path.parts[-3] / audio_path.parts[-2] / (audio_path.stem + ".TextGrid")
+                        try:
+                            assert os.path.exists(tg_path)
+                        except:
+                            tqdm.write(f"Missing {tg_path}")
+                            tqdm.write(str(data))
+                            continue
+
+                        num_samples = data["audio"]["array"].shape[-1]
+                        duration = round(num_samples / data["audio"]["sampling_rate"], ndigits=8)
+
+                        recordings = [
+                            Recording(
+                                id=data["id"],
+                                sources=[AudioSource(type='file', channels=[0], source=data["audio"]["path"])],
+                                sampling_rate=data["audio"]["sampling_rate"],
+                                num_samples=num_samples,
+                                duration=duration,
+                            )
+                        ]
+                        segments = [
+                            SupervisionSegment(
+                                id=data["id"],
+                                recording_id=data["id"],
+                                start=0,
+                                duration=duration,
+                                channel=0,
+                                text=data["text"],
+                                language='English',
+                                alignment=parse_mfa_textgrid(f_id=tg_path, seg=None),
+                            )
+                        ]
+                        recordings, segments = fix_manifests(
+                            recordings=RecordingSet.from_recordings(recordings),
+                            supervisions=SupervisionSet.from_segments(segments),
+                        )
+                        validate_recordings_and_supervisions(
+                            recordings=recordings, supervisions=segments
+                        )
+                        # Create the cut since most users will need it anyway.
+                        # There will be exactly one cut since there's exactly one recording.
+                        cuts = CutSet.from_manifests(
+                            recordings=recordings, supervisions=segments
+                        )
+                        # Write the manifests
+                        rec_writer.write(recordings[0])
+                        for s in segments:
+                            sup_writer.write(s)
+                        cut_writer.write(cuts[0])
 
     def prepare_data(self) -> None:
         """ Pytorch Lightning hook.
@@ -345,9 +457,8 @@ class VoiceboxModel(TextToWaveform):
                 self._download_libritts(target_dir=self._cfg.corpus_dir, dataset_parts=dataset_parts)
                 self._prepare_libritts(corpus_dir=self._cfg.corpus_dir, output_dir=self._cfg.manifests_dir, textgrid_dir=self._cfg.textgrid_dir, dataset_parts=dataset_parts)
             elif self._cfg.ds_name == "gigaspeech":
-                # self._download_gigaspeech(target_dir=self._cfg.corpus_dir, dataset_parts=dataset_parts)
+                self._download_gigaspeech(target_dir=self._cfg.corpus_dir, dataset_parts=dataset_parts)
                 self._prepare_gigaspeech(corpus_dir=self._cfg.corpus_dir, output_dir=self._cfg.manifests_dir, textgrid_dir=self._cfg.textgrid_dir, dataset_parts=dataset_parts)
-                exit()
 
     def setup(self, stage: Optional[str] = None):
         """Called at the beginning of fit, validate, test, or predict.
@@ -1143,7 +1254,7 @@ class VoiceboxModel(TextToWaveform):
     
 
 
-def parse_mfa_textgrid(f_id, seg: None):
+def parse_mfa_textgrid(f_id, seg=None):
     """ read alignment from MFA textgrid file
     Args
         - f_id: textgrid_filename
