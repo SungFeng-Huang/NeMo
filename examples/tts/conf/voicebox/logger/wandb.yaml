@@ -2,6 +2,7 @@
 
 create_wandb_logger: True
 wandb_logger_kwargs:
-  name: ${name}
+  name: ${task_name}
   project: ${project}
-  entity: ${entity}
+  # entity: ${entity}
+  resume: True

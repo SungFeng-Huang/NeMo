@@ -11,6 +11,9 @@ defaults:
     - tricks/vb_only
     # - tricks/adam_warmup
     - tricks/gradient_clip
+  - logger:
+    - tensorboard
+    - wandb
 
 # all parameters below will be merged with parameters from default configurations set above
 # this allows you to overwrite only specified parameters
