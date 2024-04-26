@@ -7,7 +7,7 @@ defaults:
   - dataset: libriheavy
   - model: mfa
   - callbacks: null
-  - logger@exp_manager: # set logger here or use command line (e.g. `python train.py logger=tensorboard`)
+  - logger: # set logger here or use command line (e.g. `python train.py logger=tensorboard`)
     - tensorboard
   - trainer: ddp
   - paths: null
