@@ -11,7 +11,7 @@ defaults:
     - tricks/vb_only
     # - tricks/adam_warmup
     - tricks/gradient_clip
-  - logger:
+  - /logger:
     - tensorboard
     - wandb
 
