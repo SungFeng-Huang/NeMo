@@ -342,12 +342,43 @@ class VoiceboxModel(TextToWaveform):
             from lhotse.recipes.utils import manifests_exist
 
             def has_valid_audio(ex):
+                """ For filtering examples.
+
+                Usage:
+                    ds = ds.cast_column("audio", Audio(decode=False))
+                    ds = ds.filter(has_valid_audio)
+                    ds = ds.cast_column("audio", Audio(decode=True))
+                """
                 try:
                     assert ex["text"] != ""
                     sf.read(ex["audio"]["path"])
                 except Exception:
                     return False
                 return True
+
+            def invalid_speech_as_none(batch):
+                """ For turning invalid examples into None, to prevent extra file loading during filtering.
+
+                Usage:
+                    ds = ds.cast_column("audio", Audio(decode=False))
+                    ds = ds.with_transform(invalid_speech_as_none)
+                """
+                audios = []
+                
+                for audio in batch["audio"]:
+                    try:
+                        # since gigaspeech is mono-channel, no need to do extra array processing.
+                        array, sampling_rate = sf.read(audio["path"])
+                        audio = {
+                            "path": audio["path"],
+                            "array": array,
+                            "sampling_rate": sampling_rate,
+                        }
+                    except Exception:
+                        audio = None
+                    audios.append(audio)
+                batch["audio"] = audio
+                return batch
 
             _part = None
             for part in dataset_parts:
@@ -961,16 +992,25 @@ class VoiceboxModel(TextToWaveform):
             tb_writer = self.logger.experiment
             
             plot_id = 0
-            x1, x0, w, pred_dx = outputs['vb']['x1'], outputs['vb']['x0'], outputs['vb']['w'], outputs['vb']['pred']
-            cond, cond_mask = outputs['vb']["cond"], outputs['vb']["cond_mask"]
-            cond = cond * ~cond_mask
-            σ = self.cfm_wrapper.sigma
-            pred_x1 = pred_dx + (1 - σ) * x0 if not self.voicebox.no_diffusion else pred_dx
-            tb_writer.add_image("train_vb/x1", plot_spectrogram_to_numpy(x1[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
-            tb_writer.add_image("train_vb/xt", plot_spectrogram_to_numpy(w[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
-            tb_writer.add_image("train_vb/cond", plot_spectrogram_to_numpy(cond[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
-            tb_writer.add_image("train_vb/pred_dx", plot_spectrogram_to_numpy(pred_dx[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
-            tb_writer.add_image("train_vb/pred_x1", plot_spectrogram_to_numpy(pred_x1[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
+            if not self.voicebox.no_diffusion:
+                x1, x0, w, pred_dx = outputs['vb']['x1'], outputs['vb']['x0'], outputs['vb']['w'], outputs['vb']['pred']
+                cond, cond_mask = outputs['vb']["cond"], outputs['vb']["cond_mask"]
+                cond = cond * ~cond_mask
+                σ = self.cfm_wrapper.sigma
+                pred_x1 = pred_dx + (1 - σ) * x0 if not self.voicebox.no_diffusion else pred_dx
+                tb_writer.add_image("train_vb/x1", plot_spectrogram_to_numpy(x1[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
+                tb_writer.add_image("train_vb/xt", plot_spectrogram_to_numpy(w[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
+                tb_writer.add_image("train_vb/cond", plot_spectrogram_to_numpy(cond[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
+                tb_writer.add_image("train_vb/pred_dx", plot_spectrogram_to_numpy(pred_dx[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
+                tb_writer.add_image("train_vb/pred_x1", plot_spectrogram_to_numpy(pred_x1[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
+            else:
+                pred_x1 = outputs['vb']['pred']
+                cond, cond_mask = outputs['vb']["cond"], outputs['vb']["cond_mask"]
+                x1 = cond
+                cond = cond * ~cond_mask
+                tb_writer.add_image("train_vb/x1", plot_spectrogram_to_numpy(x1[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
+                tb_writer.add_image("train_vb/cond", plot_spectrogram_to_numpy(cond[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
+                tb_writer.add_image("train_vb/pred_x1", plot_spectrogram_to_numpy(pred_x1[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
 
             pred_audio = self.voicebox.audio_enc_dec.decode(pred_x1)[plot_id].detach().cpu().numpy()
             orig_audio = audio[plot_id].detach().cpu().numpy()
