@@ -971,8 +971,21 @@ class VoiceboxModel(TextToWaveform):
                 tb_writer.add_image(key, image, step, dataformats="HWC")
             
             elif isinstance(logger, WandbLogger):
-                wandb_logger = logger
-                wandb_logger.log_image(key, [image], step)
+                import wandb
+                from wandb.wandb_run import Run
+                if not hasattr(self, "wandb_metrics"):
+                    self.wandb_metrics = {}
+
+                wandb_logger: Run = logger.experiment
+                kwargs["caption"] = f"step: {step}"
+                for k in kwargs:
+                    kwargs[k] = [kwargs[k]]
+
+                n = len([image])
+                kwarg_list = [{k: kwargs[k][i] for k in kwargs} for i in range(n)]
+                metrics = {key: [wandb.Image(img, **kwarg) for img, kwarg in zip([image], kwarg_list)]}
+                # logger.log_metrics(metrics, step=step)  # type: ignore[arg-type]
+                self.wandb_metrics.update(metrics)
 
     @rank_zero_only
     def log_audio(self, key: str, audio: Any, step: Optional[int] = None, **kwargs: Any) -> None:
@@ -990,26 +1003,38 @@ class VoiceboxModel(TextToWaveform):
         for logger in self.loggers:
             if isinstance(logger, TensorBoardLogger):
                 tb_writer = logger.experiment
-                tb_writer.add_audio(key, audios, step, **kwargs)
+                tb_writer.add_audio(key, audio, step, **kwargs)
             
             elif isinstance(logger, WandbLogger):
-                wandb_logger = logger
+                import wandb
+                from wandb.wandb_run import Run
+                if not hasattr(self, "wandb_metrics"):
+                    self.wandb_metrics = {}
+
+                wandb_logger: Run = logger.experiment
                 audios = [audio]
+                kwargs["caption"] = f"step: {step}"
                 for k in kwargs:
                     kwargs[k] = [kwargs[k]]
 
-                if not isinstance(audios, list):
-                    raise TypeError(f'Expected a list as "audios", found {type(audios)}')
                 n = len(audios)
-                for k, v in kwargs.items():
-                    if len(v) != n:
-                        raise ValueError(f"Expected {n} items but only found {len(v)} for {k}")
                 kwarg_list = [{k: kwargs[k][i] for k in kwargs} for i in range(n)]
 
-                import wandb
-
                 metrics = {key: [wandb.Audio(audio, **kwarg) for audio, kwarg in zip(audios, kwarg_list)]}
-                wandb_logger.log_metrics(metrics, step)  # type: ignore[arg-type]
+                # logger.log_metrics(metrics, step=step)  # type: ignore[arg-type]
+                self.wandb_metrics.update(metrics)
+
+    @rank_zero_only
+    def log_commit(self, step):
+        for logger in self.loggers:
+            if isinstance(logger, WandbLogger):
+                import wandb
+                from wandb.wandb_run import Run
+
+                wandb_logger: Run = logger.experiment
+                # wandb_logger.log({}, commit=True)
+                logger.log_metrics(self.wandb_metrics, step=step)
+                self.wandb_metrics = {}
 
     def train_dp(self, audio, audio_mask, tokens, token_lens, texts, durations, batch_idx):
         self.duration_predictor.train()
@@ -1057,6 +1082,8 @@ class VoiceboxModel(TextToWaveform):
             self.log_image("train_dp/bar",
                            plot_duration_barplot_to_numpy(phns, dp_cond[plot_id], dp_pred[plot_id], text),
                            self.global_step)
+                           
+            self.log_commit(self.global_step)
             
         return dp_losses, dp_outputs
 
@@ -1105,6 +1132,7 @@ class VoiceboxModel(TextToWaveform):
             orig_audio = audio[plot_id].detach().cpu().numpy()
             self.log_audio("train_vb/pred_audio", pred_audio / max(np.abs(pred_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
             self.log_audio("train_vb/orig_audio", orig_audio / max(np.abs(orig_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
+            self.log_commit(self.global_step)
 
         return losses, outputs
     
@@ -1178,6 +1206,7 @@ class VoiceboxModel(TextToWaveform):
                 self.log_audio(f"val_vb/{plot_id}/orig_audio", _orig_audio / max(np.abs(_orig_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
                 # self.log_audio(f"val_vb/{plot_id}/pred_audio", _pred_audio / np.sqrt(np.mean(_pred_audio ** 2)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
                 # self.log_audio(f"val_vb/{plot_id}/orig_audio", _orig_audio / np.sqrt(np.mean(_orig_audio ** 2)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
+            self.log_commit(self.global_step)
 
         return losses, outputs
     
@@ -1283,6 +1312,7 @@ class VoiceboxModel(TextToWaveform):
                 _ori_audio = ori_audio[i, :ori_audio_lens[i]].cpu().numpy()
                 self.log_audio(f"val_vb/{i}/gen_audio", _gen_audio / max(np.abs(_gen_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
                 self.log_audio(f"val_vb/{i}/ori_audio", _ori_audio / max(np.abs(_ori_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
+            self.log_commit(self.global_step)
 
         return
 
