@@ -35,8 +35,12 @@ from torch.utils.data import DataLoader
 from einops import rearrange
 from hydra.utils import instantiate, get_class
 from omegaconf import DictConfig, OmegaConf, open_dict
+import pytorch_lightning
 from pytorch_lightning import Trainer
 from pytorch_lightning.utilities import grad_norm
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers.wandb import WandbLogger
+from pytorch_lightning.utilities import rank_zero_only
 
 
 from nemo.utils import logging, model_utils
@@ -525,22 +529,6 @@ class VoiceboxModel(TextToWaveform):
             if not self.test_dataloader() and test_deferred_setup:
                 self.setup_multiple_test_data(test_data_config=self._cfg.test_ds)
 
-    def parse(self, text: str, normalize=True) -> torch.tensor:
-        if self.training:
-            logging.warning("parse() is meant to be called in eval mode.")
-
-        # normalize
-        if normalize and self.text_normalizer_call is not None:
-            text = self.text_normalizer_call(text, **self.text_normalizer_call_kwargs)
-
-        # phonemize
-        text = os.popen("conda run -n aligner bash -c \"echo '...' | mfa g2p -n 1 - english_us_arpa -\"").read().split('\t')[1].strip()
-
-        # tokenize
-        tokens = self.tokenizer.text_to_ids(text)[0]
-
-        return torch.tensor(tokens).long().unsqueeze(0).to(self.device)
-
     def _setup_dataloader_from_config(self, config: Optional[Dict]) -> DataLoader[Any]:
         """Modified from https://github.com/pzelasko/NeMo/blob/feature/lhotse-integration/nemo/collections/asr/models/hybrid_rnnt_ctc_bpe_models.py#L129
         """
@@ -583,6 +571,127 @@ class VoiceboxModel(TextToWaveform):
     def setup_test_data(self, test_data_config: DictConfig | Dict):
         return EncDecRNNTModel.setup_test_data(self, test_data_config)
 
+    def parse(self, text: str, normalize=True) -> torch.tensor:
+        if self.training:
+            logging.warning("parse() is meant to be called in eval mode.")
+
+        # normalize
+        if normalize and self.text_normalizer_call is not None:
+            text = self.text_normalizer_call(text, **self.text_normalizer_call_kwargs)
+
+        # phonemize
+        text = os.popen("conda run -n aligner bash -c \"echo '...' | mfa g2p -n 1 - english_us_arpa -\"").read().split('\t')[1].strip()
+
+        # tokenize
+        tokens = self.tokenizer.text_to_ids(text)[0]
+
+        return torch.tensor(tokens).long().unsqueeze(0).to(self.device)
+
+    @torch.no_grad()
+    def parse_input(self, batch):
+        # voicebox's sampling rate
+        # audio = batch["audio_24k"]
+        # audio_lens = batch["audio_lens_24k"]
+        audio = batch["audio"]
+        audio_lens = batch["audio_lens"]
+        tokens = batch["tokens"]
+        token_lens = batch["token_lens"]
+        texts = batch["texts"]
+        # mfa tgt
+        durations = batch.get("durations", None)
+
+        self.voicebox.audio_enc_dec.eval()
+        mel = self.voicebox.audio_enc_dec.encode(audio)
+        mel_lens = audio_lens * mel.shape[1] // audio.shape[-1]
+        batch.update({
+            "mel": mel,
+            "mel_lens": mel_lens,
+        })
+
+        if durations is not None:
+            cum_dur = torch.cumsum(durations, -1)
+            dur_ratio = mel_lens / cum_dur[:, -1]
+            cum_dur = cum_dur * rearrange(dur_ratio, 'b -> b 1')
+            cum_dur = torch.round(cum_dur)
+
+            dp_cond = torch.zeros_like(cum_dur)
+            dp_cond[:, 0] = cum_dur[:, 0]
+            dp_cond[:, 1:] = cum_dur[:, 1:] - cum_dur[:, :-1]
+
+            batch.update({
+                "dp_cond": dp_cond,
+                "cum_dur": cum_dur,
+            })
+
+        return batch
+
+    @torch.no_grad()
+    def parse_val_vb_input(self, batch):
+        batch = self.parse_input(batch)
+        mel = batch['mel']
+        mel_lens = batch['mel_lens']
+        mel_mask = get_mask_from_lengths(mel_lens) # (b, t)
+        batch.update({
+            "mel_mask": mel_mask,
+        })
+
+        tokens = batch['tokens']
+        durations = batch['dp_cond']
+        cum_dur = batch['cum_dur']
+
+        aligned_tokens = self.duration_predictor.align_phoneme_ids_with_durations(tokens, durations)
+        batch.update({
+            "aligned_tokens": aligned_tokens
+        })
+
+        self.voicebox.eval()
+        cond_mask = self.voicebox.create_cond_mask(
+            batch=mel.shape[0],
+            seq_len=mel.shape[1],
+            cond_token_ids=aligned_tokens,
+            self_attn_mask=mel_mask,
+            training=True,
+            frac_lengths_mask=(0.1, 0.5),
+        )
+        batch.update({
+            "cond": mel,
+            "cond_mask": cond_mask,
+            "self_attn_mask": mel_mask,
+        })
+
+        return batch
+
+    @torch.no_grad()
+    def parse_0_tts(self, batch):
+        mel = batch['mel']
+        mel_lens = batch['mel_lens']
+        mel_mask = get_mask_from_lengths(mel_lens) # (b, t)
+
+        pad_mel = torch.ones_like(mel) * -4.5252
+        new_mel = torch.cat([mel, pad_mel], dim=1)
+        new_mask = get_mask_from_lengths(mel_lens * 2)
+
+        pad_mask = torch.zeros_like(mel_mask)
+        ori_mask = torch.cat([mel_mask, pad_mask], dim=1).bool()
+        cond_mask = new_mask & ~ori_mask
+        batch.update({
+            "cond": new_mel,
+            "cond_mask": cond_mask,
+            "self_attn_mask": new_mask,
+        })
+
+        tokens = batch['tokens']
+        durations = batch['dp_cond']
+        cum_dur = batch['cum_dur']
+
+        new_tokens = torch.cat([tokens, tokens], dim=1)
+        new_dur = torch.cat([durations, durations], dim=1)
+        new_aligned_tokens = self.duration_predictor.align_phoneme_ids_with_durations(new_tokens, new_dur)
+        batch.update({
+            "aligned_tokens": new_aligned_tokens
+        })
+        return batch
+
     def mfa_align(self, audio, texts: str, sampling_rate: int):
         """run MFA align then load alignment from textgrid file"""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -603,7 +712,6 @@ class VoiceboxModel(TextToWaveform):
             alignment = parse_mfa_textgrid(temp_tg_path, seg=None)
         return alignment
 
-    # for inference
     @torch.inference_mode()
     def forward(
         self,
@@ -844,6 +952,65 @@ class VoiceboxModel(TextToWaveform):
         norms = grad_norm(self.voicebox, norm_type=2)
         self.log_dict(norms)
 
+    @rank_zero_only
+    def log_image(self, key: str, image: Any, step: Optional[int] = None, **kwargs: Any) -> None:
+        r"""Log images (numpy arrays, or file paths).
+
+        Args:
+            key: The key to be used for logging the image files
+            image: The image file path, or numpy array to be logged
+            step: The step number to be used for logging the image files
+            \**kwargs: Optional kwargs are lists passed to each ``Wandb.Image`` instance (ex: caption, sample_rate).
+
+        Optional kwargs are lists passed to each image (ex: caption, sample_rate).
+
+        """
+        for logger in self.loggers:
+            if isinstance(logger, TensorBoardLogger):
+                tb_writer = logger.experiment
+                tb_writer.add_image(key, image, step, dataformats="HWC")
+            
+            elif isinstance(logger, WandbLogger):
+                wandb_logger = logger
+                wandb_logger.log_image(key, [image], step)
+
+    @rank_zero_only
+    def log_audio(self, key: str, audio: Any, step: Optional[int] = None, **kwargs: Any) -> None:
+        r"""Log audios (numpy arrays, or file paths).
+
+        Args:
+            key: The key to be used for logging the audio files
+            audio: The audio file path, or numpy array to be logged
+            step: The step number to be used for logging the audio files
+            \**kwargs: Optional kwargs are lists passed to each ``Wandb.Audio`` instance (ex: caption, sample_rate).
+
+        Optional kwargs are lists passed to each audio (ex: caption, sample_rate).
+
+        """
+        for logger in self.loggers:
+            if isinstance(logger, TensorBoardLogger):
+                tb_writer = logger.experiment
+                tb_writer.add_audio(key, audios, step, **kwargs)
+            
+            elif isinstance(logger, WandbLogger):
+                wandb_logger = logger
+                audios = [audio]
+                for k in kwargs:
+                    kwargs[k] = [kwargs[k]]
+
+                if not isinstance(audios, list):
+                    raise TypeError(f'Expected a list as "audios", found {type(audios)}')
+                n = len(audios)
+                for k, v in kwargs.items():
+                    if len(v) != n:
+                        raise ValueError(f"Expected {n} items but only found {len(v)} for {k}")
+                kwarg_list = [{k: kwargs[k][i] for k in kwargs} for i in range(n)]
+
+                import wandb
+
+                metrics = {key: [wandb.Audio(audio, **kwarg) for audio, kwarg in zip(audios, kwarg_list)]}
+                wandb_logger.log_metrics(metrics, step)  # type: ignore[arg-type]
+
     def train_dp(self, audio, audio_mask, tokens, token_lens, texts, durations, batch_idx):
         self.duration_predictor.train()
 
@@ -874,26 +1041,73 @@ class VoiceboxModel(TextToWaveform):
         dp_outputs["cond"] = dp_inputs.get("dp_cond")
 
         if self.training and self.trainer._logger_connector.should_update_logs:
-            tb_writer = self.logger.experiment
-            
             plot_id = 0
             x1 = dp_inputs["mel"]
             dp_cond, dp_pred = dp_outputs['cond'], dp_outputs['durations']
-            # tb_writer.add_image("train_dp/dur",
-            #                     plot_alignment_to_numpy(tokens[plot_id], dp_cond[plot_id], dp_pred[plot_id], x1[plot_id].T.detach().cpu().numpy()),
-            #                     self.global_step, dataformats="HWC")
 
             phns = self.tokenizer.decode(tokens[plot_id].cpu().tolist()).split(' ')
             text = texts[plot_id]
-            tb_writer.add_image("train_dp/seg",
-                                plot_segment_to_numpy(phns, dp_cond[plot_id], dp_pred[plot_id], x1[plot_id].T.detach().cpu().numpy(), text),
-                                self.global_step, dataformats="HWC")
-            tb_writer.add_image("train_dp/bar",
-                                plot_duration_barplot_to_numpy(phns, dp_cond[plot_id], dp_pred[plot_id], text),
-                                self.global_step, dataformats="HWC")
+
+            # self.log_image("train_dp/dur",
+            #                plot_alignment_to_numpy(tokens[plot_id], dp_cond[plot_id], dp_pred[plot_id], x1[plot_id].T.detach().cpu().numpy()),
+            #                self.global_step)
+            self.log_image("train_dp/seg",
+                           plot_segment_to_numpy(phns, dp_cond[plot_id], dp_pred[plot_id], x1[plot_id].T.detach().cpu().numpy(), text),
+                           self.global_step)
+            self.log_image("train_dp/bar",
+                           plot_duration_barplot_to_numpy(phns, dp_cond[plot_id], dp_pred[plot_id], text),
+                           self.global_step)
             
         return dp_losses, dp_outputs
 
+    def train_vb(self, audio, audio_mask, tokens, batch_idx):
+        vb_inputs = self.cfm_wrapper.parse_vb_input(
+            x1=audio,
+            mask=audio_mask,
+            cond=audio,
+            input_sampling_rate=None
+        )
+
+        self.voicebox.train()
+
+        _, losses, outputs = self.cfm_wrapper.forward(
+            x1=vb_inputs['x1'],
+            mask=vb_inputs['mask'],
+            phoneme_ids=tokens,
+            cond=vb_inputs['cond'],
+            cond_mask=None,
+            input_sampling_rate=None
+        )
+        
+        if self.training and self.trainer._logger_connector.should_update_logs:
+            plot_id = 0
+            if not self.voicebox.no_diffusion:
+                x1, x0, w, pred_dx = outputs['vb']['x1'], outputs['vb']['x0'], outputs['vb']['w'], outputs['vb']['pred']
+                cond, cond_mask = outputs['vb']["cond"], outputs['vb']["cond_mask"]
+                cond = cond * ~cond_mask
+                σ = self.cfm_wrapper.sigma
+                pred_x1 = pred_dx + (1 - σ) * x0 if not self.voicebox.no_diffusion else pred_dx
+                self.log_image("train_vb/x1", plot_spectrogram_to_numpy(x1[plot_id].T.detach().cpu().numpy()), self.global_step)
+                self.log_image("train_vb/xt", plot_spectrogram_to_numpy(w[plot_id].T.detach().cpu().numpy()), self.global_step)
+                self.log_image("train_vb/cond", plot_spectrogram_to_numpy(cond[plot_id].T.detach().cpu().numpy()), self.global_step)
+                self.log_image("train_vb/pred_dx", plot_spectrogram_to_numpy(pred_dx[plot_id].T.detach().cpu().numpy()), self.global_step)
+                self.log_image("train_vb/pred_x1", plot_spectrogram_to_numpy(pred_x1[plot_id].T.detach().cpu().numpy()), self.global_step)
+            else:
+                pred_x1 = outputs['vb']['pred']
+                cond, cond_mask = outputs['vb']["cond"], outputs['vb']["cond_mask"]
+                x1 = cond
+                cond = cond * ~cond_mask
+                self.log_image("train_vb/x1", plot_spectrogram_to_numpy(x1[plot_id].T.detach().cpu().numpy()), self.global_step)
+                self.log_image("train_vb/cond", plot_spectrogram_to_numpy(cond[plot_id].T.detach().cpu().numpy()), self.global_step)
+                self.log_image("train_vb/pred_x1", plot_spectrogram_to_numpy(pred_x1[plot_id].T.detach().cpu().numpy()), self.global_step)
+
+            pred_audio = self.voicebox.audio_enc_dec.decode(pred_x1)[plot_id].detach().cpu().numpy()
+            orig_audio = audio[plot_id].detach().cpu().numpy()
+            self.log_audio("train_vb/pred_audio", pred_audio / max(np.abs(pred_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
+            self.log_audio("train_vb/orig_audio", orig_audio / max(np.abs(orig_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
+
+        return losses, outputs
+    
     def val_vb(self, audio, audio_mask, tokens, batch_idx):
         self.voicebox.train()
 
@@ -953,231 +1167,20 @@ class VoiceboxModel(TextToWaveform):
             cond = cond * ~rearrange(cond_mask, '... -> ... 1')
             pred_x1 = output_audio
 
-            tb_writer = self.logger.experiment
-            
             for plot_id in range(x1.shape[0]):
-                tb_writer.add_image(f"val_vb/{plot_id}/x1", plot_spectrogram_to_numpy(x1[plot_id, :mel_len[plot_id]].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
-                tb_writer.add_image(f"val_vb/{plot_id}/cond", plot_spectrogram_to_numpy(cond[plot_id, :mel_len[plot_id]].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
-                tb_writer.add_image(f"val_vb/{plot_id}/pred_x1", plot_spectrogram_to_numpy(pred_x1[plot_id, :mel_len[plot_id]].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
+                self.log_image(f"val_vb/{plot_id}/x1", plot_spectrogram_to_numpy(x1[plot_id, :mel_len[plot_id]].T.detach().cpu().numpy()), self.global_step)
+                self.log_image(f"val_vb/{plot_id}/cond", plot_spectrogram_to_numpy(cond[plot_id, :mel_len[plot_id]].T.detach().cpu().numpy()), self.global_step)
+                self.log_image(f"val_vb/{plot_id}/pred_x1", plot_spectrogram_to_numpy(pred_x1[plot_id, :mel_len[plot_id]].T.detach().cpu().numpy()), self.global_step)
 
                 _pred_audio = self.voicebox.audio_enc_dec.decode(pred_x1[None, plot_id, :mel_len[plot_id]])[0].detach().cpu().numpy()
                 _orig_audio = audio[plot_id, :audio_len[plot_id]].detach().cpu().numpy()
-                tb_writer.add_audio(f"val_vb/{plot_id}/pred_audio", _pred_audio / max(np.abs(_pred_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
-                tb_writer.add_audio(f"val_vb/{plot_id}/orig_audio", _orig_audio / max(np.abs(_orig_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
-                # tb_writer.add_audio(f"val_vb/{plot_id}/pred_audio", _pred_audio / np.sqrt(np.mean(_pred_audio ** 2)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
-                # tb_writer.add_audio(f"val_vb/{plot_id}/orig_audio", _orig_audio / np.sqrt(np.mean(_orig_audio ** 2)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
-
-        return losses, outputs
-
-    def train_vb(self, audio, audio_mask, tokens, batch_idx):
-        vb_inputs = self.cfm_wrapper.parse_vb_input(
-            x1=audio,
-            mask=audio_mask,
-            cond=audio,
-            input_sampling_rate=None
-        )
-
-        self.voicebox.train()
-
-        _, losses, outputs = self.cfm_wrapper.forward(
-            x1=vb_inputs['x1'],
-            mask=vb_inputs['mask'],
-            phoneme_ids=tokens,
-            cond=vb_inputs['cond'],
-            cond_mask=None,
-            input_sampling_rate=None
-        )
-        
-        if self.training and self.trainer._logger_connector.should_update_logs:
-            tb_writer = self.logger.experiment
-            
-            plot_id = 0
-            if not self.voicebox.no_diffusion:
-                x1, x0, w, pred_dx = outputs['vb']['x1'], outputs['vb']['x0'], outputs['vb']['w'], outputs['vb']['pred']
-                cond, cond_mask = outputs['vb']["cond"], outputs['vb']["cond_mask"]
-                cond = cond * ~cond_mask
-                σ = self.cfm_wrapper.sigma
-                pred_x1 = pred_dx + (1 - σ) * x0 if not self.voicebox.no_diffusion else pred_dx
-                tb_writer.add_image("train_vb/x1", plot_spectrogram_to_numpy(x1[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
-                tb_writer.add_image("train_vb/xt", plot_spectrogram_to_numpy(w[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
-                tb_writer.add_image("train_vb/cond", plot_spectrogram_to_numpy(cond[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
-                tb_writer.add_image("train_vb/pred_dx", plot_spectrogram_to_numpy(pred_dx[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
-                tb_writer.add_image("train_vb/pred_x1", plot_spectrogram_to_numpy(pred_x1[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
-            else:
-                pred_x1 = outputs['vb']['pred']
-                cond, cond_mask = outputs['vb']["cond"], outputs['vb']["cond_mask"]
-                x1 = cond
-                cond = cond * ~cond_mask
-                tb_writer.add_image("train_vb/x1", plot_spectrogram_to_numpy(x1[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
-                tb_writer.add_image("train_vb/cond", plot_spectrogram_to_numpy(cond[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
-                tb_writer.add_image("train_vb/pred_x1", plot_spectrogram_to_numpy(pred_x1[plot_id].T.detach().cpu().numpy()), self.global_step, dataformats="HWC")
-
-            pred_audio = self.voicebox.audio_enc_dec.decode(pred_x1)[plot_id].detach().cpu().numpy()
-            orig_audio = audio[plot_id].detach().cpu().numpy()
-            tb_writer.add_audio("train_vb/pred_audio", pred_audio / max(np.abs(pred_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
-            tb_writer.add_audio("train_vb/orig_audio", orig_audio / max(np.abs(orig_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
+                self.log_audio(f"val_vb/{plot_id}/pred_audio", _pred_audio / max(np.abs(_pred_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
+                self.log_audio(f"val_vb/{plot_id}/orig_audio", _orig_audio / max(np.abs(_orig_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
+                # self.log_audio(f"val_vb/{plot_id}/pred_audio", _pred_audio / np.sqrt(np.mean(_pred_audio ** 2)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
+                # self.log_audio(f"val_vb/{plot_id}/orig_audio", _orig_audio / np.sqrt(np.mean(_orig_audio ** 2)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
 
         return losses, outputs
     
-    @torch.no_grad()
-    def parse_input(self, batch):
-        # voicebox's sampling rate
-        # audio = batch["audio_24k"]
-        # audio_lens = batch["audio_lens_24k"]
-        audio = batch["audio"]
-        audio_lens = batch["audio_lens"]
-        tokens = batch["tokens"]
-        token_lens = batch["token_lens"]
-        texts = batch["texts"]
-        # mfa tgt
-        durations = batch.get("durations", None)
-
-        self.voicebox.audio_enc_dec.eval()
-        mel = self.voicebox.audio_enc_dec.encode(audio)
-        mel_lens = audio_lens * mel.shape[1] // audio.shape[-1]
-        batch.update({
-            "mel": mel,
-            "mel_lens": mel_lens,
-        })
-
-        if durations is not None:
-            cum_dur = torch.cumsum(durations, -1)
-            dur_ratio = mel_lens / cum_dur[:, -1]
-            cum_dur = cum_dur * rearrange(dur_ratio, 'b -> b 1')
-            cum_dur = torch.round(cum_dur)
-
-            dp_cond = torch.zeros_like(cum_dur)
-            dp_cond[:, 0] = cum_dur[:, 0]
-            dp_cond[:, 1:] = cum_dur[:, 1:] - cum_dur[:, :-1]
-
-            batch.update({
-                "dp_cond": dp_cond,
-                "cum_dur": cum_dur,
-            })
-
-        return batch
-
-    @torch.no_grad()
-    def parse_val_vb_input(self, batch):
-        batch = self.parse_input(batch)
-        mel = batch['mel']
-        mel_lens = batch['mel_lens']
-        mel_mask = get_mask_from_lengths(mel_lens) # (b, t)
-        batch.update({
-            "mel_mask": mel_mask,
-        })
-
-        tokens = batch['tokens']
-        durations = batch['dp_cond']
-        cum_dur = batch['cum_dur']
-
-        aligned_tokens = self.duration_predictor.align_phoneme_ids_with_durations(tokens, durations)
-        batch.update({
-            "aligned_tokens": aligned_tokens
-        })
-
-        self.voicebox.eval()
-        cond_mask = self.voicebox.create_cond_mask(
-            batch=mel.shape[0],
-            seq_len=mel.shape[1],
-            cond_token_ids=aligned_tokens,
-            self_attn_mask=mel_mask,
-            training=True,
-            frac_lengths_mask=(0.1, 0.5),
-        )
-        batch.update({
-            "cond": mel,
-            "cond_mask": cond_mask,
-            "self_attn_mask": mel_mask,
-        })
-
-        return batch
-
-    @torch.no_grad()
-    def parse_0_tts(self, batch):
-        mel = batch['mel']
-        mel_lens = batch['mel_lens']
-        mel_mask = get_mask_from_lengths(mel_lens) # (b, t)
-
-        pad_mel = torch.ones_like(mel) * -4.5252
-        new_mel = torch.cat([mel, pad_mel], dim=1)
-        new_mask = get_mask_from_lengths(mel_lens * 2)
-
-        pad_mask = torch.zeros_like(mel_mask)
-        ori_mask = torch.cat([mel_mask, pad_mask], dim=1).bool()
-        cond_mask = new_mask & ~ori_mask
-        batch.update({
-            "cond": new_mel,
-            "cond_mask": cond_mask,
-            "self_attn_mask": new_mask,
-        })
-
-        tokens = batch['tokens']
-        durations = batch['dp_cond']
-        cum_dur = batch['cum_dur']
-
-        new_tokens = torch.cat([tokens, tokens], dim=1)
-        new_dur = torch.cat([durations, durations], dim=1)
-        new_aligned_tokens = self.duration_predictor.align_phoneme_ids_with_durations(new_tokens, new_dur)
-        batch.update({
-            "aligned_tokens": new_aligned_tokens
-        })
-        return batch
-
-    @torch.no_grad()
-    def val_vb_0_tts(self, batch: List, batch_idx: int) -> STEP_OUTPUT | None:
-        batch = self.parse_input(batch)
-        batch = self.parse_0_tts(batch)
-
-        self.voicebox.eval()
-
-        cond = batch['cond']
-        self_attn_mask = batch['self_attn_mask']
-        aligned_tokens = batch['aligned_tokens']
-        cond_mask = batch['cond_mask']
-
-        out_spec = self.cfm_wrapper.sample(
-            cond=cond,
-            self_attn_mask=self_attn_mask,
-            aligned_phoneme_ids=aligned_tokens,
-            cond_mask=cond_mask,
-            steps=10,
-            decode_to_audio=False
-        )
-
-        ori_mel = batch['mel']
-        ori_mel_lens = batch['mel_lens']
-        gen_idx = torch.arange(ori_mel.shape[1]).to(ori_mel.device).reshape(1, -1, 1).expand_as(ori_mel)
-        gen_idx = gen_idx + ori_mel_lens.reshape(-1, 1, 1)
-        gen_mel = torch.gather(out_spec, 1, gen_idx)
-        # gen_mel = torch.zeros_like(ori_mel)
-        # for i in range(ori_mel.shape[0]):
-        #     gen_mel[i, :] = out_spec[i, ori_mel_lens[i]:ori_mel_lens[i]+gen_mel.shape[1]]
-
-        # ori_audio = batch["audio_24k"]
-        # ori_audio_lens = batch["audio_lens_24k"]
-        ori_audio = batch["audio"]
-        ori_audio_lens = batch["audio_lens"]
-        gen_audio = self.voicebox.audio_enc_dec.decode(gen_mel)
-        gen_audio_lens = torch.clamp(ori_audio_lens, max=gen_audio.shape[-1])
-
-        # eval metrics
-        self.log("val_num_sample", ori_audio.shape[0], reduce_fx=torch.sum)
-
-        # logging
-        if batch_idx == 0:
-            tb_writer = self.logger.experiment
-            for i in range(ori_mel.shape[0]):
-                tb_writer.add_image(f"val_vb_0_tts/{i}/ori_mel", plot_spectrogram_to_numpy(ori_mel[i, :ori_mel_lens[i]].T.cpu().numpy()), self.global_step, dataformats="HWC")
-                tb_writer.add_image(f"val_vb_0_tts/{i}/gen_mel", plot_spectrogram_to_numpy(gen_mel[i, :ori_mel_lens[i]].T.cpu().numpy()), self.global_step, dataformats="HWC")
-
-                _gen_audio = gen_audio[i, :gen_audio_lens[i]].cpu().numpy()
-                _ori_audio = ori_audio[i, :ori_audio_lens[i]].cpu().numpy()
-                tb_writer.add_audio(f"val_vb/{i}/gen_audio", _gen_audio / max(np.abs(_gen_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
-                tb_writer.add_audio(f"val_vb/{i}/ori_audio", _ori_audio / max(np.abs(_ori_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
-
-        return
-
     def training_step(self, batch: List, batch_idx: int) -> STEP_OUTPUT:
         # voicebox's sampling rate
         # audio = batch["audio_24k"]
@@ -1230,6 +1233,59 @@ class VoiceboxModel(TextToWaveform):
 
         return loss
     
+    @torch.no_grad()
+    def val_vb_0_tts(self, batch: List, batch_idx: int) -> STEP_OUTPUT | None:
+        batch = self.parse_input(batch)
+        batch = self.parse_0_tts(batch)
+
+        self.voicebox.eval()
+
+        cond = batch['cond']
+        self_attn_mask = batch['self_attn_mask']
+        aligned_tokens = batch['aligned_tokens']
+        cond_mask = batch['cond_mask']
+
+        out_spec = self.cfm_wrapper.sample(
+            cond=cond,
+            self_attn_mask=self_attn_mask,
+            aligned_phoneme_ids=aligned_tokens,
+            cond_mask=cond_mask,
+            steps=10,
+            decode_to_audio=False
+        )
+
+        ori_mel = batch['mel']
+        ori_mel_lens = batch['mel_lens']
+        gen_idx = torch.arange(ori_mel.shape[1]).to(ori_mel.device).reshape(1, -1, 1).expand_as(ori_mel)
+        gen_idx = gen_idx + ori_mel_lens.reshape(-1, 1, 1)
+        gen_mel = torch.gather(out_spec, 1, gen_idx)
+        # gen_mel = torch.zeros_like(ori_mel)
+        # for i in range(ori_mel.shape[0]):
+        #     gen_mel[i, :] = out_spec[i, ori_mel_lens[i]:ori_mel_lens[i]+gen_mel.shape[1]]
+
+        # ori_audio = batch["audio_24k"]
+        # ori_audio_lens = batch["audio_lens_24k"]
+        ori_audio = batch["audio"]
+        ori_audio_lens = batch["audio_lens"]
+        gen_audio = self.voicebox.audio_enc_dec.decode(gen_mel)
+        gen_audio_lens = torch.clamp(ori_audio_lens, max=gen_audio.shape[-1])
+
+        # eval metrics
+        self.log("val_num_sample", ori_audio.shape[0], reduce_fx=torch.sum)
+
+        # logging
+        if batch_idx == 0:
+            for i in range(ori_mel.shape[0]):
+                self.log_image(f"val_vb_0_tts/{i}/ori_mel", plot_spectrogram_to_numpy(ori_mel[i, :ori_mel_lens[i]].T.cpu().numpy()), self.global_step)
+                self.log_image(f"val_vb_0_tts/{i}/gen_mel", plot_spectrogram_to_numpy(gen_mel[i, :ori_mel_lens[i]].T.cpu().numpy()), self.global_step)
+
+                _gen_audio = gen_audio[i, :gen_audio_lens[i]].cpu().numpy()
+                _ori_audio = ori_audio[i, :ori_audio_lens[i]].cpu().numpy()
+                self.log_audio(f"val_vb/{i}/gen_audio", _gen_audio / max(np.abs(_gen_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
+                self.log_audio(f"val_vb/{i}/ori_audio", _ori_audio / max(np.abs(_ori_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
+
+        return
+
     def validation_step(self, batch: List, batch_idx: int) -> STEP_OUTPUT | None:
         if self.val_0_tts:
             return self.val_vb_0_tts(batch, batch_idx)
