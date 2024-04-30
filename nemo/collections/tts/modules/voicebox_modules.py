@@ -191,6 +191,13 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
     @property
     def latent_dim(self):
         if self.factorized_latent or self.return_code:
+            return self.model.codebook_dim * self.model.n_codebooks
+        else:
+            return self.model.latent_dim
+
+    @property
+    def masked_latent_dim(self):
+        if self.factorized_latent or self.return_code:
             return self.model.codebook_dim * self.bandwidth_id
         else:
             return self.model.latent_dim
@@ -198,24 +205,36 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
     def encode(self, audio):
         audio = rearrange(audio, 'b t -> b 1 t')
         audio = self.model.preprocess(audio, self.sampling_rate)
-        z, codes, latents, _, _ = self.model.encode(
-            audio, self.bandwidth_id
-        )
+
         if self.factorized_latent:
+            z, codes, latents, _, _ = self.model.encode(audio)
+            latents[:, self.masked_latent_dim:, :] = 0
             return rearrange(latents, 'b d n -> b n d')
+
         elif self.return_code:
+            z, codes, latents, _, _ = self.model.encode(audio)
+            codes[:, self.bandwidth_id:, :] = 0
             return rearrange(codes, 'b d n -> b n d')
+
         else:
+            z, codes, latents, _, _ = self.model.encode(
+                audio, self.bandwidth_id
+            )
             return rearrange(z, 'b d n -> b n d')
 
     def decode(self, latents):
         latents = rearrange(latents, 'b n d -> b d n')
+
         if self.factorized_latent:
+            latents = latents[:, self.masked_latent_dim:, :]
             z_q, z_p, codes = self.model.quantizer.from_latents(latents)
         elif self.return_code:
-            z_q, z_p, codes = self.model.quantizer.from_codes(latents)
+            codes = latents[:, self.bandwidth_id:, :]
+            z_q, z_p, codes = self.model.quantizer.from_codes(codes)
         else:
-            z_q, codes, latents, _, _ = self.model.quantizer(latents, self.bandwidth_id)
+            z = latents
+            z_q, codes, latents, _, _ = self.model.quantizer(z, self.bandwidth_id)
+
         audio = self.model.decode(z_q)
         audio = rearrange(audio, 'b 1 t -> b t')
 
@@ -1003,20 +1022,23 @@ class VoiceBox(_VB, LightningModule):
             assert self.no_diffusion
             # assert code_project_dim == self.audio_enc_dec.model.codebook_dim
             # codebook_size: 1024, codebook_dim: 8
-            self.to_embed = nn.Linear(self.audio_enc_dec.latent_dim + self.dim_cond_emb, dim)
 
             # mask_token: codebook_size
             self.mask_code_id = self.audio_enc_dec.model.codebook_size
-            # TODO:  what about pad_token?? -> zero
+            # what about pad_token?? -> zero
 
             # 8 -> proj_dim
             self.to_code_embs = nn.ModuleList([
                 nn.Embedding(self.audio_enc_dec.model.codebook_size+1, self.audio_enc_dec.model.codebook_dim, padding_idx=self.mask_code_id, device=self.device)
-                for _ in range(self.audio_enc_dec.bandwidth_id)
+                for _ in range(self.audio_enc_dec.model.n_codebooks)
             ])
+
+            # cond_emb + cond_token_emb -> dim
+            self.to_embed = nn.Linear(self.audio_enc_dec.latent_dim + self.dim_cond_emb, dim)
+
             # self.to_pred: proj_dim -> 96
             # to_code: 96 -> 12 cls heads
-            self.to_code = nn.Linear(self.audio_enc_dec.latent_dim, self.audio_enc_dec.bandwidth_id * self.audio_enc_dec.model.codebook_size, device=self.device)
+            self.to_code = nn.Linear(self.audio_enc_dec.latent_dim, self.audio_enc_dec.model.n_codebooks * self.audio_enc_dec.model.codebook_size, device=self.device)
 
 
     def create_cond_mask(self, batch, seq_len, cond_token_ids=None, self_attn_mask=None, training=True, frac_lengths_mask=None):
@@ -1165,11 +1187,11 @@ class VoiceBox(_VB, LightningModule):
             )
 
             # to emb
-            cond = [
-                self.to_code_embs[i](cond[:, :, i])
-                for i in range(self.audio_enc_dec.bandwidth_id)
+            conds = [
+                self.to_code_embs[i](cond[:, :, i]) * (i < self.audio_enc_dec.bandwidth_id)
+                for i in range(self.audio_enc_dec.model.n_codebooks)
             ]
-            cond = torch.concat(cond, dim=-1)
+            cond = torch.concat(conds, dim=-1)
 
             # remove padding
             cond = cond * rearrange(self_attn_mask, 'b t -> b t 1')
@@ -1262,7 +1284,7 @@ class VoiceBox(_VB, LightningModule):
         x = self.to_pred(x)
 
         if self.code_project:
-            x = self.to_code(x).reshape(batch, seq_len, self.audio_enc_dec.bandwidth_id, self.audio_enc_dec.model.codebook_size)
+            x = self.to_code(x).reshape(batch, seq_len, self.audio_enc_dec.model.n_codebooks, self.audio_enc_dec.model.codebook_size)
             outputs["pred"] = torch.argmax(x, dim=-1)
             x = rearrange(x, 'b t n c -> b c t n')
             # TODO: classification loss
@@ -1281,14 +1303,18 @@ class VoiceBox(_VB, LightningModule):
 
         if not exists(loss_mask):
             if self.code_project:
-                return F.cross_entropy(x, target), outputs
+                # x: (b,c,t,n), target: (b,t,n)
+                return F.cross_entropy(x[:, :, :, :self.audio_enc_dec.bandwidth_id], target[:, :, :self.audio_enc_dec.bandwidth_id]), outputs
             else:
-                return F.mse_loss(x, target), outputs
+                # (b,t,d)
+                return F.mse_loss(x[:, :, :self.audio_enc_dec.masked_latent_dim], target[:, :, :self.audio_enc_dec.masked_latent_dim]), outputs
 
         if self.code_project:
-            loss = F.cross_entropy(x, target, reduction = 'none')
+            # x: (b,c,t,n), target: (b,t,n)
+            loss = F.cross_entropy(x[:, :, :, :self.audio_enc_dec.bandwidth_id], target[:, :, :self.audio_enc_dec.bandwidth_id], reduction = 'none')
         else:
-            loss = F.mse_loss(x, target, reduction = 'none')
+            # (b,t,d)
+            loss = F.mse_loss(x[:, :, :self.audio_enc_dec.masked_latent_dim], target[:, :, :self.audio_enc_dec.masked_latent_dim], reduction = 'none')
 
         # TODO: weighted loss for different codes? or simply use less codes?
         loss = reduce(loss, 'b n d -> b n', 'mean')
