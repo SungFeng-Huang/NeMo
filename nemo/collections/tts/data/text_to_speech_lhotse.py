@@ -1,4 +1,7 @@
 import sys
+import os
+from glob import glob
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 from contextlib import contextmanager
 
@@ -85,6 +88,12 @@ class LhotseTextToSpeechDataset(torch.utils.data.Dataset):
         if self.corpus_dir is not None:
             old_path = cut.recording.sources[0].source
             new_path = old_path.replace(self.old_prefix, self.corpus_dir)
+            cut.recording.sources[0].source = new_path
+        if not os.path.exists(old_path):
+            # HF random path
+            old_path = Path(old_path)
+            new_path = glob(str(old_path.parents[2] / "*" / old_path.parts[-2] / old_path.parts[-1]))[0]
+            # print(str(old_path), str(new_path))
             cut.recording.sources[0].source = new_path
         return cut
 
