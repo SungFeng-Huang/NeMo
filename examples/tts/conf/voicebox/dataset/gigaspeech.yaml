@@ -4,7 +4,7 @@
 
 ds_name: gigaspeech
 
-password: ???
+# password: ???
 
 corpus_dir: data/download/GigaSpeech
 manifests_dir: data/parsed/GigaSpeech  # parsed manifests (e.g. filtering, add alignments, etc.)

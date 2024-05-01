@@ -287,6 +287,7 @@ class VoiceboxModel(TextToWaveform):
         """ Download GigaSpeech corpus. """
         if source == "lhotse":
             from lhotse.recipes.gigaspeech import download_gigaspeech, prepare_gigaspeech
+            assert hasattr(self._cfg, "password")
             download_gigaspeech(password=self._cfg.password, target_dir=target_dir, dataset_parts=dataset_parts, host="tsinghua")
         elif source == "huggingface":
             import datasets
@@ -390,9 +391,6 @@ class VoiceboxModel(TextToWaveform):
                     _part = part.lower()
                     break
             ds = load_dataset("esb/datasets", "gigaspeech", subconfig=_part, download_config=datasets.DownloadConfig(resume_download=True))
-            ds = ds.cast_column("audio", Audio(decode=False))
-            ds = ds.filter(has_valid_audio)
-            ds = ds.cast_column("audio", Audio(decode=True))
             print(ds)
             # for split in ["train", "validation", "test"]:
             for split in ["train", "validation"]:
@@ -411,6 +409,11 @@ class VoiceboxModel(TextToWaveform):
                 ):
                     logging.info(f"GigaSpeech subset: {part} already prepared - skipping.")
                     continue
+
+                ds = ds.cast_column("audio", Audio(decode=False))
+                ds = ds.filter(has_valid_audio)
+                ds = ds.cast_column("audio", Audio(decode=True))
+                print(ds)
 
                 with RecordingSet.open_writer(
                     output_dir / f"gigaspeech_recordings_{part}.speech.jsonl.gz"
