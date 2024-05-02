@@ -226,10 +226,10 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
         latents = rearrange(latents, 'b n d -> b d n')
 
         if self.factorized_latent:
-            latents = latents[:, self.masked_latent_dim:, :]
+            latents = latents[:, :self.masked_latent_dim, :]
             z_q, z_p, codes = self.model.quantizer.from_latents(latents)
         elif self.return_code:
-            codes = latents[:, self.bandwidth_id:, :]
+            codes = latents[:, :self.bandwidth_id, :]
             z_q, z_p, codes = self.model.quantizer.from_codes(codes)
         else:
             z = latents

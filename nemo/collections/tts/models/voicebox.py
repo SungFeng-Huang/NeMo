@@ -1131,9 +1131,12 @@ class VoiceboxModel(TextToWaveform):
                 self.log_image("train_vb/cond", plot_spectrogram_to_numpy(cond[plot_id].T.detach().cpu().numpy()), self.global_step)
                 self.log_image("train_vb/pred_x1", plot_spectrogram_to_numpy(pred_x1[plot_id].T.detach().cpu().numpy()), self.global_step)
 
-            pred_audio = self.voicebox.audio_enc_dec.decode(pred_x1)[plot_id].detach().cpu().numpy()
+            with torch.no_grad():
+                pred_audio = self.voicebox.audio_enc_dec.decode(pred_x1)[plot_id].detach().cpu().numpy()
+                recon_audio = self.voicebox.audio_enc_dec.decode(x1)[plot_id].detach().cpu().numpy()
             orig_audio = audio[plot_id].detach().cpu().numpy()
             self.log_audio("train_vb/pred_audio", pred_audio / max(np.abs(pred_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
+            self.log_audio("train_vb/recon_audio", recon_audio / max(np.abs(recon_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
             self.log_audio("train_vb/orig_audio", orig_audio / max(np.abs(orig_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
             self.log_commit(self.global_step)
 
@@ -1203,9 +1206,12 @@ class VoiceboxModel(TextToWaveform):
                 self.log_image(f"val_vb/{plot_id}/cond", plot_spectrogram_to_numpy(cond[plot_id, :mel_len[plot_id]].T.detach().cpu().numpy()), self.global_step)
                 self.log_image(f"val_vb/{plot_id}/pred_x1", plot_spectrogram_to_numpy(pred_x1[plot_id, :mel_len[plot_id]].T.detach().cpu().numpy()), self.global_step)
 
-                _pred_audio = self.voicebox.audio_enc_dec.decode(pred_x1[None, plot_id, :mel_len[plot_id]])[0].detach().cpu().numpy()
+                with torch.no_grad():
+                    _pred_audio = self.voicebox.audio_enc_dec.decode(pred_x1[None, plot_id, :mel_len[plot_id]])[0].detach().cpu().numpy()
+                    _recon_audio = self.voicebox.audio_enc_dec.decode(x1[None, plot_id, :mel_len[plot_id]])[0].detach().cpu().numpy()
                 _orig_audio = audio[plot_id, :audio_len[plot_id]].detach().cpu().numpy()
                 self.log_audio(f"val_vb/{plot_id}/pred_audio", _pred_audio / max(np.abs(_pred_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
+                self.log_audio(f"val_vb/{plot_id}/recon_audio", _recon_audio / max(np.abs(_recon_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
                 self.log_audio(f"val_vb/{plot_id}/orig_audio", _orig_audio / max(np.abs(_orig_audio)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
                 # self.log_audio(f"val_vb/{plot_id}/pred_audio", _pred_audio / np.sqrt(np.mean(_pred_audio ** 2)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
                 # self.log_audio(f"val_vb/{plot_id}/orig_audio", _orig_audio / np.sqrt(np.mean(_orig_audio ** 2)), self.global_step, sample_rate=self.voicebox.audio_enc_dec.sampling_rate)
