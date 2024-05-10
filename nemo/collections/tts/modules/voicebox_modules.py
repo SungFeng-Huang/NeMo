@@ -234,7 +234,8 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
             z_q, z_p, codes = self.model.quantizer.from_codes(codes)
         else:
             z = latents
-            z_q, codes, latents, _, _ = self.model.quantizer(z, self.bandwidth_id)
+            # z_q, codes, latents, _, _ = self.model.quantizer(z, self.bandwidth_id)
+            z_q = z
 
         audio = self.model.decode(z_q)
         audio = rearrange(audio, 'b 1 t -> b t')
@@ -1332,7 +1333,6 @@ class VoiceBox(_VB, LightningModule):
         loss = num / den
 
         outputs["loss_mask"] = loss_mask
-        outputs["cond_mask"] = cond_mask
         outputs["self_attn_mask"] = self_attn_mask
 
         return loss.mean(), outputs
