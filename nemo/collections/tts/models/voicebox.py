@@ -174,7 +174,8 @@ class VoiceboxModel(TextToWaveform):
         self.maybe_init_from_pretrained_checkpoint(cfg=cfg, map_location='cpu')
 
         self.val_0_tts = cfg.get("val_0_tts", False)
-        self.waveform_loss = cfg.voicebox.get("waveform_loss", False)
+        self.waveform_loss = cfg.get("waveform_loss", False)
+        self.cap_vocode = cfg.get("cap_vocode", False)
 
     def _download_libriheavy(self, target_dir, dataset_parts):
         """ Download LibriHeavy manifests. """
@@ -1137,6 +1138,8 @@ class VoiceboxModel(TextToWaveform):
                 self.log_image("train_vb/pred_x1", plot_spectrogram_to_numpy(pred_x1[plot_id].T.detach().cpu().numpy()), self.global_step)
 
             with torch.no_grad():
+                if self.cap_vocode:
+                    pred_x1 = torch.where(cond_mask, pred_x1, x1)
                 pred_audio = self.voicebox.audio_enc_dec.decode(pred_x1)[plot_id].detach().cpu().numpy()
                 recon_audio = self.voicebox.audio_enc_dec.decode(x1)[plot_id].detach().cpu().numpy()
             orig_audio = audio[plot_id].detach().cpu().numpy()
@@ -1207,8 +1210,11 @@ class VoiceboxModel(TextToWaveform):
             audio_len = audio_mask.sum(-1)
             mel_len = self_attn_mask.sum(-1)
 
-            cond = cond * ~rearrange(cond_mask, '... -> ... 1')
+            cond_mask = rearrange(cond_mask, '... -> ... 1')
+            cond = cond * ~cond_mask
             pred_x1 = output_audio
+            if self.cap_vocode:
+                pred_x1 = torch.where(cond_mask, pred_x1, x1)
 
             for plot_id in range(x1.shape[0]):
                 self.log_image(f"val_vb/{plot_id}/x1", plot_spectrogram_to_numpy(x1[plot_id, :mel_len[plot_id]].T.detach().cpu().numpy()), self.global_step)
