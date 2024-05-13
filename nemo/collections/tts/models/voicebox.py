@@ -564,7 +564,9 @@ class VoiceboxModel(TextToWaveform):
             global_rank=self.global_rank,
             world_size=self.world_size,
             dataset=LhotseTextToSpeechDataset(
+                ds_name= self.cfg.ds_name,
                 corpus_dir=self.cfg.corpus_dir,
+                old_prefix=self.cfg.old_prefix,
                 **ds_kwargs
             ),
         )
