@@ -171,6 +171,7 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
         bandwidth_id = None,
         factorized_latent = False,
         return_code = False,
+        preq_ce = False,
     ):
         super().__init__()
         model_path = dac.utils.download(model_type=pretrained_path)
@@ -180,8 +181,15 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
 
         bandwidth_id = self.model.n_codebooks if not bandwidth_id else bandwidth_id
         self.register_buffer('bandwidth_id', torch.tensor([bandwidth_id]))
+
+        # factorize to 8-dim per code * bandwidth_id codebooks
         self.register_buffer('factorized_latent', torch.BoolTensor([factorized_latent]))
+
+        # use code tokens
         self.register_buffer('return_code', torch.BoolTensor([return_code]))
+
+        # pre-quantize feature + cross-entropy loss
+        self.register_buffer('preq_ce', torch.BoolTensor([preq_ce]))
         self.freeze()
 
     @property
@@ -217,6 +225,10 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
             codes[:, self.bandwidth_id:, :] = 0
             return rearrange(codes, 'b d n -> b n d')
 
+        elif self.preq_ce:
+            z = self.model.encoder(audio)
+            return rearrange(z, 'b d n -> b n d')
+
         else:
             z, codes, latents, _, _ = self.model.encode(
                 audio, self.bandwidth_id
@@ -232,15 +244,80 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
         elif self.return_code:
             codes = latents[:, :self.bandwidth_id, :]
             z_q, z_p, codes = self.model.quantizer.from_codes(codes)
-        else:
+        elif self.preq_ce:
             z = latents
-            # z_q, codes, latents, _, _ = self.model.quantizer(z, self.bandwidth_id)
-            z_q = z
+            z_q, codes, latents, _, _ = self.model.quantizer(z, self.bandwidth_id)
+        else:
+            z_q = latents
 
         audio = self.model.decode(z_q)
         audio = rearrange(audio, 'b 1 t -> b t')
 
         return audio
+
+    def cross_entropy_loss(self, z_pred, z):
+        """
+        Args:
+            z_pred: predicted pre-quantize z
+            z: ground truth pre-quantize z
+        """
+        z_pred = rearrange(z_pred, 'b n d -> b d n')
+        z = rearrange(z, 'b n d -> b d n')
+        with torch.no_grad():
+            _, codes, _, _, _ = self.model.quantizer.forward(z, self.bandwidth_id)
+
+        z_q = 0
+        residual = z_pred
+        commitment_loss = 0
+        codebook_loss = 0
+
+        codebook_indices = []
+        latents = []
+        z_e = []
+        distances = []
+
+        n_quantizers = self.bandwidth_id
+
+        for i, quantizer in enumerate(self.model.quantizer.quantizers):
+            if i >= n_quantizers:
+                break
+
+            # Factorized codes (ViT-VQGAN) Project input into low-dimensional space
+            z_e_i = quantizer.in_proj(residual)
+
+            encodings = rearrange(z_e_i, "b d t -> (b t) d")
+            codebook = quantizer.codebook.weight  # codebook: (N x D)
+
+            # L2 normalize encodings and codebook (ViT-VQGAN)
+            encodings = F.normalize(encodings)
+            codebook = F.normalize(codebook)
+
+            # Compute euclidean distance with codebook -> ((b t) N)
+            dist = (
+                encodings.pow(2).sum(1, keepdim=True)
+                - 2 * encodings @ codebook.t()
+                + codebook.pow(2).sum(1, keepdim=True).t()
+            )
+
+            indices_i = codes[:, i]
+            z_q_i = quantizer.decode_code(indices_i)
+            z_q_i = quantizer.out_proj(z_q_i)
+
+            z_q = z_q + z_q_i
+            residual = residual - z_q_i
+
+            z_e.append(z_e_i)
+            distances.append(dist)
+
+        distances = -torch.stack(distances, -1)
+        ce_loss = F.cross_entropy(
+            rearrange(distances, '(b t) c i -> b c t i', b = z_pred.shape[0]),
+            rearrange(codes, 'b i t -> b t i')[:, :, :n_quantizers],
+            ignore_index = -1,
+            reduction='none',
+        )
+
+        return ce_loss
 
 
 class Aligner(_Aligner):
@@ -1661,7 +1738,6 @@ class ConditionalFlowMatcherWrapper(_CFMWrapper, LightningModule):
                     cond_token_ids = cond_token_ids,
                     cond_drop_prob = self.cond_drop_prob
                 )
-                # TODO: vb_outputs for plots
 
         else:
             # main conditional flow logic is below
@@ -1740,4 +1816,28 @@ class ConditionalFlowMatcherWrapper(_CFMWrapper, LightningModule):
         num = reduce(loss, 'b n -> b', 'sum')
         den = audio_loss_mask.sum(dim = -1).clamp(min = 1e-5)
         loss = num / den
-        return loss
+        return loss.mean()
+
+    def cross_entropy_loss(self, outputs, audio, audio_mask):
+        if self.voicebox.no_diffusion:
+            pred_x1 = outputs['vb']['pred']
+        else:
+            x0, pred_dx = outputs['vb']['x0'], outputs['vb']['pred']
+            σ = self.sigma
+            pred_x1 = pred_dx + (1 - σ) * x0
+        x1 = outputs['vb']['x1']
+
+        loss = self.voicebox.audio_enc_dec.cross_entropy_loss(pred_x1, x1)
+
+        loss_mask = outputs['vb']['loss_mask']
+
+        # masked mean
+        # (b, t, n_codebooks)
+        loss = reduce(loss, 'b t d -> b t', 'mean')
+        loss = loss.masked_fill(~loss_mask, 0.)
+
+        num = reduce(loss, 'b t -> b', 'sum')
+        den = loss_mask.sum(dim = -1).clamp(min = 1e-5)
+        loss = num / den
+
+        return loss.mean()

@@ -176,6 +176,7 @@ class VoiceboxModel(TextToWaveform):
         self.val_0_tts = cfg.get("val_0_tts", False)
         self.waveform_loss = cfg.get("waveform_loss", False)
         self.cap_vocode = cfg.get("cap_vocode", False)
+        self.ce_loss_lambda = 0.1
 
     def _download_libriheavy(self, target_dir, dataset_parts):
         """ Download LibriHeavy manifests. """
@@ -497,8 +498,9 @@ class VoiceboxModel(TextToWaveform):
                 self._download_libritts(target_dir=self._cfg.corpus_dir, dataset_parts=dataset_parts)
                 self._prepare_libritts(corpus_dir=self._cfg.corpus_dir, output_dir=self._cfg.manifests_dir, textgrid_dir=self._cfg.textgrid_dir, dataset_parts=dataset_parts)
             elif self._cfg.ds_name == "gigaspeech":
-                self._download_gigaspeech(target_dir=self._cfg.corpus_dir, dataset_parts=dataset_parts)
-                self._prepare_gigaspeech(corpus_dir=self._cfg.corpus_dir, output_dir=self._cfg.manifests_dir, textgrid_dir=self._cfg.textgrid_dir, dataset_parts=dataset_parts)
+                # self._download_gigaspeech(target_dir=self._cfg.corpus_dir, dataset_parts=dataset_parts)
+                # self._prepare_gigaspeech(corpus_dir=self._cfg.corpus_dir, output_dir=self._cfg.manifests_dir, textgrid_dir=self._cfg.textgrid_dir, dataset_parts=dataset_parts)
+                pass
 
     def setup(self, stage: Optional[str] = None):
         """Called at the beginning of fit, validate, test, or predict.
@@ -1111,6 +1113,10 @@ class VoiceboxModel(TextToWaveform):
             input_sampling_rate=None
         )
 
+        if getattr(self.voicebox.audio_enc_dec, "preq_ce", False):
+            ce_loss = self.cfm_wrapper.cross_entropy_loss(outputs, audio, audio_mask)
+            losses['ce'] = ce_loss
+
         if self.waveform_loss:
             waveform_loss = self.cfm_wrapper.waveform_loss(outputs, audio, audio_mask)
             losses['waveform'] = waveform_loss
@@ -1172,6 +1178,10 @@ class VoiceboxModel(TextToWaveform):
             cond_mask=None,
             input_sampling_rate=None
         )
+
+        if getattr(self.voicebox.audio_enc_dec, "preq_ce", False):
+            ce_loss = self.cfm_wrapper.cross_entropy_loss(outputs, audio, audio_mask)
+            losses['ce'] = ce_loss
         
         if self.waveform_loss:
             waveform_loss = self.cfm_wrapper.waveform_loss(outputs, audio, audio_mask)
@@ -1279,8 +1289,9 @@ class VoiceboxModel(TextToWaveform):
         bin_loss = losses.get('bin', 0)
         vb_loss = losses['vb']
         wv_loss = losses.get('waveform', 0)
+        ce_loss = losses.get('ce', 0) * self.ce_loss_lambda
 
-        loss = align_loss + bin_loss + dp_loss + vb_loss + wv_loss
+        loss = align_loss + bin_loss + dp_loss + vb_loss + wv_loss + ce_loss
 
         self.log_dict({f"train_loss/{k}": v for k, v in losses.items()}, sync_dist=True, batch_size=audio.shape[0])
         self.log("train_loss_vb", vb_loss, prog_bar=True, sync_dist=True, batch_size=audio.shape[0])
@@ -1385,8 +1396,9 @@ class VoiceboxModel(TextToWaveform):
         bin_loss = losses.get('bin', 0)
         vb_loss = losses['vb']
         wv_loss = losses.get('waveform', 0)
+        ce_loss = losses.get('ce', 0) * self.ce_loss_lambda
 
-        loss = align_loss + bin_loss + dp_loss + vb_loss + wv_loss
+        loss = align_loss + bin_loss + dp_loss + vb_loss + wv_loss + ce_loss
         self.log_dict({f"val_loss/{k}": v for k, v in losses.items()}, sync_dist=True, batch_size=audio.shape[0])
         self.log("val_loss_total", loss, prog_bar=True, sync_dist=True, batch_size=audio.shape[0])
         return loss
