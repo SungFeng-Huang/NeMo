@@ -174,7 +174,10 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
         preq_ce = False,
     ):
         super().__init__()
-        model_path = dac.utils.download(model_type=pretrained_path)
+        if pretrained_path in ["44khz", "24khz", "16khz"]:
+            model_path = dac.utils.download(model_type=pretrained_path)
+        else:
+            model_path = pretrained_path
         self.model = dac.DAC.load(model_path)
         self.sampling_rate = sampling_rate
         assert self.sampling_rate == self.model.sample_rate
