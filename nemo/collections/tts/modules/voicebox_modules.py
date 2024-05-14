@@ -1124,8 +1124,8 @@ class VoiceBox(_VB, LightningModule):
         if training:
             frac_lengths_mask = default(frac_lengths_mask, self.frac_lengths_mask)
             frac_lengths = torch.zeros((batch,), device = self.device).float().uniform_(*frac_lengths_mask)
-            # cond_mask = mask_from_frac_lengths(seq_len, frac_lengths)
-            cond_mask = self.phone_level_mask_from_frac_lengths(seq_len, frac_lengths, cond_token_ids, self_attn_mask)
+            cond_mask = mask_from_frac_lengths(seq_len, frac_lengths)
+            # cond_mask = self.phone_level_mask_from_frac_lengths(seq_len, frac_lengths, cond_token_ids, self_attn_mask)
         else:
             cond_mask = torch.zeros((batch, seq_len), device = self.device, dtype = torch.bool)
         return cond_mask
