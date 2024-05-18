@@ -1123,12 +1123,14 @@ class VoiceBox(_VB, LightningModule):
             self.to_code = nn.Linear(self.audio_enc_dec.latent_dim, self.audio_enc_dec.model.n_codebooks * self.audio_enc_dec.model.codebook_size, device=self.device)
 
 
-    def create_cond_mask(self, batch, seq_len, cond_token_ids=None, self_attn_mask=None, training=True, frac_lengths_mask=None):
+    def create_cond_mask(self, batch, seq_len, cond_token_ids=None, self_attn_mask=None, training=True, frac_lengths_mask=None, phn_bnd_eps=None):
         if training:
             frac_lengths_mask = default(frac_lengths_mask, self.frac_lengths_mask)
             frac_lengths = torch.zeros((batch,), device = self.device).float().uniform_(*frac_lengths_mask)
-            cond_mask = mask_from_frac_lengths(seq_len, frac_lengths)
-            # cond_mask = self.phone_level_mask_from_frac_lengths(seq_len, frac_lengths, cond_token_ids, self_attn_mask)
+            if phn_bnd_eps is None:
+                cond_mask = mask_from_frac_lengths(seq_len, frac_lengths)
+            else:
+                cond_mask = self.phone_level_mask_from_frac_lengths(seq_len, frac_lengths, cond_token_ids, self_attn_mask, phn_bnd_eps)
         else:
             cond_mask = torch.zeros((batch, seq_len), device = self.device, dtype = torch.bool)
         return cond_mask
@@ -1140,6 +1142,7 @@ class VoiceBox(_VB, LightningModule):
         frac_lengths: Tensor,
         cond_token_ids: Tensor,
         self_attn_mask: None | Tensor = None,
+        phn_bnd_eps: None | int | float = None,
     ):
         device = frac_lengths.device
 
