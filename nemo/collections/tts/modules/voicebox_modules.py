@@ -172,6 +172,7 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
         factorized_latent = False,
         return_code = False,
         preq_ce = False,
+        ce_weights = None,
     ):
         super().__init__()
         if pretrained_path in ["44khz", "24khz", "16khz"]:
@@ -193,6 +194,7 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
 
         # pre-quantize feature + cross-entropy loss
         self.register_buffer('preq_ce', torch.BoolTensor([preq_ce]))
+        self.ce_weights = None if ce_weights is None else torch.tensor(ce_weights[:self.bandwidth_id])
         self.freeze()
 
     @property
@@ -319,6 +321,9 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
             ignore_index = -1,
             reduction='none',
         )
+        if self.ce_weights is not None:
+            self.ce_weights = self.ce_weights.to(self.device)
+            ce_loss = ce_loss * self.ce_weights
 
         return ce_loss
 
@@ -1127,6 +1132,7 @@ class VoiceBox(_VB, LightningModule):
         if training:
             frac_lengths_mask = default(frac_lengths_mask, self.frac_lengths_mask)
             frac_lengths = torch.zeros((batch,), device = self.device).float().uniform_(*frac_lengths_mask)
+            assert phn_bnd_eps is None, "phn_bnd_eps feature work in progress"
             if phn_bnd_eps is None:
                 cond_mask = mask_from_frac_lengths(seq_len, frac_lengths)
             else:
