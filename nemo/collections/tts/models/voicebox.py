@@ -393,8 +393,6 @@ class VoiceboxModel(TextToWaveform):
                 if part.lower() in ["xs", "s", "m", "l", "xl"]: # dev/test will auto-downloaded w/ train set
                     _part = part.lower()
                     break
-            ds = load_dataset("esb/datasets", "gigaspeech", subconfig=_part, download_config=datasets.DownloadConfig(resume_download=True))
-            print(ds)
             # for split in ["train", "validation", "test"]:
             for split in ["train", "validation"]:
                 # if split == "train":
@@ -413,6 +411,8 @@ class VoiceboxModel(TextToWaveform):
                     logging.info(f"GigaSpeech subset: {part} already prepared - skipping.")
                     continue
 
+                ds = load_dataset("esb/datasets", "gigaspeech", subconfig=_part, download_config=datasets.DownloadConfig(resume_download=True))
+                print(ds)
                 ds = ds.cast_column("audio", Audio(decode=False))
                 ds = ds.filter(has_valid_audio)
                 ds = ds.cast_column("audio", Audio(decode=True))
