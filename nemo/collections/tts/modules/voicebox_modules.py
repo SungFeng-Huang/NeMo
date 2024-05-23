@@ -1335,6 +1335,9 @@ class VoiceBox(_VB, LightningModule):
                     self.null_cond,
                     cond
                 )
+                
+                p_drop_mask = prob_mask_like(cond.shape[:1], self.p_drop_prob, self.device)
+                times = times * ~p_drop_mask
 
         # phoneme or semantic conditioning embedding
 
