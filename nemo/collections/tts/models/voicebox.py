@@ -412,18 +412,18 @@ class VoiceboxModel(TextToWaveform):
                     logging.info(f"GigaSpeech subset: {part} already prepared - skipping.")
 
                     if self.additional_log_batches > 0:
-                        logging.info(f"Processing GigaSpeech subset: DEV_with_jensen")
+                        logging.info(f"Processing GigaSpeech subset: {part}_with_jensen")
                         if manifests_exist(
-                            part="DEV_with_jensen", output_dir=output_dir, types=["cuts"], prefix="gigaspeech", suffix="speech.jsonl.gz"
+                            part=f"{part}_with_jensen", output_dir=output_dir, types=["cuts"], prefix="gigaspeech", suffix="speech.jsonl.gz"
                         ):
-                            logging.info(f"GigaSpeech subset: DEV_with_jensen already prepared - skipping.")
+                            logging.info(f"GigaSpeech subset: {part}_with_jensen already prepared - skipping.")
 
                         else:
                             manifests = self._prepare_jensen(corpus_dir, output_dir)
                             jensen_cuts = manifests["cuts"]
-                            dev_cuts = CutSet.from_jsonl_lazy(output_dir / f"gigaspeech_cuts_DEV.speech.jsonl.gz")
-                            cuts = jensen_cuts + dev_cuts
-                            cuts.to_file(output_dir / f"gigaspeech_cuts_DEV_with_jensen.speech.jsonl.gz")
+                            gs_cuts = CutSet.from_jsonl_lazy(output_dir / f"gigaspeech_cuts_{part}.speech.jsonl.gz")
+                            cuts = jensen_cuts + gs_cuts
+                            cuts.to_file(output_dir / f"gigaspeech_cuts_{part}_with_jensen.speech.jsonl.gz")
 
                     continue
 
@@ -558,13 +558,52 @@ class VoiceboxModel(TextToWaveform):
                     id="2024_GTC_jensen-3",
                     recording_id="2024_GTC_jensen",
                     start=30.69,
-                    duration=22.91,
+                    duration=10.78,
                     channel=0,
-                    text="the latest the state-of-the-art open AI model is approximately one point eight trillion parameters one point eight trillion parameters required several trillion tokens to go train when you multiply the two of them together approximately thirty fourty fifty billion quadrillion floating Point operations per second so you have thirty billion quadrillion",
+                    text="the latest the state-of-the-art open AI model is approximately one point eight trillion parameters one point eight trillion parameters required several trillion tokens to go train",
                     language='English',
                     alignment={
-                        "words": alignments["words"][107:179],
-                        "phones": alignments["phones"][366:621],
+                        "words": alignments["words"][107:143],
+                        "phones": alignments["phones"][366:486],
+                    },
+                ),
+                SupervisionSegment(
+                    id="2024_GTC_jensen-4",
+                    recording_id="2024_GTC_jensen",
+                    start=41.19,
+                    duration=12.41,
+                    channel=0,
+                    text="when you multiply the two of them together approximately thirty fourty fifty billion quadrillion floating Point operations per second so you have thirty billion quadrillion",
+                    language='English',
+                    alignment={
+                        "words": alignments["words"][142:179],
+                        "phones": alignments["phones"][485:621],
+                    },
+                ),
+                SupervisionSegment(
+                    id="2024_GTC_jensen-5",
+                    recording_id="2024_GTC_jensen",
+                    start=53.35,
+                    duration=14.34,
+                    channel=0,
+                    text="a quadrillion is like a peta and so if you had a peta-flop GPU you would need thirty billion seconds to go compute to go train that model thirty billion seconds is approximately one thousand years",
+                    language='English',
+                    alignment={
+                        "words": alignments["words"][178:226],
+                        "phones": alignments["phones"][620:769],
+                    },
+                ),
+                SupervisionSegment(
+                    id="2024_GTC_jensen-6",
+                    recording_id="2024_GTC_jensen",
+                    start=67.4,
+                    duration=15.773878,
+                    channel=0,
+                    text="what we need are bigger gpus we need much much bigger gpus we recognized this early on and we realized that the answer is to put a whole bunch of gpus together",
+                    language='English',
+                    alignment={
+                        "words": alignments["words"][225:],
+                        "phones": alignments["phones"][768:],
                     },
                 ),
             ]
