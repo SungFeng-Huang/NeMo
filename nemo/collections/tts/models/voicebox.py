@@ -1394,10 +1394,7 @@ class VoiceboxModel(TextToWaveform):
                 pred_x1 = torch.where(cond_mask, pred_x1, x1)
 
             for plot_id in range(x1.shape[0]):
-                if batch_idx < self.additional_log_batches:
-                    log_id = cuts[plot_id].id
-                else:
-                    log_id = plot_id
+                log_id = cuts[plot_id].id
                 self.log_image(f"val_vb/{log_id}/x1", plot_spectrogram_to_numpy(x1[plot_id, :mel_len[plot_id]].T.detach().cpu().numpy()), self.global_step)
                 self.log_image(f"val_vb/{log_id}/cond", plot_spectrogram_to_numpy(cond[plot_id, :mel_len[plot_id]].T.detach().cpu().numpy()), self.global_step)
                 self.log_image(f"val_vb/{log_id}/pred_x1", plot_spectrogram_to_numpy(pred_x1[plot_id, :mel_len[plot_id]].T.detach().cpu().numpy()), self.global_step)
