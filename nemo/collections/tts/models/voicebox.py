@@ -411,7 +411,7 @@ class VoiceboxModel(TextToWaveform):
                 ):
                     logging.info(f"GigaSpeech subset: {part} already prepared - skipping.")
 
-                    if split == "validation" and self.additional_log_batches > 0:
+                    if self.additional_log_batches > 0:
                         logging.info(f"Processing GigaSpeech subset: DEV_with_jensen")
                         if manifests_exist(
                             part="DEV_with_jensen", output_dir=output_dir, types=["cuts"], prefix="gigaspeech", suffix="speech.jsonl.gz"
