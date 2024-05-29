@@ -1511,7 +1511,8 @@ class ConditionalFlowMatcherWrapper(_CFMWrapper, LightningModule):
         decode_to_audio = True,
         max_semantic_token_ids = 2048,
         spec_decode = False,
-        spec_decode_gamma = 5 # could be higher, since speech is probably easier than text, needs to be tested
+        spec_decode_gamma = 5, # could be higher, since speech is probably easier than text, needs to be tested
+        sample_std = 1.,
     ):
         """
         Handle slf_attn_mask (cond_mask)
@@ -1607,7 +1608,7 @@ class ConditionalFlowMatcherWrapper(_CFMWrapper, LightningModule):
 
             return out
 
-        y0 = torch.randn_like(cond)
+        y0 = torch.randn_like(cond) * sample_std
         t = torch.linspace(0, 1, steps, device = self.device)
 
         if not self.use_torchode:

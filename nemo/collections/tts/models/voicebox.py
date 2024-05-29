@@ -1076,7 +1076,8 @@ class VoiceboxModel(TextToWaveform):
             self_attn_mask=args["self_attn_mask"],
             steps=steps,
             cond_scale=cond_scale,
-            decode_to_audio=False
+            decode_to_audio=False,
+            sample_std=0.01,
         )
 
         edit_mel = torch.ones_like(new_cond) * -4.5252
@@ -1381,7 +1382,8 @@ class VoiceboxModel(TextToWaveform):
                     aligned_phoneme_ids=tokens,
                     cond_mask=cond_mask,
                     steps=100,
-                    decode_to_audio=False
+                    decode_to_audio=False,
+                    sample_std=0.01,
                 )
             
             audio_len = audio_mask.sum(-1)
