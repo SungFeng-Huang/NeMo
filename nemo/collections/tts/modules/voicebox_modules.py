@@ -1039,6 +1039,8 @@ class VoiceBox(_VB, LightningModule):
         no_diffusion = False,
         # rmsnorm_shape = -1,
         fix_time_emb = False,
+        text_encode = False,
+        text_enc_depth = 4,
         **kwargs
     ):
         """
@@ -1070,6 +1072,10 @@ class VoiceBox(_VB, LightningModule):
             - p_drop_prob = 0.3, p_drop in paper
             - frac_lengths_mask: Tuple[float, float] = (0.7, 1.),
         """
+        if text_encode:
+            text_enc_depth = min(text_enc_depth, depth//2)
+            depth = depth - text_enc_depth
+
         super().__init__(
             *_args,
             num_cond_tokens=num_cond_tokens,
@@ -1131,6 +1137,23 @@ class VoiceBox(_VB, LightningModule):
             # to_code: 96 -> 12 cls heads
             self.to_code = nn.Linear(self.audio_enc_dec.latent_dim, self.audio_enc_dec.model.n_codebooks * self.audio_enc_dec.model.codebook_size, device=self.device)
 
+        self.text_encode = text_encode
+        if self.text_encode:
+            assert dim == dim_cond_emb
+            self.text_encoder = Transformer(
+                dim = dim,
+                depth = text_enc_depth,
+                dim_head = dim_head,
+                heads = heads,
+                ff_mult = ff_mult,
+                ff_dropout = ff_dropout,
+                attn_dropout= attn_dropout,
+                attn_flash = attn_flash,
+                attn_qk_norm = attn_qk_norm,
+                num_register_tokens = num_register_tokens,
+                adaptive_rmsnorm = False,
+                use_gateloop_layers = use_gateloop_layers
+            )
 
     def create_cond_mask(self, batch, seq_len, cond_token_ids=None, self_attn_mask=None, training=True, frac_lengths_mask=None, phn_bnd_eps=None):
         if training:
@@ -1361,6 +1384,15 @@ class VoiceBox(_VB, LightningModule):
 
         # concat source signal, semantic / phoneme conditioning embed, and conditioning
         # and project
+
+        if self.text_encode:
+            conv_cond = self.conv_embed(cond)
+            conv_text = self.conv_embed(cond_emb)
+            to_concat = [*filter(exists, (conv_cond, conv_text))]
+            conv_cond_text = torch.cat(to_concat, dim = 1)
+            mask = torch.cat([~cond_mask_with_pad_dim * self_attn_mask, self_attn_mask], dim=1)
+            conv_cond_text = self.text_encoder(conv_cond_text, mask=mask)
+            cond = conv_cond_text[:, seq_len:]
 
         to_concat = [*filter(exists, (x, cond_emb, cond))]
         embed = torch.cat(to_concat, dim = -1)
