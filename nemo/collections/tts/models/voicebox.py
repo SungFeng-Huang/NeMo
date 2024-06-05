@@ -902,6 +902,8 @@ class VoiceboxModel(TextToWaveform):
         steps = 3,
         cond_scale = 1.,
         decode_to_audio = True,
+        sample_std = 1.0,
+        dp_scale = 1.0,
     ):
         """
         Args:
@@ -1006,7 +1008,7 @@ class VoiceboxModel(TextToWaveform):
             return_aligned_phoneme_ids=False,
         )
         # cut-and-paste predicted durations and duplicate tokens
-        new_dur = torch.where(dp_cond_mask, dp_outputs["durations"].round(), dp_cond).int().clamp(min=0)
+        new_dur = torch.where(dp_cond_mask, (dp_outputs["durations"] * dp_scale).round(), dp_cond).int().clamp(min=0)
         new_mel_lens = new_dur.sum(-1)
 
         # construct new_cond
@@ -1077,7 +1079,7 @@ class VoiceboxModel(TextToWaveform):
             steps=steps,
             cond_scale=cond_scale,
             decode_to_audio=False,
-            sample_std=0.01,
+            sample_std=sample_std,
         )
 
         edit_mel = torch.ones_like(new_cond) * -4.5252
@@ -1099,13 +1101,17 @@ class VoiceboxModel(TextToWaveform):
         new_cond_ed_idx = torch.clamp(cond_ed_idx * hop_size, max=ztts_audio.shape[-1])
         ori_cond_st_idx = new_cond_st_idx
         ori_cond_ed_idx = audio_lens - (new_audio_lens - new_cond_ed_idx)
+
+        cap_audio = torch.zeros_like(ztts_audio)
         for i in range(len(batch)):
-            ztts_audio[i, :new_cond_st_idx[i]] = audio[i, :ori_cond_st_idx[i]]
-            ztts_audio[i, new_cond_ed_idx[i]:new_audio_lens[i]] = audio[i, ori_cond_ed_idx[i]:audio_lens[i]]
+            cap_audio[i, :new_cond_st_idx[i]] = audio[i, :ori_cond_st_idx[i]]
+            cap_audio[i, new_cond_st_idx[i]:new_cond_ed_idx[i]] = ztts_audio[i, new_cond_st_idx[i]:new_cond_ed_idx[i]]
+            cap_audio[i, new_cond_ed_idx[i]:new_audio_lens[i]] = audio[i, ori_cond_ed_idx[i]:audio_lens[i]]
 
         return {
             "edit_audio": edit_audio,
             "ztts_audio": ztts_audio,
+            "cap_audio": cap_audio,
             "resyn_audio": resyn_audio,
             "edit_mel": edit_mel,
             "ztts_mel": ztts_mel,
