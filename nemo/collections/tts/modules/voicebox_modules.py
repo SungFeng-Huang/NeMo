@@ -1159,11 +1159,7 @@ class VoiceBox(_VB, LightningModule):
         if training:
             frac_lengths_mask = default(frac_lengths_mask, self.frac_lengths_mask)
             frac_lengths = torch.zeros((batch,), device = self.device).float().uniform_(*frac_lengths_mask)
-            assert phn_bnd_eps is None, "phn_bnd_eps feature work in progress"
-            if phn_bnd_eps is None:
-                cond_mask = mask_from_frac_lengths(seq_len, frac_lengths)
-            else:
-                cond_mask = self.phone_level_mask_from_frac_lengths(seq_len, frac_lengths, cond_token_ids, self_attn_mask, phn_bnd_eps)
+            cond_mask = self.phone_level_mask_from_frac_lengths(seq_len, frac_lengths, cond_token_ids, self_attn_mask, phn_bnd_eps)
         else:
             cond_mask = torch.zeros((batch, seq_len), device = self.device, dtype = torch.bool)
         return cond_mask
@@ -1190,6 +1186,14 @@ class VoiceBox(_VB, LightningModule):
         start = (max_start * rand).clamp(min = 0)
         end = start + lengths
 
+        if phn_bnd_eps is None:
+            if exists(self_attn_mask):
+                end = torch.minimum(end, seq_len)
+                seq_len = _seq_len
+            else:
+                end = end.clamp(max = seq_len)
+            return mask_from_start_end_indices(seq_len, start, end)
+
         # start = torch.floor(start).long()
         start_of_start = self.find_start_of_phone(cond_token_ids, torch.floor(start).long())
         end_of_start = self.find_end_of_phone(cond_token_ids, torch.floor(start).long(), seq_len)
@@ -1204,12 +1208,14 @@ class VoiceBox(_VB, LightningModule):
         prob = (end - start_of_end) / (end_of_end - start_of_end + 1)
         _end = torch.where(prob > 0.5, end_of_end + 1, start_of_end)
 
-        start = torch.minimum(_start, _end)
-        end = torch.maximum(_start, _end)
+        start = (torch.minimum(_start, _end) - phn_bnd_eps).clamp(min = 0)
+        end = torch.maximum(_start, _end) + phn_bnd_eps
 
         if exists(self_attn_mask):
             end = torch.minimum(end, seq_len)
             seq_len = _seq_len
+        else:
+            end = end.clamp(max = seq_len)
 
         return mask_from_start_end_indices(seq_len, start, end)
 
