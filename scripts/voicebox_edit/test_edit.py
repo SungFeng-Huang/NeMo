@@ -999,7 +999,7 @@ class MainExc:
         # self.vb_ckpt_path = "nemo_experiments/vb=0.7689-epoch=0-step=75932-last-001.ckpt"
         self.vb_ckpt_path = "nemo_experiments/vb=0.7526-epoch=0-step=130000.ckpt"
         # self.vb_ckpt_path = "nemo_experiments/vb=0.7406-epoch=0-step=163461-last.ckpt"
-        self.dp_ckpt_path = "nemo_experiments/a100-GS_XL-DAC_12-full/checkpoints/a100-GS_XL-DAC_12-full--val_loss/dp_no_sil_spn=1.4410-epoch=8.ckpt"
+        self.dp_ckpt_path = "nemo_experiments/dp_no_sil_spn=1.4410-epoch=8.ckpt"
 
         self.gen_data_dir = "data/gen_dataset"
 
