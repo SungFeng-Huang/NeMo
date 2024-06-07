@@ -1465,8 +1465,9 @@ class VoiceboxModel(TextToWaveform):
         vb_loss = losses['vb']
         wv_loss = losses.get('waveform', 0)
         ce_loss = losses.get('ce', 0) * self.ce_loss_lambda
+        tenc_loss = losses.get('text_enc', 0)
 
-        loss = align_loss + bin_loss + dp_loss + vb_loss + wv_loss + ce_loss
+        loss = align_loss + bin_loss + dp_loss + vb_loss + wv_loss + ce_loss + tenc_loss
 
         self.log_dict({f"train_loss/{k}": v for k, v in losses.items()}, sync_dist=True, batch_size=audio.shape[0])
         self.log("train_loss_vb", vb_loss, prog_bar=True, sync_dist=True, batch_size=audio.shape[0])
@@ -1573,8 +1574,9 @@ class VoiceboxModel(TextToWaveform):
         vb_loss = losses['vb']
         wv_loss = losses.get('waveform', 0)
         ce_loss = losses.get('ce', 0) * self.ce_loss_lambda
+        tenc_loss = losses.get('text_enc', 0)
 
-        loss = align_loss + bin_loss + dp_loss + vb_loss + wv_loss + ce_loss
+        loss = align_loss + bin_loss + dp_loss + vb_loss + wv_loss + ce_loss + tenc_loss
         self.log_dict({f"val_loss/{k}": v for k, v in losses.items()}, sync_dist=True, batch_size=audio.shape[0])
         self.log("val_loss_total", loss, prog_bar=True, sync_dist=True, batch_size=audio.shape[0])
         return loss

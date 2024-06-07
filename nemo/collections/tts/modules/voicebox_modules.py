@@ -1190,6 +1190,7 @@ class VoiceBox(_VB, LightningModule):
                     groups = conv_pos_embed_groups,
                 )
             self.text_enc_vb_masked = text_enc_vb_masked
+            self.proj_out = nn.Linear(dim, audio_enc_dec.latent_dim)
 
     def create_cond_mask(self, batch, seq_len, cond_token_ids=None, self_attn_mask=None, training=True, frac_lengths_mask=None, phn_bnd_eps=None):
         if training:
@@ -1444,6 +1445,8 @@ class VoiceBox(_VB, LightningModule):
                 mask = torch.cat([~cond_mask * self_attn_mask, self_attn_mask], dim=1)
                 cond = self.text_encoder(conv_cond_text, mask=mask)
                 cond = cond[:, seq_len:]
+            pred_ori_cond = self.proj_out(cond)
+            outputs["pred_ori_cond"] = pred_ori_cond
 
         to_concat = [*filter(exists, (x, cond_emb, cond))]
         embed = torch.cat(to_concat, dim = -1)
@@ -1520,6 +1523,16 @@ class VoiceBox(_VB, LightningModule):
 
         outputs["loss_mask"] = loss_mask
         outputs["self_attn_mask"] = self_attn_mask
+
+        if self.text_encode:
+            assert self.loss_masked
+            text_enc_loss = F.mse_loss(pred_ori_cond, outputs["cond"], reduction='none')
+            text_enc_loss = reduce(text_enc_loss, 'b n d -> b n', 'mean')
+            text_enc_loss = text_enc_loss.masked_fill(~loss_mask, 0.)
+            num = reduce(text_enc_loss, 'b n -> b', 'sum')
+            den = loss_mask.sum(dim = -1).clamp(min = 1e-5)
+            text_enc_loss = num / den
+            outputs["text_enc_loss"] = text_enc_loss
 
         return loss.mean(), outputs
     
@@ -1894,6 +1907,9 @@ class ConditionalFlowMatcherWrapper(_CFMWrapper, LightningModule):
         outputs = {
             "vb": vb_outputs,
         }
+        if "text_enc_loss" in vb_outputs:
+            losses['text_enc'] = vb_outputs["text_enc_loss"]
+            del vb_outputs["text_enc_loss"]
 
         return loss, losses, outputs
 
