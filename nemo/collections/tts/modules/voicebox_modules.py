@@ -173,6 +173,7 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
         return_code = False,
         preq_ce = False,
         ce_weights = None,
+        normalize = False,
     ):
         super().__init__()
         if pretrained_path in ["44khz", "24khz", "16khz"]:
@@ -190,6 +191,8 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
         bandwidth_id = self.model.n_codebooks if not bandwidth_id else bandwidth_id
         self.register_buffer('bandwidth_id', torch.tensor([bandwidth_id]))
 
+        self.normalize = normalize
+
         # factorize to 8-dim per code * bandwidth_id codebooks
         self.register_buffer('factorized_latent', torch.BoolTensor([factorized_latent]))
 
@@ -199,6 +202,10 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
         # pre-quantize feature + cross-entropy loss
         self.register_buffer('preq_ce', torch.BoolTensor([preq_ce]))
         self.ce_weights = None if ce_weights is None else torch.tensor(ce_weights[:self.bandwidth_id])
+        if self.normalize:
+            self.global_mean = -0.0350
+            self.global_std = 2.6780
+
         self.freeze()
 
     @property
@@ -236,6 +243,8 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
 
         elif self.preq_ce:
             z = self.model.encoder(audio)
+            if self.normalize:
+                z = (z - self.global_mean) / self.global_std
             return rearrange(z, 'b d n -> b n d')
 
         else:
@@ -255,6 +264,8 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
             z_q, z_p, codes = self.model.quantizer.from_codes(codes)
         elif self.preq_ce:
             z = latents
+            if self.normalize:
+                z = (z * self.global_std) + self.global_mean
             z_q, codes, latents, _, _ = self.model.quantizer(z, self.bandwidth_id)
         else:
             z_q = latents
@@ -272,6 +283,11 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
         """
         z_pred = rearrange(z_pred, 'b n d -> b d n')
         z = rearrange(z, 'b n d -> b d n')
+
+        if self.normalize:
+            z_pred = (z_pred * self.global_std) + self.global_mean
+            z = (z * self.global_std) + self.global_mean
+
         with torch.no_grad():
             _, codes, _, _, _ = self.model.quantizer.forward(z, self.bandwidth_id)
 
