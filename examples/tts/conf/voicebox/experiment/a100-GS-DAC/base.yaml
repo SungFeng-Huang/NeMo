@@ -18,9 +18,14 @@ model:
       preq_ce: True
       normalize: True
     frac_lengths_mask: [0.1, 0.9]
+    # time_hidden_dim: 1024
+    # text_encode: True
+    # text_enc_frame_concat: True
+    # text_enc_vb_masked: False
 
   duration_predictor:
     audio_enc_dec: ${..voicebox.audio_enc_dec}
+    # time_hidden_dim: 1024
 
   cap_vocode: True
   additional_log_batches: 1
