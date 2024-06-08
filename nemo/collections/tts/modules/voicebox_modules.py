@@ -1532,7 +1532,7 @@ class VoiceBox(_VB, LightningModule):
             num = reduce(text_enc_loss, 'b n -> b', 'sum')
             den = loss_mask.sum(dim = -1).clamp(min = 1e-5)
             text_enc_loss = num / den
-            outputs["text_enc_loss"] = text_enc_loss
+            outputs["text_enc_loss"] = text_enc_loss.mean()
 
         return loss.mean(), outputs
     
