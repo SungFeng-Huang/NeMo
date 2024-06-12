@@ -1228,6 +1228,13 @@ class VoiceboxModel(TextToWaveform):
             input_sampling_rate=None,
         )
 
+        # if hasattr(self, "_freeze_cfg") and self._freeze_cfg['is_frozen']["duration_predictor"]:
+        #     dp_losses = {}
+        #     dp_outputs = {
+        #         "aligned_phoneme_ids":  self.duration_predictor.align_phoneme_ids_with_durations(tokens, durations*self.duration_predictor.audio_enc_dec.sampling_rate/self.duration_predictor.audio_enc_dec.downsample_factor)
+        #     }
+        #     return dp_losses, dp_outputs
+
         dp_loss, dp_losses, dp_outputs = self.duration_predictor.forward(
             cond=dp_inputs.get("dp_cond"),               # might be None
             texts=None,                 # converted to phoneme_ids by dataset
@@ -1459,10 +1466,10 @@ class VoiceboxModel(TextToWaveform):
         )
         losses.update(dp_losses)
 
-        dp_loss = losses['dp']
+        dp_loss = losses.get('dp', 0)
         align_loss = losses.get('align', 0)
         bin_loss = losses.get('bin', 0)
-        vb_loss = losses['vb']
+        vb_loss = losses.get('vb', 0)
         wv_loss = losses.get('waveform', 0)
         ce_loss = losses.get('ce', 0) * self.ce_loss_lambda
         tenc_loss = losses.get('text_enc', 0)
@@ -1568,10 +1575,10 @@ class VoiceboxModel(TextToWaveform):
         )
         losses.update(dp_losses)
 
-        dp_loss = losses['dp']
+        dp_loss = losses.get('dp', 0)
         align_loss = losses.get('align', 0)
         bin_loss = losses.get('bin', 0)
-        vb_loss = losses['vb']
+        vb_loss = losses.get('vb', 0)
         wv_loss = losses.get('waveform', 0)
         ce_loss = losses.get('ce', 0) * self.ce_loss_lambda
         tenc_loss = losses.get('text_enc', 0)
