@@ -291,6 +291,7 @@ class Transformer(Module):
         adaptive_rmsnorm_cond_dim_in = None,
         use_unet_skip_connection = False,
         skip_connect_scale = None,
+        **kwargs,
     ):
         super().__init__()
         assert divisible_by(depth, 2)
