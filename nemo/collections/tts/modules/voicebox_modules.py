@@ -1520,7 +1520,7 @@ class VoiceBox(LightningModule):
                 conv_cond_text = self.text_audio_to_embed(conv_cond_text)
                 conv_cond_text = self.text_audio_conv_embed(conv_cond_text, mask=~self_attn_mask)
 
-                masking_kwargs = {'key_padding_mask': ~self_attn_mask} if self.pytorch_mha else {'mask': self_atten_mask}
+                masking_kwargs = {'key_padding_mask': ~self_attn_mask} if self.pytorch_mha else {'mask': self_attn_mask}
                 cond = self.text_encoder(
                     conv_cond_text,
                     **masking_kwargs,
