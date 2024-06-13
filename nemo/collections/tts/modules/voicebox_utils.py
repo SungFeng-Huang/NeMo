@@ -400,7 +400,7 @@ class Transformer(Module):
             else:
                 float_key_padding_mask = None 
 
-            x, _ = attn(
+            attn_output, _ = attn(
                 query=attn_input, 
                 key=attn_input,
                 value=attn_input,
@@ -408,6 +408,7 @@ class Transformer(Module):
                 need_weights=False,
                 attn_mask = alibi_bias
             )
+            x = attn_output + x
 
             ff_input = ff_prenorm(x, **rmsnorm_kwargs) 
             x = ff(ff_input) + x
