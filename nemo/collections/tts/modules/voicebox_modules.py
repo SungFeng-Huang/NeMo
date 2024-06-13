@@ -1557,7 +1557,7 @@ class VoiceBox(LightningModule):
         if self.text_encode and self.text_enc_vb_masked:
             masking_kwargs = {'key_padding_mask': ~cond_mask} if self.pytorch_mha else {'mask': cond_mask}
         else:
-            masking_kwargs = {'key_padding_mask': ~self_attn_mask} if self.pytorch_mha else {'mask': self_atten_mask}
+            masking_kwargs = {'key_padding_mask': ~self_attn_mask} if self.pytorch_mha else {'mask': self_attn_mask}
         x = self.transformer(
             x,
             **masking_kwargs,
