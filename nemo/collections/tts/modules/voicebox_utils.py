@@ -381,6 +381,7 @@ class Transformer(Module):
         # going through the attention layers
 
         for skip_combiner, attn_prenorm, attn, ff_prenorm, ff in self.layers:
+            attn.train()
 
             # in the paper, they use a u-net like skip connection
             # unclear how much this helps, as no ablations or further numbers given besides a brief one-two sentence mention
