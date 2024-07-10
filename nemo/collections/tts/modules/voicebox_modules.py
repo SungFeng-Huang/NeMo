@@ -157,12 +157,16 @@ class MelVoco(_MelVoco, LightningModule):
 
         return self.vocos.decode(mel)
 
+    def wav2mel_len(self, wav_len):
+        return wav_len // self.downsample_factor + 1
 
 class EncodecVoco(_EncodecVoco, LightningModule):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.freeze()
 
+    def wav2mel_len(self, wav_len):
+        return torch.ceil(wav_len / self.downsample_factor).long()
 
 class DACVoco(AudioEncoderDecoder, LightningModule):
     def __init__(
@@ -349,6 +353,8 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
 
         return ce_loss
 
+    def wav2mel_len(self, wav_len):
+        return torch.ceil(wav_len / self.downsample_factor).long()
 
 class Aligner(_Aligner):
 
@@ -1401,6 +1407,7 @@ class VoiceBox(LightningModule):
         cond_token_ids,
         self_attn_mask = None,
         cond_drop_prob = 0.1,
+        cond_id_drop_prob = -1,
         target = None,
         cond = None,
         cond_mask: BoolTensor | None = None
@@ -1473,6 +1480,15 @@ class VoiceBox(LightningModule):
                     self.null_cond,
                     cond
                 )
+
+                if self.training or cond_id_drop_prob == -1:
+                    # let cond_id_drop_prob == -1 means drop audio and text together
+                    # if training, drop audio and text together with the following additional spectrogram dropout
+                    pass
+                else:
+                    # only for inference
+                    # usually for cond_drop_prob == 1 & cond_id_drop_prob == 0
+                    cond_drop_mask = prob_mask_like(cond.shape[:1], cond_id_drop_prob, self.device)
 
                 cond_ids = torch.where(
                     rearrange(cond_drop_mask, '... -> ... 1'),
@@ -1896,7 +1912,9 @@ class ConditionalFlowMatcherWrapper(LightningModule):
                 assert exists(audio_len), 'audio_len must be given if mel_len is not given'
                 # audio_len = mask.sum(-1)
                 # mel_len = audio_len * x1.shape[1] // mask.shape[-1]
-                mel_len = torch.ceil(audio_len / self.voicebox.audio_enc_dec.downsample_factor)
+                # mel_len = torch.ceil(audio_len / self.voicebox.audio_enc_dec.downsample_factor)
+                # mel_len = audio_len // self.voicebox.audio_enc_dec.downsample_factor + 1
+                mel_len = self.voicebox.audio_enc_dec.wav2mel_len(audio_len)
             assert mel_len.max() == x1.shape[1], 'mel_len must be the same as the mel length of the audio encoder decoder'
             mask = get_mask_from_lengths(mel_len)
 

@@ -738,6 +738,7 @@ class VoiceboxModel(TextToWaveform):
                 ds_name= self.cfg.ds_name,
                 corpus_dir=self.cfg.corpus_dir,
                 old_prefix=self.cfg.old_prefix,
+                wav2mel_len_fn=self.voicebox.audio_enc_dec.wav2mel_len,
                 **ds_kwargs,
             ),
         )
