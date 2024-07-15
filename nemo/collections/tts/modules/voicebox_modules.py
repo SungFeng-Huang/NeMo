@@ -257,6 +257,8 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
             z, codes, latents, _, _ = self.model.encode(
                 audio, self.bandwidth_id
             )
+            if self.normalize:
+                z = (z - self.global_mean) / self.global_std
             return rearrange(z, 'b d n -> b n d')
 
     def decode(self, latents):
@@ -275,6 +277,8 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
             z_q, codes, latents, _, _ = self.model.quantizer(z, self.bandwidth_id)
         else:
             z_q = latents
+            if self.normalize:
+                z_q = (z_q * self.global_std) + self.global_mean
 
         audio = self.model.decode(z_q)
         audio = rearrange(audio, 'b 1 t -> b t')
