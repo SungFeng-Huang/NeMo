@@ -177,6 +177,7 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
         bandwidth_id = None,
         factorized_latent = False,
         return_code = False,
+        preq = False,
         preq_ce = False,
         ce_weights = None,
         normalize = False,
@@ -206,6 +207,7 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
         self.register_buffer('return_code', torch.BoolTensor([return_code]))
 
         # pre-quantize feature + cross-entropy loss
+        self.register_buffer('preq', torch.BoolTensor([preq]))
         self.register_buffer('preq_ce', torch.BoolTensor([preq_ce]))
         self.ce_weights = None if ce_weights is None else torch.tensor(ce_weights[:self.bandwidth_id])
         if self.normalize:
@@ -247,7 +249,7 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
             codes[:, self.bandwidth_id:, :] = 0
             return rearrange(codes, 'b d n -> b n d')
 
-        elif self.preq_ce:
+        elif self.preq or self.preq_ce:
             z = self.model.encoder(audio)
             if self.normalize:
                 z = (z - self.global_mean) / self.global_std
@@ -270,7 +272,7 @@ class DACVoco(AudioEncoderDecoder, LightningModule):
         elif self.return_code:
             codes = latents[:, :self.bandwidth_id, :]
             z_q, z_p, codes = self.model.quantizer.from_codes(codes)
-        elif self.preq_ce:
+        elif self.preq or self.preq_ce:
             z = latents
             if self.normalize:
                 z = (z * self.global_std) + self.global_mean
