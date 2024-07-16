@@ -622,6 +622,44 @@ class DataProcessor:
         ]
         return datas
 
+    def get_riva_demo_data(self, output_dir="nemo_experiments/riva_demo_gen"):
+        os.makedirs(output_dir, exist_ok=True)
+        data = [
+            {
+                "audio_path": "nemo_experiments/RIVA/Lindy/LINDY_CMU_ANGRY_000407.wav",
+                # "textgrid_path": "",
+                "text": "Mercedes screamed, cried, laughed, and manifested the chaotic abandonment of hysteria.",
+                "from": "of hysteria",
+                "to": "in different countries there are different requirements for an individual to legally practice neurosurgery and there are varying methods through which they must be educated",
+                "out_ori_path": f"{output_dir}/LINDY_CMU_ANGRY_000407_ori.wav",
+                "out_gen_path": f"{output_dir}/LINDY_CMU_ANGRY_000407_gen.wav",
+                "out_tts_path": f"{output_dir}/LINDY_CMU_ANGRY_000407_tts.wav",
+            },
+            {
+                "audio_path": "nemo_experiments/RIVA/Lindy/LINDY_CMU_DISGUSTED_000023.wav",
+                # "textgrid_path": "",
+                "text": "A combination of Canadian capital quickly organized and petitioned for the same privileges. ",
+                "from": "for the same privileges",
+                "to": "in different countries there are different requirements for an individual to legally practice neurosurgery and there are varying methods through which they must be educated",
+                "out_ori_path": f"{output_dir}/LINDY_CMU_DISGUSTED_000023_ori.wav",
+                "out_gen_path": f"{output_dir}/LINDY_CMU_DISGUSTED_000023_gen.wav",
+                "out_tts_path": f"{output_dir}/LINDY_CMU_DISGUSTED_000023_tts.wav",
+            },
+            {
+                "audio_path": "nemo_experiments/RIVA/Rodney/RODNEY_CMU_ANGRY_000407.wav",
+                # "textgrid_path": "",
+                "text": "Mercedes screamed, cried, laughed, and manifested the chaotic abandonment of hysteria.",
+                "from": "of hysteria",
+                "to": "in different countries there are different requirements for an individual to legally practice neurosurgery and there are varying methods through which they must be educated",
+                "out_ori_path": f"{output_dir}/RODNEY_CMU_ANGRY_000407_000407_ori.wav",
+                "out_gen_path": f"{output_dir}/RODNEY_CMU_ANGRY_000407_000407_gen.wav",
+                "out_tts_path": f"{output_dir}/RODNEY_CMU_ANGRY_000407_000407_tts.wav",
+            },
+            
+        ]
+        return data
+
+
     def get_word_edit_data(self):
         datas = {
             "libriheavy": [
@@ -791,8 +829,9 @@ class Inference:
         return edit_pred["ori_mel"], edit_pred["edit_mel"]
 
 class DataGen:
-    def __init__(self, model: VoiceboxModel):
+    def __init__(self, model: VoiceboxModel, sample_std=.95):
         self.model = model
+        self.sample_std = sample_std
 
     def get_dac_statistics(self):
         # (-0.0350, 2.6780)
@@ -1099,6 +1138,8 @@ class DataGen:
                     edit_from=edit_froms,
                     edit_to=edit_tos,
                     steps=16,
+                    sample_std=self.sample_std,
+                    dp_scale=1.1,
                     # decode_to_audio=False,
                 )
             except:
@@ -1302,12 +1343,12 @@ class MainExc:
 
     def load_model(self,):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = VoiceboxModel.load_from_checkpoint(self.vb_ckpt_path, map_location=device)
+        model = VoiceboxModel.load_from_checkpoint(self.vb_ckpt_path, map_location=device, strict=False)
 
         # dp_state_dict = torch.load(self.dp_ckpt_path, map_location=device)["state_dict"]
         # model.load_part_of_state_dict(state_dict=dp_state_dict, include=["duration_predictor"], exclude=[], load_from_string=dp_ckpt_path)
 
-        dp_model = VoiceboxModel.load_from_checkpoint(self.dp_ckpt_path, map_location=device)
+        dp_model = VoiceboxModel.load_from_checkpoint(self.dp_ckpt_path, map_location=device, strict=False)
 
         del model.duration_predictor, model.cfm_wrapper.duration_predictor
         model.duration_predictor = dp_model.duration_predictor
@@ -1335,7 +1376,7 @@ class MainExc:
     @property
     def datagen(self):
         if not hasattr(self, "_datagen"):
-            self._datagen = DataGen(model=self.model)
+            self._datagen = DataGen(model=self.model, sample_std=self.sample_std)
         return self._datagen
 
     @property
@@ -1397,6 +1438,11 @@ class MainExc:
 
     def span_edit(self, output_dir="nemo_experiments/span_edit"):
         datas = self.dataprocessor.get_span_edit_data(output_dir)
+        for data in datas:
+            ori_mel, edit_mel = self.infer.internal_demo(data)
+
+    def riva_demo(self, output_dir="nemo_experiments/riva_demo_gen"):
+        datas = self.dataprocessor.get_riva_demo_data(output_dir)
         for data in datas:
             ori_mel, edit_mel = self.infer.internal_demo(data)
 
@@ -1472,14 +1518,16 @@ if __name__ == "__main__":
                     "output_dir": "nemo_experiments/edit_gen_gs_unet/",
                 },
                 "span_edit": {"output_dir": "nemo_experiments/span_edit_gs_unet"},
+                "riva_demo": {"output_dir": "nemo_experiments/riva_demo_gen_gs_unet"},
             },
         }
         exp = "unet"
         main_exc = MainExc(**(kwargs[exp]["main_exc"]), sample_std=0.95)
         # main_exc.gen_val_v1()
-        main_exc._internal_demo(**(kwargs[exp]["internal_demo"]))
+        # main_exc._internal_demo(**(kwargs[exp]["internal_demo"]))
         # main_exc.v4_gs_val_word_edit(**(kwargs[exp]["v4_gs_val_word_edit"]))
         # main_exc.span_edit(**(kwargs[exp]["span_edit"]))
+        main_exc.riva_demo(**(kwargs[exp]["riva_demo"]))
 
         # main_exc.calc_dac_stats(ds_name="gigaspeech", corpus_dir="data/download/GigaSpeech", manifest_filepath="data/parsed/GigaSpeech/gigaspeech_cuts_XL.speech.jsonl.gz", shuffle=True)
         exit()
