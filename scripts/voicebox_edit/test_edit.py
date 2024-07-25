@@ -624,39 +624,135 @@ class DataProcessor:
 
     def get_riva_demo_data(self, output_dir="nemo_experiments/riva_demo_gen"):
         os.makedirs(output_dir, exist_ok=True)
-        data = [
+        audio_names = []
+        audio_data = [
             {
-                "audio_path": "nemo_experiments/RIVA/Lindy/LINDY_CMU_ANGRY_000407.wav",
-                # "textgrid_path": "",
+                "name": "LINDY_CMU_ANGRY_000407",
                 "text": "Mercedes screamed, cried, laughed, and manifested the chaotic abandonment of hysteria.",
                 "from": "of hysteria",
-                "to": "in different countries there are different requirements for an individual to legally practice neurosurgery and there are varying methods through which they must be educated",
-                "out_ori_path": f"{output_dir}/LINDY_CMU_ANGRY_000407_ori.wav",
-                "out_gen_path": f"{output_dir}/LINDY_CMU_ANGRY_000407_gen.wav",
-                "out_tts_path": f"{output_dir}/LINDY_CMU_ANGRY_000407_tts.wav",
+                "time": 6.64,
             },
             {
-                "audio_path": "nemo_experiments/RIVA/Lindy/LINDY_CMU_DISGUSTED_000023.wav",
-                # "textgrid_path": "",
+                "name": "LINDY_CMU_CALM_000407",
+                "text": "Mercedes screamed, cried, laughed, and manifested the chaotic abandonment of hysteria.",
+                "from": "of hysteria",
+                "time": 7.3,
+            },
+            {
+                "name": "LINDY_CMU_DISGUSTED_000023",
                 "text": "A combination of Canadian capital quickly organized and petitioned for the same privileges. ",
                 "from": "for the same privileges",
-                "to": "in different countries there are different requirements for an individual to legally practice neurosurgery and there are varying methods through which they must be educated",
-                "out_ori_path": f"{output_dir}/LINDY_CMU_DISGUSTED_000023_ori.wav",
-                "out_gen_path": f"{output_dir}/LINDY_CMU_DISGUSTED_000023_gen.wav",
-                "out_tts_path": f"{output_dir}/LINDY_CMU_DISGUSTED_000023_tts.wav",
+                "time": 6.18,
             },
             {
-                "audio_path": "nemo_experiments/RIVA/Rodney/RODNEY_CMU_ANGRY_000407.wav",
-                # "textgrid_path": "",
+                "name": "LINDY_CMU_HAPPY_000472",
+                "text": "He is too keenly intelligent, too sharply sensitive, successfully to endure.",
+                "from": "to endure",
+                "time": 5.15,
+            },
+            {
+                "name": "LINDY_CMU_SAD_000023",
+                "text": "A combination of Canadian capital quickly organized and petitioned for the same privileges. ",
+                "from": "for the same privileges",
+                "time": 5.77,
+            },
+            {
+                "name": "LINDY_pa",
+                "text": "Other sources put the numbers of speakers at one hundred eighty thousand, two hundred twenty thousand, and two hundred fifty thousand, whereas Yugoslav sources vary, some putting the estimated number of Macedonians in Greek Macedonia at one hundred fifty thousand to two hundred thousand and others at three hundred thousand.",
+                "from": "at three hundred thousand",
+                "time": 17.12,
+            },
+            {
+                "name": "RODNEY_CMU_ANGRY_000407",
                 "text": "Mercedes screamed, cried, laughed, and manifested the chaotic abandonment of hysteria.",
                 "from": "of hysteria",
-                "to": "in different countries there are different requirements for an individual to legally practice neurosurgery and there are varying methods through which they must be educated",
-                "out_ori_path": f"{output_dir}/RODNEY_CMU_ANGRY_000407_000407_ori.wav",
-                "out_gen_path": f"{output_dir}/RODNEY_CMU_ANGRY_000407_000407_gen.wav",
-                "out_tts_path": f"{output_dir}/RODNEY_CMU_ANGRY_000407_000407_tts.wav",
+                "time": 6.87,
             },
-            
+            {
+                "name": "RODNEY_CMU_CALM_000407",
+                "text": "Mercedes screamed, cried, laughed, and manifested the chaotic abandonment of hysteria.",
+                "from": "of hysteria",
+                "time": 6.52,
+            },
+            {
+                "name": "RODNEY_CMU_DISGUSTED_000023",
+                "text": "A combination of Canadian capital quickly organized and petitioned for the same privileges. ",
+                "from": "for the same privileges",
+                "time": 7.67,
+            },
+            {
+                "name": "RODNEY_CMU_HAPPY_000023",
+                "text": "A combination of Canadian capital quickly organized and petitioned for the same privileges. ",
+                "from": "for the same privileges",
+                "time": 4.27,
+            },
+            {
+                "name": "RODNEY_CMU_SAD_000407",
+                "text": "Mercedes screamed, cried, laughed, and manifested the chaotic abandonment of hysteria.",
+                "from": "of hysteria",
+                "time": 7.07,
+            },
+            # {
+            #     "name": "RODNEY_pa",
+            #     "text": "During two thousand one, according to several international sources, twenty eight to thirty thousand Pakistani nationals, fourteen to fifteen thousand Afghan Taliban, and two to three thousand al-Qaeda militants were fighting against anti-Taliban forces in Afghanistan as a roughly fourty five thousand strong military force.",
+            #     "from": "as a roughly fourty five thousand strong military force",
+            #     "time": 16.05,
+            # },
+            {
+                "name": "voice_prompt",
+                "text": "What are you talking about, man? said one of the bystanders. I have got them. I have got them. And they are not worth three reels.",
+                "from": "worth three reels",
+            },
         ]
+        for i, _ in enumerate(audio_data):
+            if audio_data[i]["name"][:5] == "LINDY":
+                spk = "Lindy"
+            elif audio_data[i]["name"][:6] == "RODNEY":
+                spk = "Rodney"
+            else:
+                spk = "Other"
+
+            name = audio_data[i]["name"]
+            if name == "voice_prompt":
+                audio_data[i].update({
+                    "audio_path": f"nemo_experiments/RIVA/{spk}/{name}.wav",
+                })
+            else:
+                audio_data[i].update({
+                    "audio_path": f"nemo_experiments/RIVA/{spk}/{name}.wav",
+                    "textgrid_path": f"nemo_experiments/RIVA_MFA/{spk}/{name}.TextGrid",
+                })
+
+        text_data = [
+            "In different countries, there are different requirements for an individual to legally practice neurosurgery, and there are varying methods through which they must be educated.",
+            "I help design video games for a living. More on the concept side, less on the actual building! Do you play?",
+            "There are over five hundred federally recognized tribes within the U.S., about half of which are associated with Indian reservations.",
+            "I shop online way too much. I tend to visit too many retailers and searching for products I might want or need and it shows me everything I want to know.",
+            "Single-payer healthcare is a healthcare system financed by taxes that covers the costs of essential healthcare for all residents, with costs covered by a single public system.",
+            "Absolutely, I love prime and being able to buy whatever I want from the largest internet retailer in the world.",
+        ]
+
+        data = []
+        for a_data in audio_data:
+            for t_data in text_data:
+                data.append({
+                    "audio_path": a_data["audio_path"],
+                    "text": a_data["text"],
+                    "from": a_data["from"],
+                    "to": t_data,
+                    "out_ori_path": f"{output_dir}/{a_data['name']}_ori.wav",
+                    "out_gen_path": f"{output_dir}/{a_data['name']}-{t_data}_gen.wav",
+                    "out_tts_path": f"{output_dir}/{a_data['name']}-{t_data}_tts.wav",
+                })
+                if "textgrid_path" in a_data:
+                    data[-1].update({
+                        "textgrid_path": a_data["textgrid_path"],
+                    })
+                if "time" in a_data:
+                    data[-1].update({
+                        "time": a_data["time"],
+                    })
+
         return data
 
 
@@ -826,6 +922,34 @@ class Inference:
         sf.write(data["out_ori_path"], audio[0].cpu().numpy(), samplerate=self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
         sf.write(data["out_gen_path"], edit_audio, samplerate=self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
         # sf.write(data["out_tts_path"], ztts_audio, samplerate=self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
+        return edit_pred["ori_mel"], edit_pred["edit_mel"]
+
+    def riva_demo(self, data):
+        # shape: (1, L), (1,), scalar
+        audio_data, _sr = librosa.load(data["audio_path"], sr=self.model.voicebox.audio_enc_dec.sampling_rate)
+        audio_data = Eval.preprocess_wav(audio_data, _sr)
+        audio = torch.tensor(audio_data, dtype=torch.float, device=self.model.device).unsqueeze(0)
+        audio_len = torch.tensor(audio.shape[1], device=self.model.device).unsqueeze(0)
+        
+        edit_pred = self.model.forward(
+            audio=audio,
+            audio_lens=audio_len,
+            texts=[data["text"],],
+            textgrids=None if "textgrid_path" not in data else [data["textgrid_path"],],
+            edit_from=[data["from"],],
+            edit_to=[data["to"],],
+            steps=64,
+            cond_scale=1.0,
+            sample_std=self.sample_std,
+            dp_scale=1.2,
+            ztts=False,
+            edit_alignments=None if "edit_alignment" not in data else [data["edit_alignment"]],
+        )
+        edit_audio = edit_pred["edit_audio"][0].cpu().numpy()
+        if "time" in data:
+            edit_audio = edit_audio[int(data["time"] * _sr):]
+        sf.write(data["out_ori_path"], audio[0].cpu().numpy(), samplerate=self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
+        sf.write(data["out_gen_path"], edit_audio, samplerate=self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
         return edit_pred["ori_mel"], edit_pred["edit_mel"]
 
 class DataGen:
@@ -1444,7 +1568,7 @@ class MainExc:
     def riva_demo(self, output_dir="nemo_experiments/riva_demo_gen"):
         datas = self.dataprocessor.get_riva_demo_data(output_dir)
         for data in datas:
-            ori_mel, edit_mel = self.infer.internal_demo(data)
+            ori_mel, edit_mel = self.infer.riva_demo(data)
 
     def calc_dac_stats(self, ds_name="gigaspeech", corpus_dir="data/download/GigaSpeech", manifest_filepath="data/parsed/GigaSpeech/gigaspeech_cuts_DEV.speech.jsonl.gz", shuffle=False):
         self.dataprocessor.prepare_val_dl(ds_name=ds_name, corpus_dir=corpus_dir, manifest_filepath=manifest_filepath, old_prefix="/home/sungfengh/.cache/huggingface/datasets", shuffle=shuffle)
