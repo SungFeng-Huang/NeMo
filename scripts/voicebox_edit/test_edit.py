@@ -380,6 +380,15 @@ class DataProcessor:
     def get_internal_demo_data(self, output_dir="nemo_experiments/internal_demo_gen"):
         os.makedirs(output_dir, exist_ok=True)
         datas = [
+            {
+                "audio_path": "nemo_experiments/MOVIE/I'm Bat man.wav",
+                "text": "Im Bat man",
+                "from": "man",
+                "to": "man any question",
+                "out_ori_path": f"{output_dir}/I'm Bat man_ori.wav",
+                "out_gen_path": f"{output_dir}/I'm Bat man any question_gen.wav",
+                "out_tts_path": f"{output_dir}/I'm Bat man any question_tts.wav",
+            },
             # {
             #     "audio_path": "nemo_experiments/MOVIE/I'm Bat man.wav",
             #     "text": "Im Bat man",
@@ -504,16 +513,16 @@ class DataProcessor:
             #     "out_gen_path": f"{output_dir}/SE_you know the lady gaga song at the end of although this is a generated speech i like this cool demo_gen.wav",
             #     "out_tts_path": f"{output_dir}/SE_you know the lady gaga song at the end of although this is a generated speech i like this cool demo_tts.wav",
             # },
-            {
-                "audio_path": "nemo_experiments/internal_demo/by doubling every six months if you double the size of the model you double the size of your brain you need twice as much information to go fill it.wav",
-                # "audio_path": "nemo_experiments/internal_demo/by doubling every six months if you double the size of the model you double the size of your brain you need twice as much money to go fill it_gen_SE.wav",
-                "text": "by doubling every six months if you double the size of the model you double the size of your brain you need twice as much information to go fill it",
-                "from": "six months if you double",
-                "to": "ten milliseconds when you triple",
-                "out_ori_path": f"{output_dir}/by doubling every six months if you double the size of the model you double the size of your brain you need twice as much information to go fill it_ori.wav",
-                "out_gen_path": f"{output_dir}/by doubling every ten milliseconds when you triple the size of the model you double the size of your brain you need twice as much information to go fill it_gen.wav",
-                "out_tts_path": f"{output_dir}/by doubling every ten milliseconds when you triple the size of the model you double the size of your brain you need twice as much information to go fill it_tts.wav",
-            },
+            # {
+            #     "audio_path": "nemo_experiments/internal_demo/by doubling every six months if you double the size of the model you double the size of your brain you need twice as much information to go fill it.wav",
+            #     # "audio_path": "nemo_experiments/internal_demo/by doubling every six months if you double the size of the model you double the size of your brain you need twice as much money to go fill it_gen_SE.wav",
+            #     "text": "by doubling every six months if you double the size of the model you double the size of your brain you need twice as much information to go fill it",
+            #     "from": "six months if you double",
+            #     "to": "ten milliseconds when you triple",
+            #     "out_ori_path": f"{output_dir}/by doubling every six months if you double the size of the model you double the size of your brain you need twice as much information to go fill it_ori.wav",
+            #     "out_gen_path": f"{output_dir}/by doubling every ten milliseconds when you triple the size of the model you double the size of your brain you need twice as much information to go fill it_gen.wav",
+            #     "out_tts_path": f"{output_dir}/by doubling every ten milliseconds when you triple the size of the model you double the size of your brain you need twice as much information to go fill it_tts.wav",
+            # },
             # {
             #     "audio_path": "nemo_experiments/internal_demo/by doubling every six months if you double the size of the model you double the size of your brain you need twice as much information to go fill it.wav",
             #     # "audio_path": "nemo_experiments/internal_demo/by doubling every six months if you double the size of the model you double the size of your brain you need twice as much money to go fill it_gen_SE.wav",
@@ -554,16 +563,16 @@ class DataProcessor:
             #     "out_gen_path": f"{output_dir}/Oh, I hate that song_gen.wav",
             #     "out_tts_path": f"{output_dir}/Oh, I hate that song_tts.wav",
             # },
-            {
-                "audio_path": "nemo_experiments/internal_demo/yoy know the lage gaga song at the end of Maverick/yoy know the lage gaga song at the end of Maverick.wav",
-                "textgrid_path": "nemo_experiments/internal_demo_mfa/yoy know the lage gaga song at the end of Maverick/yoy know the lage gaga song at the end of Maverick.TextGrid",
-                "text": "you know the lady gaga song at the end of Maverick",
-                "from": "maverick",
-                "to": "a star is born",
-                "out_ori_path": f"{output_dir}/you know the lady gaga song at the end of Maverick_ori.wav",
-                "out_gen_path": f"{output_dir}/you know the lady gaga song at the end of a star is born_gen.wav",
-                "out_tts_path": f"{output_dir}/you know the lady gaga song at the end of a star is born_tts.wav",
-            },
+            # {
+            #     "audio_path": "nemo_experiments/internal_demo/yoy know the lage gaga song at the end of Maverick/yoy know the lage gaga song at the end of Maverick.wav",
+            #     "textgrid_path": "nemo_experiments/internal_demo_mfa/yoy know the lage gaga song at the end of Maverick/yoy know the lage gaga song at the end of Maverick.TextGrid",
+            #     "text": "you know the lady gaga song at the end of Maverick",
+            #     "from": "maverick",
+            #     "to": "a star is born",
+            #     "out_ori_path": f"{output_dir}/you know the lady gaga song at the end of Maverick_ori.wav",
+            #     "out_gen_path": f"{output_dir}/you know the lady gaga song at the end of a star is born_gen.wav",
+            #     "out_tts_path": f"{output_dir}/you know the lady gaga song at the end of a star is born_tts.wav",
+            # },
             # {
             #     "audio_path": "nemo_experiments/internal_demo/yoy know the lage gaga song at the end of Maverick/yoy know the lage gaga song at the end of Maverick.wav",
             #     "text": "you know the lady gaga song at the end of Maverick",
@@ -799,6 +808,12 @@ class Inference:
     def __init__(self, model: VoiceboxModel, sample_std=0.9):
         self.model = model
         self.sample_std = sample_std
+        self.mfa_en_dict = {}
+        with open("/root/Documents/MFA/pretrained_models/dictionary/english_us_arpa.dict", 'r') as f:
+            for line in tqdm(f):
+                wrd, _, _, _, _, phns = line.strip().split('\t')
+                if wrd not in self.mfa_en_dict:
+                    self.mfa_en_dict[wrd] = phns
 
     def test_batch(self, batch, out_dir, prefix=""):
         os.makedirs(out_dir, exist_ok=True)
@@ -884,7 +899,8 @@ class Inference:
                 edit_to=[data["edit_to"]],
                 steps=16,
                 sample_std=self.sample_std,
-                ztts=False
+                ztts=False,
+                mfa_en_dict=self.mfa_en_dict,
             )
             edit_audio = edit_pred["edit_audio"]
             # ztts_audio = edit_pred["ztts_audio"]
@@ -915,6 +931,7 @@ class Inference:
             dp_scale=1.2,
             ztts=False,
             edit_alignments=None if "edit_alignment" not in data else [data["edit_alignment"]],
+            mfa_en_dict=self.mfa_en_dict,
         )
         edit_audio = edit_pred["edit_audio"][0].cpu().numpy()
         # ztts_audio = edit_pred["ztts_audio"][0].cpu().numpy()
@@ -944,6 +961,7 @@ class Inference:
             dp_scale=1.2,
             ztts=False,
             edit_alignments=None if "edit_alignment" not in data else [data["edit_alignment"]],
+            mfa_en_dict=self.mfa_en_dict,
         )
         edit_audio = edit_pred["edit_audio"][0].cpu().numpy()
         if "time" in data:
@@ -956,6 +974,12 @@ class DataGen:
     def __init__(self, model: VoiceboxModel, sample_std=.95):
         self.model = model
         self.sample_std = sample_std
+        self.mfa_en_dict = {}
+        with open("/root/Documents/MFA/pretrained_models/dictionary/english_us_arpa.dict", 'r') as f:
+            for line in tqdm(f):
+                wrd, _, _, _, _, phns = line.strip().split('\t')
+                if wrd not in self.mfa_en_dict:
+                    self.mfa_en_dict[wrd] = phns
 
     def get_dac_statistics(self):
         # (-0.0350, 2.6780)
@@ -1264,6 +1288,7 @@ class DataGen:
                     steps=16,
                     sample_std=self.sample_std,
                     dp_scale=1.1,
+                    mfa_en_dict=self.mfa_en_dict,
                     # decode_to_audio=False,
                 )
             except:
@@ -1273,12 +1298,12 @@ class DataGen:
             cap_audio = pred["cap_audio"]
             resyn_audio = pred["resyn_audio"]
             gen_audio_lens = pred["new_audio_lens"]
-            ori_ls = ori_audio_lens / 24000
-            gen_ls = gen_audio_lens / 24000
+            ori_ls = ori_audio_lens / self.model.voicebox.audio_enc_dec.sampling_rate
+            gen_ls = gen_audio_lens / self.model.voicebox.audio_enc_dec.sampling_rate
             gen_st_idx = pred["new_cond_st_idx"]
             gen_ed_idx = pred["new_cond_ed_idx"]
-            gen_st = gen_st_idx / 24000
-            gen_ed = gen_ed_idx / 24000
+            gen_st = gen_st_idx / self.model.voicebox.audio_enc_dec.sampling_rate
+            gen_ed = gen_ed_idx / self.model.voicebox.audio_enc_dec.sampling_rate
             for i in range(edit_audio.shape[0]):
                 _i = indexes[i].item()
                 new_id = '-'.join(cuts[_i].id.split('/'))
@@ -1298,13 +1323,13 @@ class DataGen:
                 # print(label[1][-1])
 
                 _ori_audio = ori_audio[i, :ori_audio_lens[i]].cpu().numpy()
-                sf.write(f"{out_dir}/combine/dev_real_{new_id}.wav", _ori_audio, sampling_rate, format='WAV')
+                sf.write(f"{out_dir}/combine/dev_real_{new_id}.wav", _ori_audio, self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
                 _resyn_audio = resyn_audio[i, :ori_audio_lens[i]].cpu().numpy()
-                sf.write(f"{out_dir}/combine/dev_resyn_{new_id}.wav", _resyn_audio, sampling_rate, format='WAV')
+                sf.write(f"{out_dir}/combine/dev_resyn_{new_id}.wav", _resyn_audio, self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
                 _edit_audio = edit_audio[i, :gen_audio_lens[i]].cpu().numpy()
-                sf.write(f"{out_dir}/combine/dev_edit_{new_id}.wav", _edit_audio, sampling_rate, format='WAV')
+                sf.write(f"{out_dir}/combine/dev_edit_{new_id}.wav", _edit_audio, self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
                 _cut_paste_audio = cap_audio[i, :gen_audio_lens[i]].cpu().numpy()
-                sf.write(f"{out_dir}/combine/dev_cut_paste_{new_id}.wav", _cut_paste_audio, sampling_rate, format='WAV')
+                sf.write(f"{out_dir}/combine/dev_cut_paste_{new_id}.wav", _cut_paste_audio, self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
 
                 f_real.write(label["real"][-1] + '\n')
                 f_resyn.write(label["resyn"][-1] + '\n')
@@ -1458,11 +1483,11 @@ class Eval:
 
 
 class MainExc:
-    def __init__(self, vb_ckpt_path=None, dp_ckpt_path=None, sample_std=0.9):
+    def __init__(self, vb_ckpt_path=None, dp_ckpt_path=None, gen_data_dir="data/gen_dataset", sample_std=0.9):
         self.vb_ckpt_path = vb_ckpt_path
         self.dp_ckpt_path = dp_ckpt_path
 
-        self.gen_data_dir = "data/gen_dataset"
+        self.gen_data_dir = gen_data_dir
         self.sample_std = sample_std
 
     def load_model(self,):
@@ -1530,7 +1555,7 @@ class MainExc:
 
     def gen_v3(self, split_id=None, out_dict=None,
                    gpt_file="nemo_experiments/data_1a_medium.json", out_dict_file="nemo_experiments/data_parsed_1a_medium.json"):
-        if not split_id:
+        if split_id is None:
             split_id = int(sys.argv[1])
         if not out_dict:
             if not os.path.exists(out_dict_file):
@@ -1646,12 +1671,13 @@ if __name__ == "__main__":
             },
         }
         exp = "unet"
-        main_exc = MainExc(**(kwargs[exp]["main_exc"]), sample_std=0.95)
+        main_exc = MainExc(**(kwargs[exp]["main_exc"]), gen_data_dir="nemo_experiments/gen_dataset", sample_std=0.95)
         # main_exc.gen_val_v1()
-        # main_exc._internal_demo(**(kwargs[exp]["internal_demo"]))
+        main_exc._internal_demo(**(kwargs[exp]["internal_demo"]))
         # main_exc.v4_gs_val_word_edit(**(kwargs[exp]["v4_gs_val_word_edit"]))
         # main_exc.span_edit(**(kwargs[exp]["span_edit"]))
-        main_exc.riva_demo(**(kwargs[exp]["riva_demo"]))
+        # main_exc.riva_demo(**(kwargs[exp]["riva_demo"]))
+        # main_exc.gen_v3(split_id=None)
 
         # main_exc.calc_dac_stats(ds_name="gigaspeech", corpus_dir="data/download/GigaSpeech", manifest_filepath="data/parsed/GigaSpeech/gigaspeech_cuts_XL.speech.jsonl.gz", shuffle=True)
         exit()
