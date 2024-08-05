@@ -1229,17 +1229,25 @@ class DataGen:
             json.dump(out_dict, fo, indent=4)
         return out_dict
 
-    def gen_v3_dataset_from_val_set(self, edit_dict, out_dir):
+    def gen_v3_dataset_from_val_set(self, edit_dict, out_dir, ztts=False, redit=True):
         import random
         val_dl = self.model._validation_dl
 
         os.makedirs(f"{out_dir}/combine", exist_ok=True)
-        label = {"edit": [], "cut_paste": [], "resyn": [], "real": []} #fake, real
+        label = {"edit": [], "resyn": [], "real": []} #fake, real
 
-        f_real = open(f"{out_dir}/medium_real.txt", 'w')
-        f_resyn = open(f"{out_dir}/medium_resyn.txt", 'w')
-        f_edit = open(f"{out_dir}/medium_edit.txt", 'w')
-        f_cut_paste = open(f"{out_dir}/medium_cut_paste.txt", 'w')
+        files = {
+            "real": open(f"{out_dir}/medium_real.txt", 'w'),
+            "resyn": open(f"{out_dir}/medium_resyn.txt", 'w'),
+            "edit": open(f"{out_dir}/medium_edit.txt", 'w'),
+        }
+
+        if ztts:
+            label["cut_paste"] = []
+            files["cut_paste"] = open(f"{out_dir}/medium_cut_paste.txt", 'w')
+        if redit:
+            label["redit"] = []
+            files["redit"] = open(f"{out_dir}/medium_redit.txt", 'w')
 
         count = 0
         for batch in tqdm(val_dl):
@@ -1289,14 +1297,13 @@ class DataGen:
                     sample_std=self.sample_std,
                     dp_scale=1.1,
                     mfa_en_dict=self.mfa_en_dict,
+                    ztts=ztts,
                     # decode_to_audio=False,
                 )
             except:
                 print("X")
                 continue
-            edit_audio = pred["edit_audio"]
-            cap_audio = pred["cap_audio"]
-            resyn_audio = pred["resyn_audio"]
+
             gen_audio_lens = pred["new_audio_lens"]
             ori_ls = ori_audio_lens / self.model.voicebox.audio_enc_dec.sampling_rate
             gen_ls = gen_audio_lens / self.model.voicebox.audio_enc_dec.sampling_rate
@@ -1304,51 +1311,72 @@ class DataGen:
             gen_ed_idx = pred["new_cond_ed_idx"]
             gen_st = gen_st_idx / self.model.voicebox.audio_enc_dec.sampling_rate
             gen_ed = gen_ed_idx / self.model.voicebox.audio_enc_dec.sampling_rate
-            for i in range(edit_audio.shape[0]):
+
+            for i in range(gen_audio_lens.shape[0]):
                 _i = indexes[i].item()
                 new_id = '-'.join(cuts[_i].id.split('/'))
 
-                if gen_st_idx[i] == 0:
-                    label["edit"].append(f"dev_edit_{new_id} {gen_st[i]:.2f}-{gen_ed[i]:.2f}-F/{gen_ed[i]:.2f}-{gen_ls[i]:.2f}-T 0")
-                    label["cut_paste"].append(f"dev_cut_paste_{new_id} {gen_st[i]:.2f}-{gen_ed[i]:.2f}-F/{gen_ed[i]:.2f}-{gen_ls[i]:.2f}-T 0")
-                elif gen_ed_idx[i] == gen_audio_lens[i]:
-                    label["edit"].append(f"dev_edit_{new_id} 0.00-{gen_st[i]:.2f}-T/{gen_st[i]:.2f}-{gen_ed[i]:.2f}-F 0")
-                    label["cut_paste"].append(f"dev_cut_paste_{new_id} 0.00-{gen_st[i]:.2f}-T/{gen_st[i]:.2f}-{gen_ed[i]:.2f}-F 0")
-                else:
-                    label["edit"].append(f"dev_edit_{new_id} 0.00-{gen_st[i]:.2f}-T/{gen_st[i]:.2f}-{gen_ed[i]:.2f}-F/{gen_ed[i]:.2f}-{gen_ls[i]:.2f}-T 0")
-                    label["cut_paste"].append(f"dev_cut_paste_{new_id} 0.00-{gen_st[i]:.2f}-T/{gen_st[i]:.2f}-{gen_ed[i]:.2f}-F/{gen_ed[i]:.2f}-{gen_ls[i]:.2f}-T 0")
-                label["real"].append(f"dev_real_{new_id} 0.00-{ori_ls[i]:.2f}-T 1")
-                label["resyn"].append(f"dev_resyn_{new_id} 0.00-{ori_ls[i]:.2f}-T 1")
-                # print(label[0][-1])
-                # print(label[1][-1])
+                edit_audio = pred["edit_audio"]
+                resyn_audio = pred["resyn_audio"]
+                _audio = {
+                    "real": ori_audio[i, :ori_audio_lens[i]].cpu().numpy(),
+                    "resyn": resyn_audio[i, :ori_audio_lens[i]].cpu().numpy(),
+                    "edit": edit_audio[i, :gen_audio_lens[i]].cpu().numpy(),
+                }
+                if ztts:
+                    cap_audio = pred["cap_audio"]
+                    _audio["cut_paste"] = cap_audio[i, :gen_audio_lens[i]].cpu().numpy()
+                if redit:
+                    redit_audio = pred["redit_audio"]
+                    _audio["redit"] = redit_audio[i, :gen_audio_lens[i]].cpu().numpy()
 
-                _ori_audio = ori_audio[i, :ori_audio_lens[i]].cpu().numpy()
-                sf.write(f"{out_dir}/combine/dev_real_{new_id}.wav", _ori_audio, self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
-                _resyn_audio = resyn_audio[i, :ori_audio_lens[i]].cpu().numpy()
-                sf.write(f"{out_dir}/combine/dev_resyn_{new_id}.wav", _resyn_audio, self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
-                _edit_audio = edit_audio[i, :gen_audio_lens[i]].cpu().numpy()
-                sf.write(f"{out_dir}/combine/dev_edit_{new_id}.wav", _edit_audio, self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
-                _cut_paste_audio = cap_audio[i, :gen_audio_lens[i]].cpu().numpy()
-                sf.write(f"{out_dir}/combine/dev_cut_paste_{new_id}.wav", _cut_paste_audio, self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
+                for edit_type in ["edit", "cut_paste", "redit"]:
+                    if edit_type in label:
+                        if gen_st_idx[i] == 0:
+                            label[edit_type].append(f"dev_{edit_type}_{new_id} {gen_st[i]:.2f}-{gen_ed[i]:.2f}-F/{gen_ed[i]:.2f}-{gen_ls[i]:.2f}-T 0")
+                        elif gen_ed_idx[i] == gen_audio_lens[i]:
+                            label[edit_type].append(f"dev_{edit_type}_{new_id} 0.00-{gen_st[i]:.2f}-T/{gen_st[i]:.2f}-{gen_ed[i]:.2f}-F 0")
+                        else:
+                            label[edit_type].append(f"dev_{edit_type}_{new_id} 0.00-{gen_st[i]:.2f}-T/{gen_st[i]:.2f}-{gen_ed[i]:.2f}-F/{gen_ed[i]:.2f}-{gen_ls[i]:.2f}-T 0")
+                        sf.write(f"{out_dir}/combine/dev_{edit_type}_{new_id}.wav", _audio[edit_type], self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
+                        files[edit_type].write(label[edit_type][-1] + '\n')
+                        files[edit_type].flush()
 
-                f_real.write(label["real"][-1] + '\n')
-                f_resyn.write(label["resyn"][-1] + '\n')
-                f_edit.write(label["edit"][-1] + '\n')
-                f_cut_paste.write(label["cut_paste"][-1] + '\n')
+                for real_type in ["real", "resyn"]:
+                    label[real_type].append(f"dev_{real_type}_{new_id} 0.00-{ori_ls[i]:.2f}-T 1")
+                    sf.write(f"{out_dir}/combine/dev_{real_type}_{new_id}.wav", _audio[real_type], self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
+                    files[real_type].write(label[real_type][-1] + '\n')
+                    files[real_type].flush()
 
-                f_real.flush()
-                f_resyn.flush()
-                f_edit.flush()
-                f_cut_paste.flush()
+                # _ori_audio = ori_audio[i, :ori_audio_lens[i]].cpu().numpy()
+                # sf.write(f"{out_dir}/combine/dev_real_{new_id}.wav", _ori_audio, self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
+                # _resyn_audio = resyn_audio[i, :ori_audio_lens[i]].cpu().numpy()
+                # sf.write(f"{out_dir}/combine/dev_resyn_{new_id}.wav", _resyn_audio, self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
+                # _edit_audio = edit_audio[i, :gen_audio_lens[i]].cpu().numpy()
+                # sf.write(f"{out_dir}/combine/dev_edit_{new_id}.wav", _edit_audio, self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
+                # if ztts:
+                #     _cut_paste_audio = cap_audio[i, :gen_audio_lens[i]].cpu().numpy()
+                #     sf.write(f"{out_dir}/combine/dev_cut_paste_{new_id}.wav", _cut_paste_audio, self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
+                # if redit:
+                #     _redit_audio = redit_audio[i, :gen_audio_lens[i]].cpu().numpy()
+                #     sf.write(f"{out_dir}/combine/dev_redit_{new_id}.wav", _redit_audio, self.model.voicebox.audio_enc_dec.sampling_rate, format='WAV')
 
-        # with open(f"{out_dir}/dev_label.txt", 'w') as f:
-        #     f.write('\n'.join(label[0]))
-        #     f.write('\n')
-        #     f.write('\n'.join(label[1]))
-        f_real.close()
-        f_resyn.close()
-        f_edit.close()
-        f_cut_paste.close()
+                # f_real.write(label["real"][-1] + '\n')
+                # f_resyn.write(label["resyn"][-1] + '\n')
+                # f_edit.write(label["edit"][-1] + '\n')
+                # f_cut_paste.write(label["cut_paste"][-1] + '\n')
+
+                # f_real.flush()
+                # f_resyn.flush()
+                # f_edit.flush()
+                # f_cut_paste.flush()
+
+        # f_real.close()
+        # f_resyn.close()
+        # f_edit.close()
+        # f_cut_paste.close()
+        for t in files:
+            files[t].close()
         return label
 
     @staticmethod    
@@ -1553,7 +1581,7 @@ class MainExc:
         self.dataprocessor.prepare_val_dl(manifest_filepath="data/parsed/LibriHeavy/libriheavy_cuts_medium.jsonl.gz", min_duration=6, max_duration=8, load_audio=False)
         self.datagen.gen_edit_transcript_json("/datasets/LibriLight_aligned/gen_dataset/medium_prompt.json")
 
-    def gen_v3(self, split_id=None, out_dict=None,
+    def gen_v3(self, split_id=None, out_dict=None, tag="",
                    gpt_file="nemo_experiments/data_1a_medium.json", out_dict_file="nemo_experiments/data_parsed_1a_medium.json"):
         if split_id is None:
             split_id = int(sys.argv[1])
@@ -1567,11 +1595,11 @@ class MainExc:
         self.dataprocessor.prepare_val_dl(manifest_filepath="data/parsed/LibriHeavy/libriheavy_cuts_medium.jsonl.gz",
                                      min_duration=6, max_duration=8,
                                      filter_ids=filter_ids)
-        self.datagen.gen_v3_dataset_from_val_set(out_dict, f"{self.gen_data_dir}/medium-v3/split-{split_id}")
+        self.datagen.gen_v3_dataset_from_val_set(out_dict, f"{self.gen_data_dir}/medium-v3{tag}/split-{split_id}")
 
         # split_id = int(sys.argv[1])
-        self.eval.gen_val_frame_spk_sim(data_dir=f"{self.gen_data_dir}/medium-v3/split-{split_id}", subset="medium", audio_type="edit")
-        self.eval.gen_val_frame_spk_sim(data_dir=f"{self.gen_data_dir}/medium-v3/split-{split_id}", subset="medium", audio_type="cut_paste")
+        self.eval.gen_val_frame_spk_sim(data_dir=f"{self.gen_data_dir}/medium-v3{tag}/split-{split_id}", subset="medium", audio_type="edit")
+        # self.eval.gen_val_frame_spk_sim(data_dir=f"{self.gen_data_dir}/medium-v3{tag}/split-{split_id}", subset="medium", audio_type="cut_paste")
         # exit()
 
     def v4_gs_val_word_edit(self, ds_name="gigaspeech", corpus_dir="data/download/GigaSpeech", manifest_filepath="data/parsed/GigaSpeech/gigaspeech_cuts_DEV.speech.jsonl.gz", output_dir="nemo_experiments/edit_gen/"):
@@ -1656,7 +1684,8 @@ if __name__ == "__main__":
             "unet": {
                 "main_exc": {
                     # "vb_ckpt_path": "nemo_experiments/vb=0.3008-epoch=68-step=206000.ckpt",
-                    "vb_ckpt_path": "nemo_experiments/checkpoints/a100-GS_XL-DAC-pymha-unet-warmup/checkpoints/vb-val_loss/vb=0.2955-epoch=112-step=336740-last.ckpt",
+                    # "vb_ckpt_path": "nemo_experiments/checkpoints/a100-GS_XL-DAC-pymha-unet-warmup/checkpoints/vb-val_loss/vb=0.2955-epoch=112-step=336740-last.ckpt",
+                    "vb_ckpt_path": "nemo_experiments/checkpoints/a100-GS_XL-DAC-pymha-unet-warmup/checkpoints/vb-val_loss/vb=0.2913-epoch=167-step=500000-last.ckpt",
                     "dp_ckpt_path": "nemo_experiments/dp_no_sil_spn=1.4410-epoch=8.ckpt",
                 },
                 "internal_demo": {"output_dir": "nemo_experiments/internal_demo_gen_gs_unet"},
@@ -1673,11 +1702,11 @@ if __name__ == "__main__":
         exp = "unet"
         main_exc = MainExc(**(kwargs[exp]["main_exc"]), gen_data_dir="nemo_experiments/gen_dataset", sample_std=0.95)
         # main_exc.gen_val_v1()
-        main_exc._internal_demo(**(kwargs[exp]["internal_demo"]))
+        # main_exc._internal_demo(**(kwargs[exp]["internal_demo"]))
         # main_exc.v4_gs_val_word_edit(**(kwargs[exp]["v4_gs_val_word_edit"]))
         # main_exc.span_edit(**(kwargs[exp]["span_edit"]))
         # main_exc.riva_demo(**(kwargs[exp]["riva_demo"]))
-        # main_exc.gen_v3(split_id=None)
+        main_exc.gen_v3(split_id=None, tag="-unet-500k")
 
         # main_exc.calc_dac_stats(ds_name="gigaspeech", corpus_dir="data/download/GigaSpeech", manifest_filepath="data/parsed/GigaSpeech/gigaspeech_cuts_XL.speech.jsonl.gz", shuffle=True)
         exit()

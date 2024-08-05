@@ -1152,9 +1152,15 @@ class VoiceboxModel(TextToWaveform):
                 cap_audio[i, :new_cond_st_idx[i]] = audio[i, :ori_cond_st_idx[i]]
                 cap_audio[i, new_cond_st_idx[i]:new_cond_ed_idx[i]] = ztts_audio[i, new_cond_st_idx[i]:new_cond_ed_idx[i]]
                 cap_audio[i, new_cond_ed_idx[i]:new_audio_lens[i]] = audio[i, ori_cond_ed_idx[i]:audio_lens[i]]
+        redit_audio = torch.zeros_like(edit_audio)
+        for i in range(len(batch)):
+            redit_audio[i, :new_cond_st_idx[i]] = audio[i, :ori_cond_st_idx[i]]
+            redit_audio[i, new_cond_st_idx[i]:new_cond_ed_idx[i]] = edit_audio[i, new_cond_st_idx[i]:new_cond_ed_idx[i]]
+            redit_audio[i, new_cond_ed_idx[i]:new_audio_lens[i]] = audio[i, ori_cond_ed_idx[i]:audio_lens[i]]
 
         return {
             "edit_audio": edit_audio,
+            "redit_audio": redit_audio,
             "ztts_audio": None if not ztts else ztts_audio,
             "cap_audio": None if not ztts else cap_audio,
             "resyn_audio": resyn_audio,
