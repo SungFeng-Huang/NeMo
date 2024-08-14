@@ -52,7 +52,7 @@ class DataProcessor:
         self.model = model
 
     def prepare_val_dl(self, ds_name="libriheavy", corpus_dir="/datasets/LibriLight/", manifest_filepath="data/parsed/LibriHeavy/libriheavy_cuts_dev.jsonl.gz",
-                       old_prefix="download/librilight", min_duration=-1, max_duration=float("inf"), load_audio=True, filter_ids=None, shuffle=False):
+                       old_prefix="download/librilight", min_duration=-1, max_duration=float("inf"), load_audio=True, filter_ids=None, shuffle=False, batch_duration=100):
         # load from val set
         self.model.cfg.ds_name = ds_name
         self.model.cfg.corpus_dir = corpus_dir
@@ -65,6 +65,7 @@ class DataProcessor:
             self.model.cfg.validation_ds.filter_ids = filter_ids
             self.model.cfg.validation_ds.num_workers = 8
             self.model.cfg.validation_ds.shuffle = shuffle
+            self.model.cfg.validation_ds.batch_duration = batch_duration
         with open_dict(self.model.cfg):
             self.model.cfg["old_prefix"] = old_prefix
         self.model.setup_validation_data(self.model.cfg.validation_ds)
@@ -1683,10 +1684,10 @@ if __name__ == "__main__":
             },
             "unet": {
                 "main_exc": {
-                    # "vb_ckpt_path": "nemo_experiments/vb=0.3008-epoch=68-step=206000.ckpt",
+                    # "vb_ckpt_path": "nemo_experiments/checkpoints/vb=0.3008-epoch=68-step=206000.ckpt",
                     # "vb_ckpt_path": "nemo_experiments/checkpoints/a100-GS_XL-DAC-pymha-unet-warmup/checkpoints/vb-val_loss/vb=0.2955-epoch=112-step=336740-last.ckpt",
                     "vb_ckpt_path": "nemo_experiments/checkpoints/a100-GS_XL-DAC-pymha-unet-warmup/checkpoints/vb-val_loss/vb=0.2913-epoch=167-step=500000-last.ckpt",
-                    "dp_ckpt_path": "nemo_experiments/dp_no_sil_spn=1.4410-epoch=8.ckpt",
+                    "dp_ckpt_path": "nemo_experiments/checkpoints/dp_no_sil_spn=1.4410-epoch=8.ckpt",
                 },
                 "internal_demo": {"output_dir": "nemo_experiments/internal_demo_gen_gs_unet"},
                 "v4_gs_val_word_edit": {
