@@ -1836,7 +1836,8 @@ class MainExc:
                     if i == 0:
                         continue
                     line = line.strip('\n').split('\t')
-                    gen_audio_file_list.append(line[0])
+                    for j in range(rounds):
+                        gen_audio_file_list.append(line[0])
             f = open(f"{output_dir}/metadata/metadata.tsv", 'a')
             row_id = 0
         else:
@@ -1846,7 +1847,7 @@ class MainExc:
             f.write(f"gt_txt\tnorm_gt_txt\n")
 
         for i, data in tqdm(enumerate(datas)):
-            # if i < 308:
+            # if i < 19:
             #     continue
             target_list = data["target"].split('|')
             text_list.append(target_list[-1])
@@ -1862,10 +1863,11 @@ class MainExc:
                 gen_audio_path = gen_audio_file_list[i]
                 gen_sim = self.eval.calc_wavlm_sim(data["out_ori_path"], gen_audio_path)
                 gen_sims.append(gen_sim)
+                # for j in range(rounds):
             else:
                 _gen_sims = []
                 _gen_audio_paths = []
-                for j in range(5):
+                for j in range(rounds):
                     try:
                         data, edit_pred = self.infer.RealEdit(data, tag=f".round-{j}", tune_vol=tune_vol)
                     except:
@@ -2061,8 +2063,8 @@ if __name__ == "__main__":
         # main_exc.riva_demo(**(kwargs[exp]["riva_demo"]))
         # main_exc.gen_v3(split_id=None, tag="-unet-500k")
         # for exp in ["unet-mel"]:
-        for exp in [ "unet_postq", "unet-mel", "unet-lh-mel"]:
-        # for exp in ["unet", "unet_noCE", "unet_postq", "unet-lh-mel", "unet-mel"]:
+        # for exp in [ "unet_postq", "unet-mel", "unet-lh-mel"]:
+        for exp in ["unet", "unet_noCE", "unet_postq", "unet-lh-mel", "unet-mel"]:
             main_exc = MainExc(**(kwargs[exp]["main_exc"]), gen_data_dir="nemo_experiments/gen_dataset", sample_std=0.95)
             # main_exc.model.voicebox.audio_enc_dec.normalize=False
             # main_exc.model.silence_value = -4.5252
