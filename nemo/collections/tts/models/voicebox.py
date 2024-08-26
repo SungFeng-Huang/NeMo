@@ -1060,11 +1060,14 @@ class VoiceboxModel(TextToWaveform):
 
         new_cum_dur = new_dur.cumsum(dim=-1)
         ori_cum_dur = ori_dp_cond.int().cumsum(dim=-1)
-        new_slice = None
-        ori_slice = None
-        edited = False
-        cnt_span_tokens = 0
+        cond_st_idx = []
+        cond_ed_idx = []
         for bi, dp_in in enumerate(batch):
+            new_slice = None
+            ori_slice = None
+            edited = False
+            cnt_span_tokens = 0
+
             n2o_mapping = dp_in["n2o_mapping"]
             new_p2p_mapping = dp_in["new_p2p_mapping"]
             ori_p2p_mapping = dp_in["ori_p2p_mapping"]
@@ -1079,6 +1082,7 @@ class VoiceboxModel(TextToWaveform):
                 elif j == -2:
                     cnt_span_tokens += 1
                     # pre margin
+                    cond_st_idx.append(new_slice.stop if new_slice is not None else 0)
                     # if i > 0:
                     #     margin_slice = slice(new_slice.stop - margin, new_slice.stop)
                     #     new_cond_mask[bi, margin_slice] = 1
@@ -1102,16 +1106,19 @@ class VoiceboxModel(TextToWaveform):
                     new_cond_mask[bi, new_slice] = 0
 
                     # post margin
-                    # if edited:
+                    if edited:
                     #     margin_slice = slice(new_slice.start, min(new_slice.start + margin, new_mel_lens))
                     #     new_cond_mask[bi, margin_slice] = 1
-                    #     edited = False
+                        cond_ed_idx.append(new_slice.start)
+                        edited = False
 
-        cond_st_idx = torch.arange(new_cond.shape[1], 0, -1, device=self.device).reshape(1, -1) * new_cond_mask
-        cond_st_idx = cond_st_idx.argmax(dim=1)
+        # cond_st_idx = torch.arange(new_cond.shape[1], 0, -1, device=self.device).reshape(1, -1) * new_cond_mask
+        # cond_st_idx = cond_st_idx.argmax(dim=1)
+        cond_st_idx = torch.tensor(cond_st_idx, device=self.device)
         cond_st_idx = torch.clamp(cond_st_idx - margin, min=0)
-        cond_ed_idx = torch.arange(new_cond.shape[1], device=self.device).reshape(1, -1) * new_cond_mask
-        cond_ed_idx = cond_ed_idx.argmax(dim=1) + 1
+        # cond_ed_idx = torch.arange(new_cond.shape[1], device=self.device).reshape(1, -1) * new_cond_mask
+        # cond_ed_idx = cond_ed_idx.argmax(dim=1) + 1
+        cond_ed_idx = torch.tensor(cond_ed_idx, device=self.device)
         cond_ed_idx = torch.clamp(cond_ed_idx + margin, max=new_mel_lens)
         for bi in range(new_cond_mask.shape[0]):
             new_cond_mask[bi, cond_st_idx[bi]:cond_ed_idx[bi]] = 1
@@ -1869,12 +1876,7 @@ def edit_w2p_alignment(w2p_alis=None, edit_from="", edit_to="", edit_ali=None, e
             # store for calculate masked interval
             ori_phn_alis += phn_alis
 
-            if edit_type == "deletion" and i in edit_pos:
-                # start/end of edit span, for margin notation
-                n2o_mapping += [-2, -3]
-                continue
-
-            elif edit_type == "insertion" and i == edit_pos[1]:
+            if edit_type == "insertion" and i == edit_pos[1]:
                 assert edit_pos[1] - edit_pos[0] == 1
                 # start of edit span
                 n2o_mapping.append(-2)
@@ -1888,6 +1890,18 @@ def edit_w2p_alignment(w2p_alis=None, edit_from="", edit_to="", edit_ali=None, e
                 n2o_mapping += list(range(len(ori_phn_alis)-len(phn_alis), len(ori_phn_alis)))
                 # end of edit span
                 n2o_mapping.append(-3)
+
+            elif edit_type == "deletion" and i in edit_pos:
+                if edited:
+                    continue
+                # start/end of edit span, for margin notation
+                # if i == edit_pos[0]:
+                #     n2o_mapping += [-2]
+                # elif i == edit_pos[1]:
+                #     n2o_mapping += [-3]
+                n2o_mapping += [-2, -3]
+                edited = True
+                continue
 
             elif edit_type == "substitution" and i in edit_pos:
                 if edited:
