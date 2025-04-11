@@ -1,7 +1,7 @@
-TRAIN_MANIFEST='/mount/src/NeMo/ASR/TechOrange_tp1/mixedtok_manifests/techorange_segmented_mixed_train.jsonl'
-VAL_MANIFEST='/mount/src/NeMo/ASR/TechOrange_tp1/mixedtok_manifests/techorange_segmented_mixed_valid.jsonl'
-TOKENIZERS_DIR='/mount/src/NeMo/ASR/TechOrange_tp1/tokenizers/tokenizer_spe_bpe_v5000/'
-PRETRAINED_MODEL='/mount/src/NeMo/ASR/TechOrange/pretrained_model/stt_enzh_600m.nemo'
+TRAIN_MANIFEST='/datasets/TechOrange/techorange_formated_train.jsonl.clean_m3'
+VAL_MANIFEST='/datasets/TechOrange/techorange_formated_valid.jsonl.clean_m3'
+TOKENIZERS_DIR='/datasets/TechOrange/mount/src/NeMo/ASR/TechOrange_tp1/tokenizers/tokenizer_spe_bpe_v5000'
+PRETRAINED_MODEL='/results/checkpoints/aishell1_fc_rnnt_bpe_5000_50_n1_bs64_lr2.5e-4_a100_600M_spec00.nemo'
 
 EPOCH=50 #100 #400
 LR="2.5e-4" #5 #"2e-3" #5 #"2.5e-3" #"1e-3"
@@ -23,10 +23,10 @@ EXP_NAME=aishell1_fc_rnnt_bpe_5000_${EPOCH}_n${node}_bs${TRAIN_BATCH_SIZE}_lr${L
 PROJECT_NAME="aishell1_fct_asr"
 
 # WandB info
-WANDB="" 
+WANDB="a256061eb5311e7d96a9f735f71737154a1b9bed" 
 
 # Config file
-CONFIG_PATH="../conf/fastconformer/"
+CONFIG_PATH="/codes/examples/asr/conf/fastconformer/hybrid_transducer_ctc"
 # CONFIG_NAME=model.yaml
 CONFIG_NAME=model_600m_mixedtok_rnnt.yaml
 
@@ -43,11 +43,24 @@ else
   SCRIPT_POSTFIX="_bpe"
 fi
 
+export DEBUG=false
+export HOSTNAME=$(hostname -I | awk '{print $1}')
+export DEBUG_PORT=5678
+export OMP_NUM_THREADS=16
+# ssh -fN -L localhost:$DEBUG_PORT:cs-oci-ord-vscode-02.nvidia.com:$DEBUG_PORT $USER@$HOSTNAME
+
+if [[ $DEBUG == true ]]
+then
+  PYTHON_SCRIPT="scripts/asr_tw/debug_wrapper.py"
+else
+  PYTHON_SCRIPT="examples/asr/asr_transducer/speech_to_text_rnnt_bpe.py"
+fi
+
 read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
 && echo "---------------" \
 && wandb login ${WANDB} \
-&& HYDRA_FULL_ERROR=1 python speech_to_text_rnnt_bpe.py  \
+&& HYDRA_FULL_ERROR=1 PYTHONPATH=/codes python -m torch.distributed.run --nproc_per_node=8 ${PYTHON_SCRIPT} \
     --config-path=$CONFIG_PATH \
     --config-name=$CONFIG_NAME \
     exp_manager.create_wandb_logger=true \
@@ -89,9 +102,10 @@ echo "*******STARTING********" \
     +model.train_ds.use_lhotse=false \
     +model.train_ds.batch_duration=200 \
     ++init_from_nemo_model.model0.path=$PRETRAINED_MODEL \
-    ++init_from_nemo_model.model0.exclude=['decoder'] \
     model.optim.sched.min_lr=$MIN_LR
 EOF
+
+#   ++init_from_nemo_model.model0.exclude='["decoder.prediction.embed.weight", "joint.joint_net.2"]' \
 
 bash -c "${cmd}"
 
