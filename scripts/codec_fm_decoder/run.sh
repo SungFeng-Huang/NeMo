@@ -1,4 +1,4 @@
-cd ~/personal/codes/nemo_codec_fm_decoding
+# cd ~/personal/codes/nemo_codec_fm_decoding
 
 export HYDRA_FULL_ERROR=1
 export PYTHONPATH=.
@@ -10,6 +10,7 @@ export DEBUG=true
 python3 -c "import torchaudio" > /dev/null 2>&1
 if [ $? -ne 0 ]; then
     echo "torchaudio not installed, installing..."
+    apt update && apt install -y ffmpeg sox libavdevice-dev
     bash ./scripts/installers/install_torchaudio_latest.sh
 else
     echo "torchaudio is installed"
@@ -39,11 +40,11 @@ CV_VAL_MANIFEST=/lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-spee
 
 # Set config file paths
 CONFIG_PATH="examples/audio/conf"
-CONFIG_NAME="flow_matching_codec_decoding.yaml"
+CONFIG_NAME="codec_fm_decoding.yaml"
 
 if [[ $DEBUG == true ]]
 then
-  PYTHON_SCRIPT="scripts/flow_matching_codec_decoder/debug_wrapper.py"
+  PYTHON_SCRIPT="scripts/codec_fm_decoder/debug_wrapper.py"
   PYTHON_SCRIPT="-m torch.distributed.run --nproc_per_node=8 ${PYTHON_SCRIPT}"
   EXP_NAME="${EXP_NAME}_debug"
   echo "Debug mode enabled. Using debug wrapper script."
