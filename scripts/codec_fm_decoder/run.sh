@@ -71,7 +71,6 @@ echo "*******Starting********" \
 && nvidia-smi \
 && wandb login ${WANDB_API_KEY} \
 && HYDRA_FULL_ERROR=1 PYTHONPATH=. python ${PYTHON_SCRIPT} \
-    --config-path=${CONFIG_PATH} \
     --config-name=${CONFIG_NAME} \
     exp_manager.create_wandb_logger=true \
     exp_manager.wandb_logger_kwargs.project=${PROJECT_NAME} \
@@ -92,6 +91,7 @@ echo "*******Starting********" \
     model.optim.sched.name=${SCHE} \
     model.optim.sched.min_lr=${MIN_LR}
 EOF
+    # --config-path=${CONFIG_PATH} \
 
 echo "Running command: $cmd"
 
