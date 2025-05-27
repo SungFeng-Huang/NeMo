@@ -19,6 +19,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import copy
 from omegaconf import OmegaConf
 
 from nemo.collections.asr.parts.submodules import rnnt_beam_decoding, rnnt_greedy_decoding

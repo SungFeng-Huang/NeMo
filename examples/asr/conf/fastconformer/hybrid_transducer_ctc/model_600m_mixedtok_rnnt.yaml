@@ -39,7 +39,7 @@
 # To increase the global batch size with limited number of GPUs, you may use higher accumulate_grad_batches.
 # However accumulate_grad_batches is better to be avoided as long as the global batch size is large enough and training is stable.
 
-name: "FastConformer-Transducer-BPE"
+name: "FastConformerXL-Hybrid-Transducer-CTC-BPE"
 
 model:
   sample_rate: 16000
@@ -94,8 +94,8 @@ model:
 #     type: bpe  # Can be either bpe (SentencePiece tokenizer) or wpe (WordPiece tokenizer)
   langs: ['zh', 'en']
   tokenizer:
-    type: bpe  # The AggregateTokenizer is an ordered dict of N monolingual tokenizers, one per language id
-    dir: ???
+    dir: ???  # path to directory which contains either tokenizer.model (bpe) or vocab.txt (for wpe)
+    type: bpe  # Can be either bpe (SentencePiece tokenizer) or wpe (WordPiece tokenizer)
 
   preprocessor:
     _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
@@ -119,57 +119,75 @@ model:
 
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder
-    feat_in: 80
-    feat_out: -1
+    feat_in: ${model.preprocessor.features}
+    feat_out: -1 # you may set it if you need different output size other than the default d_model
     n_layers: 24
     d_model: 1024
-    subsampling: dw_striding
-    subsampling_factor: 8
-    subsampling_conv_channels: 256
+
+    # Sub-sampling parameters
+    subsampling: dw_striding # vggnet, striding, stacking or stacking_norm, dw_striding
+    subsampling_factor: 8 # must be power of 2 for striding and vggnet
+    subsampling_conv_channels: 256 # set to -1 to make it equal to the d_model
+
+    # Feed forward module's params
     ff_expansion_factor: 4
-    self_attention_model: rel_pos
-    n_heads: 8
-    att_context_size:
-    - -1
-    - -1
-    att_context_style: regular
-    xscaling: false
+
+    # Multi-headed Attention Module's params
+    self_attention_model: rel_pos # rel_pos or abs_pos
+    n_heads: 8 # may need to be lower for smaller d_models
+    # [left, right] specifies the number of steps to be seen from left and right of each step in self-attention
+    att_context_size: [-1, -1] # -1 means unlimited context
+    att_context_style: regular # regular or chunked_limited
+    xscaling: false # scales up the input embeddings by sqrt(d_model)
     pos_emb_max_len: 5000
+
+    # Convolution module's params
     conv_kernel_size: 9
-    conv_norm_type: batch_norm
-    dropout: 0.1
-    dropout_pre_encoder: 0.1
-    dropout_emb: 0.0
-    dropout_att: 0.1
+    conv_norm_type: 'batch_norm' # batch_norm or layer_norm or groupnormN (N specifies the number of groups)
+
+    ### regularization
+    dropout: 0.1 # The dropout used in most of the Conformer Modules
+    dropout_pre_encoder: 0.1 # The dropout used before the encoder
+    dropout_emb: 0.0 # The dropout used for embeddings
+    dropout_att: 0.1 # The dropout for multi-headed attention modules
+
+    # set to non-zero to enable stochastic depth
     stochastic_depth_drop_prob: 0.0
-    stochastic_depth_mode: linear
+    stochastic_depth_mode: linear  # linear or uniform
     stochastic_depth_start_layer: 1
+
   decoder:
     _target_: nemo.collections.asr.modules.RNNTDecoder
-    normalization_mode: null
-    random_state_sampling: false
-    blank_as_pad: true
+    normalization_mode: null # Currently only null is supported for export.
+    random_state_sampling: false # Random state sampling: https://arxiv.org/pdf/1910.11455.pdf
+    blank_as_pad: true # This flag must be set in order to support exporting of RNNT models + efficient inference.
+
     prednet:
-      pred_hidden: 640
+      pred_hidden: ${model.model_defaults.pred_hidden}
       pred_rnn_layers: 2
       t_max: null
       dropout: 0.2
     vocab_size: 7000
 
-  # if a large vocabulary size is desired, you may wish to use SampleRNNTJoint module
-  # _target_: nemo.collections.asr.modules.SampledRNNTJoint
-  # n_samples: 500 # Specifies the minimum number of tokens to sample from the vocabulary space, excluding
-  # the RNNT blank token. If a given value is larger than the entire vocabulary size, then the full
-  # vocabulary will be used
   joint:
     _target_: nemo.collections.asr.modules.RNNTJoint
-    log_softmax: null
-    preserve_memory: false
+    log_softmax: null  # 'null' would set it automatically according to CPU/GPU device
+    preserve_memory: false  # dramatically slows down training, but might preserve some memory
+
+    # Fuses the computation of prediction net + joint net + loss + WER calculation
+    # to be run on sub-batches of size `fused_batch_size`.
+    # When this flag is set to true, consider the `batch_size` of *_ds to be just `encoder` batch size.
+    # `fused_batch_size` is the actual batch size of the prediction net, joint net and transducer loss.
+    # Using small values here will preserve a lot of memory during training, but will make training slower as well.
+    # An optimal ratio of fused_batch_size : *_ds.batch_size is 1:1.
+    # However, to preserve memory, this ratio can be 1:8 or even 1:16.
+    # Extreme case of 1:B (i.e. fused_batch_size=1) should be avoided as training speed would be very slow.
     fuse_loss_wer: true
     fused_batch_size: 2
+
     jointnet:
-      joint_hidden: 640
-      activation: relu
+      joint_hidden: ${model.model_defaults.joint_hidden}
+      activation: "relu"
       dropout: 0.2
       encoder_hidden: 1024
       pred_hidden: 640
@@ -190,12 +208,25 @@ model:
       tsd_max_sym_exp: 50  # for Time Synchronous Decoding
       alsd_max_target_len: 2.0  # for Alignment-Length Synchronous Decoding
 
+  # The section which would contain the decoder and decoding configs of the auxiliary CTC decoder
+  aux_ctc:
+    ctc_loss_weight: 0.3 # the weight used to combine the CTC loss with the RNNT loss
+    use_cer: false
+    ctc_reduction: 'mean_batch'
+    decoder:
+      _target_: nemo.collections.asr.modules.ConvASRDecoder
+      feat_in: null
+      num_classes: -1
+      vocabulary: []
+    decoding:
+      strategy: "greedy"
+
   loss:
     loss_name: "default"
-
     warprnnt_numba_kwargs:
       # FastEmit regularization: https://arxiv.org/abs/2010.11148
       # You may enable FastEmit to reduce the latency of the model for streaming
+      # It also helps to improve the accuracy of the model in streaming mode
       fastemit_lambda: 0.0  # Recommended values to be in range [1e-4, 1e-2], 0.001 is a good start.
       clamp: -1.0  # if > 0, applies gradient clamping in range [-clamp, clamp] for the joint tensor only.
 

@@ -339,6 +339,14 @@ def write_transcription(
                         item['pred_lang_chars'] = transcription.langs_chars
                     if not cfg.decoding.beam.return_best_hypothesis:
                         item['beams'] = beams[idx]
+                    if cfg.preserve_attention:
+                        item['score'] = transcription.score
+                        for _mode in ['encoder', 'decoder']:
+                            for _causal in ['True', 'False']:
+                                if hasattr(transcription, f'score_{_mode}_{_causal}'):
+                                    item[f'score_{_mode}_{_causal}'] = getattr(
+                                        transcription, f'score_{_mode}_{_causal}'
+                                    )
                 f.write(json.dumps(item) + "\n")
         else:
             with open(cfg.dataset_manifest, 'r', encoding='utf-8') as fr:
@@ -365,6 +373,14 @@ def write_transcription(
 
                         if not cfg.decoding.beam.return_best_hypothesis:
                             item['beams'] = beams[idx]
+                        if cfg.preserve_attention:
+                            item['score'] = best_hyps[idx].score
+                            for _mode in ['encoder', 'decoder']:
+                                for _causal in ['True', 'False']:
+                                    if hasattr(best_hyps[idx], f'score_{_mode}_{_causal}'):
+                                        item[f'score_{_mode}_{_causal}'] = getattr(
+                                            best_hyps[idx], f'score_{_mode}_{_causal}'
+                                        )
                     f.write(json.dumps(item) + "\n")
 
     return cfg.output_filename, pred_text_attr_name

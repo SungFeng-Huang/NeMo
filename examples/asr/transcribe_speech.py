@@ -28,6 +28,7 @@ from nemo.collections.asr.parts.submodules.multitask_decoding import MultiTaskDe
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecodingConfig
 from nemo.collections.asr.parts.utils.eval_utils import cal_write_wer
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
+from nemo.collections.asr.parts.utils.star_utils import add_nemo_attention_dropout_hooks, star_transcribe
 from nemo.collections.asr.parts.utils.transcribe_utils import (
     compute_output_filename,
     prepare_audio_data,
@@ -133,6 +134,7 @@ class TranscriptionConfig:
     compute_timestamps: bool = False
     # set to True if need to return full alignment information
     preserve_alignment: bool = False
+    preserve_attention: bool = True  # Set to True to output attention weights (only supported models)
 
     # Set to True to output language ID information
     compute_langs: bool = False
@@ -361,6 +363,22 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
                     channel_selector=cfg.channel_selector,
                     augmentor=augmentor,
                     decoder_type=cfg.decoder_type,
+                )
+            elif cfg.preserve_attention:
+                cfg.rnnt_decoding.confidence_cfg.preserve_frame_confidence = True
+                cfg.rnnt_decoding.confidence_cfg.preserve_word_confidence = False
+                cfg.rnnt_decoding.confidence_cfg.preserve_token_confidence = True
+
+                asr_model.change_decoding_strategy(cfg.rnnt_decoding)
+                add_nemo_attention_dropout_hooks(asr_model)
+                transcriptions = star_transcribe(
+                    asr_model=asr_model,
+                    paths2audio_files=filepaths,
+                    batch_size=cfg.batch_size,
+                    num_workers=cfg.num_workers,
+                    return_hypotheses=cfg.return_hypotheses,
+                    channel_selector=cfg.channel_selector,
+                    augmentor=augmentor,
                 )
             else:
                 transcriptions = asr_model.transcribe(

@@ -7,7 +7,7 @@ TechOrange_MANIFEST='/datasets/TechOrange/techorange_formated_all.jsonl.clean_m3
 CV_TechOrange_MANIFEST='/datasets/TechOrange/cv_techorange_formated_all.jsonl.clean_m3'
 
 # cat $TRAIN_MANIFEST $VAL_MANIFEST $TEST_MANIFEST > $TechOrange_MANIFEST
-# cat $TechOrange_MANIFEST $CV_MANIFEST > $CV_TechOrange_MANIFEST
+# cat $CV_MANIFEST $TechOrange_MANIFEST > $CV_TechOrange_MANIFEST
 
 NUM_TOKENS=5000
 OUT_TOKENIZER_DIR="/datasets/TechOrange/mount/src/NeMo/ASR/CV_TechOrange/tokenizers/tokenizer_spe_bpe_v${NUM_TOKENS}"

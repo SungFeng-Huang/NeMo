@@ -5,6 +5,9 @@ CV_VAL_MANIFEST=/lustre/fs12/portfolios/nvr/users/szuweif/Datasets/cv-corpus-20.
 TO_TRAIN_MANIFEST='/datasets/TechOrange/techorange_formated_train.jsonl.clean_m3'
 TO_VAL_MANIFEST='/datasets/TechOrange/techorange_formated_valid.jsonl.clean_m3'
 
+CV_TO_TRAIN_MANIFEST='/datasets/TechOrange/cv_techorange_formated_train.jsonl.clean_m3'
+CV_TO_VAL_MANIFEST='/datasets/TechOrange/cv_techorange_formated_valid.jsonl.clean_m3'
+
 TOKENIZERS_DIR='/datasets/TechOrange/mount/src/NeMo/ASR/CV_TechOrange/tokenizers/tokenizer_spe_bpe_v7000/tokenizer_spe_bpe_v7000'
 # TOKENIZERS_DIR='/datasets/TechOrange/mount/src/NeMo/ASR/CV_TechOrange/tokenizers/tokenizer_spe_bpe_v5000/tokenizer_spe_bpe_v5000'
 # TOKENIZERS_DIR='/datasets/TechOrange/mount/src/NeMo/ASR/TechOrange_tp1/tokenizers/tokenizer_spe_bpe_v5000'
@@ -112,14 +115,14 @@ echo "*******STARTING********" \
     model.train_ds.max_duration=20.0 \
     model.train_ds.num_workers=2 \
     ++model.train_ds.shuffle_n=2048 \
-    ++model.train_ds.manifest_filepath="[$TO_TRAIN_MANIFEST, $CV_TRAIN_MANIFEST]" \
+    ++model.train_ds.manifest_filepath=$CV_TO_TRAIN_MANIFEST \
     model.train_ds.batch_size=$TRAIN_BATCH_SIZE \
     +model.train_ds.use_lhotse=false \
     +model.train_ds.batch_duration=200 \
     model.validation_ds.pin_memory=true \
     ++model.validation_ds.use_start_end_token=false \
     model.validation_ds.num_workers=1 \
-    model.validation_ds.manifest_filepath="[$TO_VAL_MANIFEST, $CV_VAL_MANIFEST]" \
+    model.validation_ds.manifest_filepath=$CV_TO_VAL_MANIFEST \
     model.validation_ds.batch_size=$EVAL_BATCH_SIZE \
     +model.validation_ds.use_lhotse=false \
     +model.validation_ds.use_bucketing=false \
