@@ -21,6 +21,7 @@ import torch
 import torchaudio
 import soundfile as sf
 import webdataset as wd
+from omegaconf import OmegaConf, open_dict
 
 from nemo.collections.asr.data.audio_to_text import expand_sharded_filepaths
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
@@ -101,6 +102,9 @@ def vocoder_collate_fn(batch: List[dict], feature_processors: List[FeatureProces
         "audio_filepaths": audio_filepath_list,
         "audio": batch_audio,
         "audio_lens": batch_audio_len,
+        "input_signal": batch_audio,
+        "input_length": batch_audio_len,
+        "target_signal": batch_audio,
     }
 
     for feature_processor in feature_processors:
@@ -329,6 +333,7 @@ class TarredVocoderDataset(IterableDataset):
         shard_strategy: str = "scatter",
         global_rank: int = 0,
         world_size: int = 0,
+        **kwargs,
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -349,6 +354,7 @@ class TarredVocoderDataset(IterableDataset):
 
         web_datasets = []
         dataset_lengths = []
+        sample_weights = []
         self.file_to_sample_map = {}
         for dataset_name, dataset_info in dataset_meta.items():
             dataset_meta = TarredMetadata(**dataset_info)
@@ -379,6 +385,15 @@ class TarredVocoderDataset(IterableDataset):
             if web_dataset is not None:
                 web_datasets.append(web_dataset)
                 dataset_lengths.append(dataset_length)
+                sample_weights.append(dataset_meta.sample_weight)
+
+        # Normalize sample weights to sum to 1
+        if sample_weights:
+            total_weight = sum(sample_weights)
+            sample_weights = [w / total_weight for w in sample_weights]
+
+        with open_dict(sample_args):
+            sample_args.dataset_weights = sample_weights
 
         self.dataset = create_tarred_dataset(
             datasets=web_datasets,

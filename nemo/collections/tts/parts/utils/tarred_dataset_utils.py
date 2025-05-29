@@ -43,7 +43,7 @@ def process_tarred_manifest(
     file_to_sample_map = {}
     for entry in filtered_entries:
         sample = TarredSample(dataset_name=dataset_name, manifest_entry=entry)
-        audio_id = entry["audio_id"]
+        audio_id = entry.get("audio_id", get_file_id(Path(entry["audio_filepath"])))
         file_to_sample_map[audio_id] = sample
 
     return file_to_sample_map, unfiltered_file_count, unfiltered_hours, filtered_hours

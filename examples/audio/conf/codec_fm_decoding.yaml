@@ -1,11 +1,9 @@
-name: flow_matching_generative_finetuning
+name: codec_flow_matching
 
 init_from_nemo_model: null
 init_strict: false
 
-metadata_file:
-  tar_filepath: /dataset/dummy_data/audio_{0..num_tars}.tar
-  manifest_path: /dataset/dummy_data/manifest.json
+weighted_sampling_steps_per_epoch: null
 
 model:
   type: codec_flow_matching
@@ -18,52 +16,57 @@ model:
 
   train_ds:
     is_tarred: true
-    dataset_type: "tarred_vocoder"
-    dataset_args:
-      shard_strategy: "replicate"
-      sample_type: "weighted_random"
-      batch_size: 10
-      steps_per_epoch: 1000
-      dataset_weights: null
-      sample_rate: 22050
-      n_samples: null
-      min_duration: null
-      max_duration: null
-      trunc_duration: 10.0 # Only log the first 10 seconds of generated audio.
-      dataset_meta: ${metadata_file}
-    # manifest_filepath: ???
-    # input_key: noisy_filepath
-    # target_key: clean_filepath
-    # audio_duration: 6.14 # Number of STFT time frames = 1 + audio_duration // encoder.hop_length = 768
-    # random_offset: true
-    # batch_size: 8 # batch size may be increased based on the available memory
-    # shuffle: true
-    # num_workers: 8
-    # pin_memory: true
+    dataset:
+      _target_: nemo.collections.tts.data.vocoder_dataset.VocoderDataset
+      weighted_sampling_steps_per_epoch: ${weighted_sampling_steps_per_epoch}
+      dataset_type: "tarred_vocoder"
+      dataset_args:
+        dataset_meta:
+          cv:
+            manifest_path: ???
+            tar_filepath: ???
+            sample_weight: 1.0
+        sample_rate: 22050
+        n_samples: null
+        min_duration: 0.4
+        max_duration: null
+        trunc_duration: 10.0 # Only log the first 10 seconds of generated audio.
+        shard_strategy: "replicate"
+        sample_type: "weighted_random"
+        sample_args:
+          batch_size: ${model.train_ds.dataloader_params.batch_size}
+          steps_per_epoch: 1000
+          # dataset_weights: [1.0]
+        shuffle_n: 10000
+
+    dataloader_params:
+      batch_size: 4 # batch size may be increased based on the available memory
+      num_workers: 4
+      drop_last: true
+      # pin_memory: true
 
   validation_ds:
     is_tarred: true
-    dataset_type: "tarred_vocoder"
-    dataset_args:
-      shard_strategy: "replicate"
-      sample_type: "weighted_random"
-      batch_size: 10
-      steps_per_epoch: 1000
-      dataset_weights: null
-      sample_rate: 22050
-      n_samples: null
-      min_duration: null
-      max_duration: null
-      trunc_duration: 10.0 # Only log the first 10 seconds of generated audio.
-      dataset_meta: ${metadata_file}
-    # manifest_filepath: ???
-    # input_key: noisy_filepath
-    # target_key: clean_filepath
-    # batch_size: 8
-    # shuffle: false
-    # num_workers: 4
-    # pin_memory: true
-  
+    dataset:
+      _target_: nemo.collections.tts.data.vocoder_dataset.VocoderDataset
+      dataset_type: "vocoder"
+      dataset_args:
+        dataset_meta:
+          cv:
+            manifest_path: ???
+            audio_dir: ???
+            sample_weight: 1.0
+        sample_rate: 22050
+        n_samples: null
+        min_duration: null
+        max_duration: null
+        trunc_duration: 10.0 # Only log the first 10 seconds of generated audio.
+
+    dataloader_params:
+      batch_size: 8
+      num_workers: 4
+      # pin_memory: true
+
   log_config:
     log_tensorboard: true
     log_wandb: false
@@ -78,7 +81,7 @@ model:
 
   codec:
     _target_: nemo.collections.audio.models.codec_to_audio.AudioToCodec
-    restore_path: "/lustre/fsw/portfolios/convai/users/ecasanova/Checkpoints/Low_Frame-rate_Speech_Codec++_nemo_last_checkpoint/ml-model-INTERSPEECH_2025_abblations_12.5Hz_8_codebooks_2016_codes_pad_fix_enc_non_causal_dec_causal_/checkpoints/Low_Frame-rate_Speech_Codec++.nemo"
+    restore_codec_from_path: "/lustre/fsw/portfolios/convai/users/ecasanova/Checkpoints/Low_Frame-rate_Speech_Codec++_nemo_last_checkpoint/ml-model-INTERSPEECH_2025_abblations_12.5Hz_8_codebooks_2016_codes_pad_fix_enc_non_causal_dec_causal_/checkpoints/Low_Frame-rate_Speech_Codec++.nemo"
     feature_type: "prequantized" # "prequantized" or "quantized" or "postquantized"
 
   decoder:

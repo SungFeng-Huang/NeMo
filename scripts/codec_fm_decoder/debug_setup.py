@@ -15,12 +15,15 @@ def setup_debugging():
         rank = 0  # Default to main process in single GPU or non-distributed scenarios
 
     if rank == 0:
-        # debugpy.configure(subProcess=True)
         # Set the port number for debugpy
         debugpy.listen(("0.0.0.0", 5678))
         print("Waiting for debugger to attach...")
         debugpy.wait_for_client()  # Wait for the debugger to connect
         print("Debugger attached!")
+    else:
+        # Other ranks should wait for rank 0 to finish debugging
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
 # 在訓練腳本中調用
 if __name__ == "__main__":

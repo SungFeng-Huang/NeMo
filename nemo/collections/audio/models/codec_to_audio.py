@@ -42,11 +42,11 @@ class AudioToCodec(NeuralModule):
         self.feature_type = feature_type
         if self.feature_type not in ["quantized", "postquantized", "prequantized"]:
             raise ValueError(f"Unknown feature type {self.feature_type}. Supported types are quantized, postquantized, prequantized")
-        self.num_groups = self.codec.num_groups
+        self.num_groups = self.codec.vector_quantizer.num_groups
         if self.feature_type == "quantized":
-            self.feature_dim = self.codec.num_groups
+            self.feature_dim = self.codec.vector_quantizer.num_groups
         elif self.feature_type in ["postquantized", "prequantized"]:
-            self.feature_dim = self.codec.codebook_dim_per_group * self.codec.num_groups
+            self.feature_dim = self.codec.vector_quantizer.codebook_dim_per_group * self.codec.vector_quantizer.num_groups
 
         logging.debug('Initialized %s with:', self.__class__.__name__)
         logging.debug('\tcodec:           %s', self.codec)
@@ -64,13 +64,13 @@ class AudioToCodec(NeuralModule):
     def input_types(self) -> Dict[str, NeuralType]:
         """Returns definitions of module output ports."""
         return {
-            "input": NeuralType(('B', 'C', 'T'), AudioSignal()),
+            "input_signal": NeuralType(('B', 'C', 'T'), AudioSignal()),
             "input_length": NeuralType(('B',), LengthsType(), optional=True),
         }
 
     @typecheck()
     def forward(
-        self, input: torch.Tensor, input_length: Optional[torch.Tensor] = None
+        self, input_signal: torch.Tensor, input_length: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Convert a batch of C-channel input signals
         into a batch of codec-based spectrograms.
@@ -83,21 +83,21 @@ class AudioToCodec(NeuralModule):
             Output codec features with F subbands and N time frames, shape (B, C, F, N)
             and output length with shape (B,).
         """
-        B, T = input.size(0), input.size(-1)
-        input = input.view(B, -1, T)
+        B, T = input_signal.size(0), input_signal.size(-1)
+        input_signal = input_signal.view(B, T)
 
         # codec output (B, C, F, N)
         with torch.amp.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", dtype=torch.float32):
             if self.feature_type == "prequantized":
                 # encoded (B, codebook_dim_per_group * num_groups, T)
                 # encoded_len (B)
-                encoded, encoded_len = self.encode_audio(audio=input, audio_len=input_length)
+                encoded, encoded_len = self.codec.encode_audio(audio=input_signal, audio_len=input_length)
                 return encoded, encoded_len
             
             elif self.feature_type in ["quantized", "postquantized"]:
                 # FSD uses rounded scalar to determin code_id
                 # gen_tokens (B, num_groups, T)
-                gen_tokens, gen_tokens_lens = self.codec.encode(audio=input, audio_len=input_length)
+                gen_tokens, gen_tokens_lens = self.codec.encode(audio=input_signal, audio_len=input_length)
 
                 if self.feature_type == "quantized":
                     return gen_tokens, gen_tokens_lens
@@ -125,54 +125,11 @@ class CodecFlowMatchingAudioToAudioModel(FlowMatchingAudioToAudioModel):
     """
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
-        # AudioToAudioModel.__init__(self, cfg=cfg, trainer=trainer)
-        # self.sample_rate = self._cfg.sample_rate
-
-        # # Setup processing modules
-        # self.encoder = self.from_config_dict(self._cfg.encoder)
-        # self.decoder = self.from_config_dict(self._cfg.decoder)
+        super().__init__(cfg=cfg, trainer=trainer)
 
         # Codec
         self.codec = self.from_config_dict(self._cfg.codec)
-        super().__init__(cfg=cfg, trainer=trainer)
 
-        # # Neural estimator
-        # self.estimator = self.from_config_dict(self._cfg.estimator)
-
-        # # Flow
-        # self.flow = self.from_config_dict(self._cfg.flow)
-
-        # # Sampler
-        # self.sampler = hydra.utils.instantiate(self._cfg.sampler, estimator=self.estimator)
-
-        # # probability that the conditional input will be feed into the
-        # # estimator in the training stage
-        # self.p_cond = self._cfg.get('p_cond', 1.0)
-
-        # # Self-Supervised Pretraining
-        # if self._cfg.get('ssl_pretrain_masking') is not None:
-        #     logging.debug('SSL-pretrain_masking is found and will be initialized')
-        #     self.ssl_pretrain_masking = self.from_config_dict(self._cfg.ssl_pretrain_masking)
-        # else:
-        #     self.ssl_pretrain_masking = None
-
-        # # Normalization
-        # self.normalize_input = self._cfg.get('normalize_input', False)
-
-        # # Metric evaluation
-        # self.max_utts_evaluation_metrics = self._cfg.get('max_utts_evaluation_metrics')
-
-        # if self.max_utts_evaluation_metrics is not None:
-        #     logging.warning(
-        #         'Metrics will be evaluated on first %d examples of the evaluation datasets.',
-        #         self.max_utts_evaluation_metrics,
-        #     )
-
-        # # Regularization
-        # self.eps = self._cfg.get('eps', 1e-8)
-
-        # # Setup optional Optimization flags
-        # self.setup_optimization_flags()
 
         logging.debug('Initialized              %s', self.__class__.__name__)
         logging.debug('\tdoing SSL-pretraining: %s', (self.ssl_pretrain_masking is not None))
@@ -262,7 +219,7 @@ class CodecFlowMatchingAudioToAudioModel(FlowMatchingAudioToAudioModel):
 
         # Codec
         with torch.no_grad():
-            input_codec, input_codec_length = self.codec(input=input_signal, input_length=input_length)
+            input_codec, input_codec_length = self.codec(input_signal=input_signal, input_length=input_length)
             input_codec = einops.rearrange(input_codec, 'B D T -> B 1 D T')
 
             # Reshape the codec output to match the encoder output
@@ -346,7 +303,7 @@ class CodecFlowMatchingAudioToAudioModel(FlowMatchingAudioToAudioModel):
 
         # The vector field model is conditioned on the input signal codec
         with torch.no_grad():
-            input_codec, input_codec_len = self.codec(input=input_signal, input_length=input_length)
+            input_codec, input_codec_len = self.codec(input_signal=input_signal, input_length=input_length)
             input_codec = einops.rearrange(input_codec, 'B D T -> B 1 D T')
 
             # Reshape the codec output to match the encoder output
