@@ -5,9 +5,12 @@ init_strict: false
 
 weighted_sampling_steps_per_epoch: null
 
+stft_sample_rate: 16000
+codec_sample_rate: 22050
+
 model:
   type: codec_flow_matching
-  sample_rate: 16000
+  sample_rate: ${stft_sample_rate}  # for stft encoder/decoder and evaluation metrics, not pretending to be the sample rate of the audio files
   skip_nan_grad: false
   num_outputs: 1
   p_cond: 0.9 # Proability of feeding the conditional input into the model.
@@ -26,7 +29,7 @@ model:
             manifest_path: ???
             tar_filepath: ???
             sample_weight: 1.0
-        sample_rate: 22050
+        sample_rate: ${codec_sample_rate} # for audio files
         n_samples: null
         min_duration: 0.4
         max_duration: null
@@ -56,7 +59,7 @@ model:
             manifest_path: ???
             audio_dir: ???
             sample_weight: 1.0
-        sample_rate: 22050
+        sample_rate: ${codec_sample_rate} # for audio files
         n_samples: null
         min_duration: null
         max_duration: null
@@ -120,11 +123,11 @@ model:
         _target_: torchmetrics.audio.ScaleInvariantSignalDistortionRatio
       estoi: # output ESTOI
         _target_: torchmetrics.audio.ShortTimeObjectiveIntelligibility
-        fs: ${model.sample_rate}
+        fs: ${stft_sample_rate}
         extended: true
       pesq: # output PESQ
         _target_: torchmetrics.audio.PerceptualEvaluationSpeechQuality
-        fs: ${model.sample_rate}
+        fs: ${stft_sample_rate}
         mode: wb
     
   optim:
