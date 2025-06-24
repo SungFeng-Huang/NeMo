@@ -17,7 +17,7 @@ def fade_in_out(fade_in_mel, fade_out_mel, window):
 
 
 class AudioDecoder(torch.nn.Module): # from token to wav
-    def __init__(self, config_path, flow_ckpt_path, hift_ckpt_path, device="cuda"):
+    def __init__(self, config_path, flow_ckpt_path, hift_ckpt_path, block_size=10, device="cuda"):
         super().__init__()
         self.device = device
 
@@ -45,6 +45,7 @@ class AudioDecoder(torch.nn.Module): # from token to wav
         self.source_cache_len = int(self.mel_cache_len * 256)
         # speech fade in out
         self.speech_window = np.hamming(2 * self.source_cache_len)
+        self.block_size = block_size
 
     def token2wav(self, token, uuid, prompt_token=torch.zeros(1, 0, dtype=torch.int32),
                   prompt_feat=torch.zeros(1, 0, 80), embedding=torch.zeros(1, 192), finalize=False):
@@ -96,18 +97,22 @@ class AudioDecoder(torch.nn.Module): # from token to wav
         tts_speech, tts_mel = self.token2wav(token, uuid=this_uuid, finalize=True)
         return tts_speech.cpu()
 
-    def stream_inference(self, token, this_uuid, flow_prompt_speech_token, prompt_speech_feat, spk_emb):
+    def stream_inference(self, token, this_uuid, flow_prompt_speech_token, prompt_speech_feat, spk_emb, pad_args=None):
 
 
         tts_speechs = []
         tts_mels = []
 
-        block_size = self.flow.encoder.block_size
+        # block_size = self.flow.encoder.block_size
+        block_size = self.block_size
         prev_mel = None
 
-        for idx in range(0, token.size(1), block_size):
+        prev_idx = 0
+        start_idx = block_size if pad_args is None else self.flow.encoder.block_size
+
+        for idx in range(start_idx, token.size(1), block_size):
             # if idx>block_size: break
-            tts_token = token[:, idx:idx + block_size]
+            tts_token = token[:, prev_idx:idx]
 
             # print(tts_token.size())
 
@@ -120,8 +125,6 @@ class AudioDecoder(torch.nn.Module): # from token to wav
             else:
                 is_finalize = False
 
-
-
             tts_speech, tts_mel = self.token2wav(tts_token, uuid=this_uuid,
                                                  prompt_token=flow_prompt_speech_token.to(self.device),
                                                  prompt_feat=prompt_speech_feat.to(self.device),
@@ -130,6 +133,7 @@ class AudioDecoder(torch.nn.Module): # from token to wav
 
             prev_mel = tts_mel
             prev_speech = tts_speech
+            prev_idx = idx
             # print(tts_mel.size())
 
             tts_speechs.append(tts_speech)
