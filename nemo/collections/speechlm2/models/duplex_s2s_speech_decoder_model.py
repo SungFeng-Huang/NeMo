@@ -149,6 +149,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.audio_decoder = AudioDecoder(config_path=flow_config, flow_ckpt_path=flow_checkpoint,
                                      hift_ckpt_path=hift_checkpoint, block_size=self.cfg.block_size)
         self.stream_inference = self.cfg.stream_inference
+        setattr(self.audio_decoder.flow, 'causal_mask', getattr(self.cfg, 'causal_mask', False))
 
         self.pad_args = self.cfg.pad_args
 
@@ -260,7 +261,20 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
     def prepare_inputs(self, batch: dict, train=False):
 
 
-        target_audio_list = [sample[sample != 0].unsqueeze(0) for sample in batch["target_audio"]]
+        # target_audio_list = [sample[sample != 0].unsqueeze(0) for sample in batch["target_audio"]]
+        target_audio_list = [
+            audio[start:end].unsqueeze(0) if (audio != 0).sum() > 0 else torch.zeros(1, batch["target_audio"].shape[1]).to(audio.device)
+            for audio, segs in zip(batch["target_audio"], batch["agent_seg"])
+            for start, end in segs
+        ]
+        target_texts = [
+            text for texts in batch["agent_seg_texts"] for text in texts
+        ]
+        sample_id = [
+            f"{batch['sample_id'][i]}_{start}_{end}"
+            for i, segs in enumerate(batch["agent_seg"])
+            for start, end in segs
+        ]
 
         # left silence padding when training
         if self.pad_args is not None:
@@ -269,6 +283,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             else:
                 target_audio_list = [torch.nn.functional.pad(sample, (8448, 0), **self.pad_args) for sample in target_audio_list]
         
+        speech_signal = target_audio_list
         audio_lens = torch.tensor([sample.shape[1] for sample in target_audio_list], device=self.device)
 
         target_mel_list = [mel_spectrogram(sample) for sample in target_audio_list]
@@ -299,11 +314,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         speech_tokens = padded_tensor
 
         return {
+            "sample_id": sample_id,
+            "speech_signal": speech_signal,
             "audio_lens": audio_lens,
             "speech_feat": speech_feat,
             "speech_feat_len": speech_feat_lens,
             "speech_token": speech_tokens,
             "speech_token_len": speech_token_len,
+            "target_texts": target_texts,
             "embedding": torch.zeros(speech_tokens.size(0), 192).to(self.device)
         }
 
@@ -415,7 +433,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         #         m.eval()
         inputs = self.prepare_inputs(batch, train=True)
 
-
+        self.print(batch_idx, inputs['speech_feat'].shape, inputs['speech_feat_len'].sum().item(), inputs['speech_feat'].shape[0]*inputs['speech_feat'].shape[-1])
 
         loss = self.audio_decoder.flow(inputs, self.device)
 
@@ -534,23 +552,25 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
                 os.makedirs(self.cfg.get('audio_save_path'), exist_ok=True)
                 for i in range(batch):
-                    torchaudio.save(f"{self.cfg.audio_save_path}/{name}_{i}_{dataset_batch['sample_id'][i]}.wav",
-                                    response_speech[i, start_idx:].unsqueeze(0).cpu(), 22050)
-                    response_speech[i, audio_lens[i]:] = 0
+                    torchaudio.save(f"{self.cfg.audio_save_path}/{name}_{inputs['sample_id'][i]}.wav",
+                                    response_speech[i, start_idx:audio_lens[i]].unsqueeze(0).cpu(), 22050)
+                    torchaudio.save(f"{self.cfg.audio_save_path}/{name}_{inputs['sample_id'][i]}_ref.wav",
+                                    inputs['speech_signal'][i][0, start_idx:].unsqueeze(0).cpu(), 22050)
 
                 pred_audios = resample(response_speech[:, start_idx:], 22050, 16000)
 
                 self.asr_bleu.update(
                     name=name,
-                    refs=dataset_batch["target_texts"],
+                    refs=inputs["target_texts"],
                     pred_audio=pred_audios,
-                    pred_audio_lens=torch.tensor(pred_audios.shape[1] / 22050 * 16000).repeat(batch).to(torch.long),
+                    pred_audio_lens=torch.tensor((audio_lens - start_idx) / 22050 * 16000).repeat(batch).to(torch.long),
                 )
 
                 self.mos.update(
                     name=name,
                     pred_audios=pred_audios,
                     tmp_dir=os.path.join(self.cfg.get('audio_save_path'), "tmp"),
+                    pred_audio_lens=torch.tensor((audio_lens - start_idx) / 22050 * 16000).repeat(batch).to(torch.long),
                 )
 
 

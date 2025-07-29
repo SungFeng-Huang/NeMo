@@ -108,11 +108,15 @@ class AudioDecoder(torch.nn.Module): # from token to wav
         prev_mel = None
 
         prev_idx = 0
-        start_idx = block_size if pad_args is None else self.flow.encoder.block_size
+        start_idx = 0 if pad_args is None else self.flow.encoder.block_size
 
         for idx in range(start_idx, token.size(1), block_size):
-            # if idx>block_size: break
-            tts_token = token[:, prev_idx:idx]
+            # current block: idx ~ idx + block_size
+            # if padding: prev_idx = enc_block_size, 
+            # first block: 0 ~ enc_block_size + block_size
+            #   --> next prev_idx = enc_block_size + block_size
+            # other blocks: prev_idx ~ idx + block_size
+            tts_token = token[:, prev_idx:idx + block_size]
 
             # print(tts_token.size())
 
@@ -133,7 +137,7 @@ class AudioDecoder(torch.nn.Module): # from token to wav
 
             prev_mel = tts_mel
             prev_speech = tts_speech
-            prev_idx = idx
+            prev_idx = idx + block_size
             # print(tts_mel.size())
 
             tts_speechs.append(tts_speech)

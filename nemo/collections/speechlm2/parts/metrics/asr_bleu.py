@@ -16,6 +16,7 @@ from collections import defaultdict
 import sacrebleu
 import torch
 from whisper_normalizer.english import EnglishTextNormalizer
+from whisper_normalizer.basic import BasicTextNormalizer
 
 from nemo.collections.asr.models import ASRModel
 from nemo.collections.common.parts.optional_cuda_graphs import WithOptionalCudaGraphs
@@ -36,11 +37,11 @@ class ASRBLEU:
         self.verbose = verbose
         if normalize:
             if normalizer is None:
-                self.normalizer = EnglishTextNormalizer()
+                self.normalizer = lambda x: BasicTextNormalizer()(EnglishTextNormalizer()(x)) 
             else:
-                self.normalizer = normalizer
+                self.normalizer = lambda x: BasicTextNormalizer()(normalizer(x))
         else:
-            self.normalizer = _identity
+            self.normalizer = BasicTextNormalizer()
 
         self._refs = defaultdict(list)
         self._hyps = defaultdict(list)
@@ -73,8 +74,10 @@ class ASRBLEU:
 
         for ref, asr_hyp in zip(refs, asr_hyps):
             asr_hyp = asr_hyp.text
-            self._refs[name].append([self.normalizer(ref)])
-            self._hyps[name].append(self.normalizer(asr_hyp))
+            asr_hyp = self.normalizer(asr_hyp)
+            ref = self.normalizer(ref)
+            self._refs[name].append([ref])
+            self._hyps[name].append(asr_hyp)
             if self.verbose:
                 asrb = sacrebleu.sentence_bleu(asr_hyp, [ref]).score
                 logging.info(f"[REF]\t{ref}\n[ASR]\t{asr_hyp} [{asrb:.2f}]")
@@ -83,7 +86,8 @@ class ASRBLEU:
         """Computes the final score and deallocates ASR and partial results."""
         corpus_metric = {}
         for name in self._refs.keys():
-            metric = torch.tensor(sacrebleu.corpus_bleu(self._hyps[name], self._refs[name]).score)
+            # use_effective_order=True is important for the case where sentence length is too short, which is the case for the short audio in the test set
+            metric = torch.tensor(sacrebleu.corpus_bleu(self._hyps[name], self._refs[name], use_effective_order=True).score)
             corpus_metric[f"asr_bleu_{name}"] = metric
         corpus_metric["asr_bleu"] = torch.stack(list(corpus_metric.values())).mean()
         self._refs.clear()

@@ -80,6 +80,9 @@ class MaskedDiffWithXvec(torch.nn.Module):
         h = self.encoder_proj(h)
         h, h_lengths = self.length_regulator(h, feat_len)
 
+        mask = (~make_pad_mask(feat_len)).to(h)
+        feat = F.interpolate(feat.unsqueeze(dim=1), size=h.shape[1:], mode="nearest").squeeze(dim=1)
+
         # get conditions
         conds = torch.zeros(feat.shape, device=token.device)
         for i, j in enumerate(feat_len):
@@ -87,10 +90,9 @@ class MaskedDiffWithXvec(torch.nn.Module):
                 continue
             index = random.randint(0, int(0.8 * j))
             conds[i, :index] = feat[i, :index]
+            if getattr(self, 'causal_mask', False):
+                mask[i, index:] = 0
         conds = conds.transpose(1, 2)
-
-        mask = (~make_pad_mask(feat_len)).to(h)
-        feat = F.interpolate(feat.unsqueeze(dim=1), size=h.shape[1:], mode="nearest").squeeze(dim=1)
 
         loss, _ = self.decoder.compute_loss(
             feat.transpose(1, 2).contiguous(),

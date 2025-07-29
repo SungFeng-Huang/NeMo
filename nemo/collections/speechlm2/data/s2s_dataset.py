@@ -123,8 +123,17 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             target_texts = [
                 " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
             ]
+            agent_seg = [
+                [
+                    (int(s.start * self.target_sample_rate) , int((s.start + s.duration) * self.target_sample_rate) )
+                    for s in cut.supervisions if s.speaker in self.output_roles
+                ] for cut in cuts
+            ]
+            agent_seg_texts = [
+                [s.text for s in cut.supervisions if s.speaker in self.output_roles] for cut in cuts
+            ]
 
-        else:
+        else: # blackwell
 
             sample_id = [cut.id for cut in cuts]
             (
@@ -140,7 +149,32 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 cuts, self.tokenizer, self.frame_length, roles=self.input_roles, segment_type="user_segments"
             )
             target_texts = [" ".join(segment["text"] for segment in cut.custom["agent_segments"]) for cut in cuts]
+            agent_seg = [[(int(segment["start"] * self.target_sample_rate) , int((segment["end"]) * self.target_sample_rate) )
+                          for segment in cut.custom["agent_segments"]] for cut in cuts]
+            # Filter out agent segments that are longer than 10 seconds
+            filtered_agent_seg, filtered_agent_seg_texts = [], []
+            for cut in cuts:
+                filtered_segments = []
+                max_seg_dur = 0
+                for segment in cut.custom["agent_segments"]:
+                    duration_seconds = (segment["end"] - segment["start"])
+                    if duration_seconds < 10.0:
+                        filtered_segments.append(segment)
+                        max_seg_dur = max(max_seg_dur, duration_seconds)
+                if filtered_segments:
+                    # Sample segments if total duration is too large
+                    total_duration = len(filtered_segments) * max_seg_dur
+                    if total_duration > 50.0:  # If total duration exceeds 30 seconds
+                        # Sample a subset of segments to keep total duration reasonable
+                        max_segments = max(1, int(50.0 / max_seg_dur))
+                        filtered_segments = filtered_segments[:max_segments]
+                    
+                    filtered_agent_seg.append([(int(segment["start"] * self.target_sample_rate) , int((segment["end"]) * self.target_sample_rate) ) for segment in filtered_segments])
+                    filtered_agent_seg_texts.append([segment["text"] for segment in filtered_segments])
+            agent_seg = filtered_agent_seg
+            agent_seg_texts = filtered_agent_seg_texts
 
+        # agent_seg = [[(int(s.start * self.target_sample_rate) , int((s.start + s.duration) * self.target_sample_rate) ) for s in cut.supervisions if s.speaker in self.output_roles] for cut in cuts]
 
         return {
             "sample_id": sample_id,
@@ -152,7 +186,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "target_token_lens": target_token_lens,
             "source_tokens": source_tokens,
             "source_token_lens": source_token_lens,
-            "target_texts": target_texts
+            "target_texts": target_texts,
+            "agent_seg": agent_seg,
+            "agent_seg_texts": agent_seg_texts
         }
 
 
