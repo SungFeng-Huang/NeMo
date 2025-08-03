@@ -102,7 +102,7 @@ class CausalConvTranspose1D(nn.ConvTranspose1d):
     def forward(self, x):
         n = x.shape[-1]
 
-        x = torch.nn.functional.pad(x, (self._padding, 0))
+        # x = torch.nn.functional.pad(x, (self._padding, 0))
         out = super().forward(x)
         out = out[..., :(n * self._upsample_factor)]
 
