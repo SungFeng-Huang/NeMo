@@ -5,7 +5,7 @@ import re
 from hyperpyyaml import load_hyperpyyaml
 import uuid
 from collections import defaultdict
-
+from .causal_conv import CausalConfigManager, CausalConvConverter
 
 def fade_in_out(fade_in_mel, fade_out_mel, window):
     device = fade_in_mel.device
@@ -17,7 +17,7 @@ def fade_in_out(fade_in_mel, fade_out_mel, window):
 
 
 class AudioDecoder(torch.nn.Module): # from token to wav
-    def __init__(self, config_path, flow_ckpt_path, hift_ckpt_path, block_size=10, device="cuda"):
+    def __init__(self, config_path, flow_ckpt_path, hift_ckpt_path, block_size=10, device="cuda", causal_conv=False):
         super().__init__()
         self.device = device
 
@@ -46,6 +46,17 @@ class AudioDecoder(torch.nn.Module): # from token to wav
         # speech fade in out
         self.speech_window = np.hamming(2 * self.source_cache_len)
         self.block_size = block_size
+
+        # Initialize causal configuration manager
+        causal_config = {
+            'causal_mode': True,
+            'affected_modules': ['decoder'],
+            'conversion_strategy': 'converter'
+        }
+        if causal_conv:
+            self.causal_config_manager = CausalConfigManager()
+            self.causal_config_manager.update_config(causal_config)
+            self.causal_config_manager.apply_to_model(self.flow)
 
     def token2wav(self, token, uuid, prompt_token=torch.zeros(1, 0, dtype=torch.int32),
                   prompt_feat=torch.zeros(1, 0, 80), embedding=torch.zeros(1, 192), finalize=False):

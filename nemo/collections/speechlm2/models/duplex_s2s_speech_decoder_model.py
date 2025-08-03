@@ -147,7 +147,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.cfg.pretrained_flow,
             'hift.pt')
         self.audio_decoder = AudioDecoder(config_path=flow_config, flow_ckpt_path=flow_checkpoint,
-                                     hift_ckpt_path=hift_checkpoint, block_size=self.cfg.block_size)
+                                     hift_ckpt_path=hift_checkpoint, block_size=self.cfg.block_size, causal_conv=getattr(self.cfg, 'causal_conv', False))
         self.stream_inference = self.cfg.stream_inference
         setattr(self.audio_decoder.flow, 'causal_mask', getattr(self.cfg, 'causal_mask', False))
 

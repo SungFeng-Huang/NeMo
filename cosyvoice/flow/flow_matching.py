@@ -28,6 +28,7 @@ class ConditionalCFM(BASECFM):
         self.inference_cfg_rate = cfm_params.inference_cfg_rate
         in_channels = in_channels + (spk_emb_dim if n_spks > 0 else 0)
         # Just change the architecture of the estimator here
+        # The estimator should be an instance of ConditionalDecoder from decoder.py
         self.estimator = estimator
 
     @torch.inference_mode()
