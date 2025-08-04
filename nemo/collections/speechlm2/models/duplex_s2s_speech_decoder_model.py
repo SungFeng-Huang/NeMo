@@ -155,6 +155,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         # self.embed_audio_tokens = torch.nn.Embedding(16384, self.llm.config.hidden_size)
 
+        if getattr(self.cfg, "learn_spk_emb", False):
+            self.spk_emb = torch.nn.Embedding(1, 192)
 
         # cached for quicker audio decoding
         self.register_buffer(
@@ -525,7 +527,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
             prompt_speech_feat = torch.zeros(batch, 0, 80).to(self.device)
             flow_prompt_speech_token = torch.zeros(batch, 0, dtype=torch.int64).to(self.device)
-            spk_emb = torch.zeros(batch, 192).to(self.device)
+            if hasattr(self, 'spk_emb'):
+                spk_id = torch.zeros(batch, dtype=torch.int64).to(self.device)
+                spk_emb = self.spk_emb(spk_id)
+            else:
+                spk_emb = torch.zeros(batch, 192).to(self.device)
 
 
             with fp32_precision(), torch.no_grad():
@@ -742,7 +748,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
           
                 prompt_speech_feat = torch.zeros(input_embeds.shape[0], 0, 80).to(self.device)
                 flow_prompt_speech_token = torch.zeros(input_embeds.shape[0], 0, dtype=torch.int64).to(self.device)
-                spk_emb = torch.zeros(input_embeds.shape[0], 192).to(self.device)
+                if hasattr(self, 'spk_emb'):
+                    spk_id = torch.zeros(input_embeds.shape[0], dtype=torch.int64).to(self.device)
+                    spk_emb = self.spk_emb(spk_id)
+                else:
+                    spk_emb = torch.zeros(input_embeds.shape[0], 192).to(self.device)
 
                 flow_input_token = gen_audio[:,:,0]
                 flow_input_token[flow_input_token >16383] = 0
