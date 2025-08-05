@@ -6,6 +6,12 @@ from hyperpyyaml import load_hyperpyyaml
 import uuid
 from collections import defaultdict
 from .causal_conv import CausalConfigManager, CausalConvConverter
+import yaml
+import tempfile
+import os
+import json
+import hydra
+from omegaconf import OmegaConf
 
 def fade_in_out(fade_in_mel, fade_out_mel, window):
     device = fade_in_mel.device
@@ -17,12 +23,25 @@ def fade_in_out(fade_in_mel, fade_out_mel, window):
 
 
 class AudioDecoder(torch.nn.Module): # from token to wav
-    def __init__(self, config_path, flow_ckpt_path, hift_ckpt_path, block_size=10, device="cuda", causal_conv=False):
+    def __init__(self, config_path, flow_ckpt_path, hift_ckpt_path, block_size=10, device="cuda", causal_conv=False, config_overrides=None):
         super().__init__()
         self.device = device
 
-        with open(config_path, 'r') as f:
-            self.scratch_configs = load_hyperpyyaml(f)
+        # Initialize causal configuration manager
+        causal_config = {
+            'causal_mode': True,
+            'affected_modules': ['decoder'],
+            'conversion_strategy': 'converter'
+        }
+        if causal_conv:
+            config_overrides = {'flow.encoder.causal': True}
+
+        # Load and potentially modify config before instantiation
+        if config_overrides:
+            self.scratch_configs = self._load_config_with_overrides(config_path, config_overrides)
+        else:
+            with open(config_path, 'r') as f:
+                self.scratch_configs = load_hyperpyyaml(f)
 
         # Load models
         self.flow = self.scratch_configs['flow']
@@ -47,16 +66,152 @@ class AudioDecoder(torch.nn.Module): # from token to wav
         self.speech_window = np.hamming(2 * self.source_cache_len)
         self.block_size = block_size
 
-        # Initialize causal configuration manager
-        causal_config = {
-            'causal_mode': True,
-            'affected_modules': ['decoder'],
-            'conversion_strategy': 'converter'
-        }
         if causal_conv:
             self.causal_config_manager = CausalConfigManager()
             self.causal_config_manager.update_config(causal_config)
             self.causal_config_manager.apply_to_model(self.flow)
+
+    def _load_config_with_overrides(self, config_path, overrides):
+        """
+        Load config with overrides before instantiation using Hydra
+        
+        Args:
+            config_path: Path to the original YAML config file
+            overrides: Dict of parameter overrides (e.g., {'flow.hidden_size': 512})
+        
+        Returns:
+            Modified config object
+        """
+        # Convert overrides to Hydra format
+        override_list = []
+        for key_path, value in overrides.items():
+            override_list.append(f"{key_path}={value}")
+        
+        # Read the original config file as string to preserve hyperpyyaml syntax
+        with open(config_path, 'r') as f:
+            config_content = f.read()
+        
+        # Apply overrides by modifying the YAML content string
+        for key_path, value in overrides.items():
+            # Convert value to YAML string representation
+            if isinstance(value, bool):
+                yaml_value = str(value).lower()
+            elif isinstance(value, str):
+                yaml_value = f"'{value}'"
+            elif isinstance(value, (int, float)):
+                yaml_value = str(value)
+            elif isinstance(value, (list, dict)):
+                yaml_value = yaml.dump(value, default_flow_style=True).strip()
+            else:
+                yaml_value = str(value)
+            
+            # Find and replace the specific key in the YAML content
+            config_content = self._replace_yaml_value(config_content, key_path, yaml_value)
+        
+        # Create temporary file with modified config
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as temp_file:
+            temp_file.write(config_content)
+            temp_config_path = temp_file.name
+        
+        try:
+            # Load modified config with hyperpyyaml
+            with open(temp_config_path, 'r') as f:
+                config = load_hyperpyyaml(f)
+            return config
+        finally:
+            # Clean up temporary file
+            os.unlink(temp_config_path)
+
+    def _replace_yaml_value(self, yaml_content, key_path, new_value):
+        """
+        Replace a specific key's value in YAML content while preserving structure
+        
+        Args:
+            yaml_content: The original YAML content as string
+            key_path: Dot-separated path to the key (e.g., 'flow.encoder.causal')
+            new_value: The new value to set
+            
+        Returns:
+            Modified YAML content as string
+        """
+        keys = key_path.split('.')
+        lines = yaml_content.split('\n')
+        modified_lines = []
+        
+        # Track current nesting level and key path
+        current_level = 0
+        current_key_path = []
+        found_target = False
+        found_target_key_parent_path = False
+        
+        for i, line in enumerate(lines):
+            # Count indentation (assuming 4 spaces per level)
+            indent = len(line) - len(line.lstrip())
+            level = indent // 4
+            
+            # Update current key path based on indentation level
+            while len(current_key_path) > level:
+                current_key_path.pop()
+            
+            # Check if this line contains a key
+            if ':' in line and line.strip():
+                line_key = line.strip().split(':')[0]
+                if len(current_key_path) == level:
+                    current_key_path.append(line_key)
+                elif len(current_key_path) > level:
+                    current_key_path[level] = line_key
+            
+            # Check if we're at the target level and this line contains our key
+            # if level == len(keys) - 1 and keys[-1] in line and ':' in line:
+            if not found_target:
+                # Check if the current key parent path matches the target key parent path up to the current level
+                if self._is_correct_key_path(current_key_path[:-1], keys[:-1]):
+                    found_target_key_parent_path = True
+                    # Verify this is the correct key by checking the full path
+                    if self._is_correct_key_path(current_key_path, keys):
+                        # Replace the value after the colon
+                        colon_pos = line.find(':')
+                        new_line = f"{line[:colon_pos+1]} {new_value}"
+                        modified_lines.append(new_line)
+                        found_target = True
+                        continue
+                elif found_target_key_parent_path:
+                    # If we found the parent key path, but not the target key before exiting the loop,
+                    # it means the target key is not in the config file.
+                    # If we didn't find the key, append it at the appropriate level
+                    # Build the full path structure
+                    target_level = len(keys) - 1
+                    indent_str = '    ' * target_level  # 4 spaces per level
+                    new_line = f"{indent_str}{keys[-1]}: {new_value}"
+                    modified_lines.append(new_line)
+                    found_target = True
+            
+            modified_lines.append(line)
+        
+        
+        return '\n'.join(modified_lines)
+    
+    def _is_correct_key_path(self, current_key_path, target_keys):
+        """
+        Check if the current key path matches the target key path
+        
+        Args:
+            current_key_path: List of keys in the current path (e.g., ['flow', 'encoder'])
+            target_keys: List of target keys (e.g., ['flow', 'encoder', 'causal'])
+            
+        Returns:
+            True if the paths match, False otherwise
+        """
+        # Check if the current path matches the target path up to the current level
+        if len(current_key_path) != len(target_keys):
+            return False
+        
+        # Check if all keys in the current path match the target path
+        for i, key in enumerate(current_key_path):
+            if key != target_keys[i]:
+                return False
+        
+        return True
 
     def token2wav(self, token, uuid, prompt_token=torch.zeros(1, 0, dtype=torch.int32),
                   prompt_feat=torch.zeros(1, 0, 80), embedding=torch.zeros(1, 192), finalize=False):
