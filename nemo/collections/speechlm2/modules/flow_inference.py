@@ -23,7 +23,7 @@ def fade_in_out(fade_in_mel, fade_out_mel, window):
 
 
 class AudioDecoder(torch.nn.Module): # from token to wav
-    def __init__(self, config_path, flow_ckpt_path, hift_ckpt_path, block_size=10, device="cuda", causal_conv=False, config_overrides=None):
+    def __init__(self, config_path, flow_ckpt_path, hift_ckpt_path, block_size=10, device="cuda", causal_conv=False, learnable_prompt=False, config_overrides=None):
         super().__init__()
         self.device = device
 
@@ -33,19 +33,37 @@ class AudioDecoder(torch.nn.Module): # from token to wav
             'affected_modules': ['decoder'],
             'conversion_strategy': 'converter'
         }
+        if config_overrides is None:
+            config_overrides = {}
         if causal_conv:
-            config_overrides = {'flow.encoder.causal': True}
+            config_overrides['flow.encoder.causal'] = True    # causal conv
+        if learnable_prompt:
+            config_overrides['flow.learnable_prompt'] = True    # learnable prompt
+
+        try:
+            with open(config_path, 'r') as f:
+                scratch_configs = load_hyperpyyaml(f)
+            scratch_configs['flow'].load_state_dict(torch.load(flow_ckpt_path, map_location=self.device), strict=True)
+        except Exception as e:
+            print(f"Error loading flow model: {e}")
+            raise e
 
         # Load and potentially modify config before instantiation
-        if config_overrides:
+        # Check if config_overrides is not None and not an empty dict
+        if config_overrides is not None and len(config_overrides) > 0:
+            del scratch_configs
+            # Release CUDA memory before reloading configs/models
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+
             self.scratch_configs = self._load_config_with_overrides(config_path, config_overrides)
         else:
-            with open(config_path, 'r') as f:
-                self.scratch_configs = load_hyperpyyaml(f)
+            self.scratch_configs = scratch_configs
 
         # Load models
         self.flow = self.scratch_configs['flow']
-        self.flow.load_state_dict(torch.load(flow_ckpt_path, map_location=self.device))
+        self.flow.load_state_dict(torch.load(flow_ckpt_path, map_location=self.device), strict=not (learnable_prompt))
         self.hift = self.scratch_configs['hift']
         self.hift.load_state_dict(torch.load(hift_ckpt_path, map_location=self.device))
 
@@ -73,15 +91,16 @@ class AudioDecoder(torch.nn.Module): # from token to wav
 
     def _load_config_with_overrides(self, config_path, overrides):
         """
-        Load config with overrides before instantiation using Hydra
+        Load config with overrides before instantiation.
+        This function directly parses the YAML file using standard I/O,
+        applies the overrides, and returns the modified config object.
         
         Args:
             config_path: Path to the original YAML config file
-            overrides: Dict of parameter overrides (e.g., {'flow.hidden_size': 512})
-        
+            overrides: Dict of parameter overrides (e.g., {'flow.encoder.causal': True})        
         Returns:
-            Modified config object
-        """
+            Modified config object with overrides applied
+        """        
         # Convert overrides to Hydra format
         override_list = []
         for key_path, value in overrides.items():
@@ -165,7 +184,7 @@ class AudioDecoder(torch.nn.Module): # from token to wav
             # if level == len(keys) - 1 and keys[-1] in line and ':' in line:
             if not found_target:
                 # Check if the current key parent path matches the target key parent path up to the current level
-                if self._is_correct_key_path(current_key_path[:-1], keys[:-1]):
+                if self._is_correct_key_path(current_key_path[:len(keys) - 1], keys[:-1]):
                     found_target_key_parent_path = True
                     # Verify this is the correct key by checking the full path
                     if self._is_correct_key_path(current_key_path, keys):

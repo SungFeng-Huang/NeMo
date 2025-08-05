@@ -101,7 +101,7 @@ class ConditionalCFM(BASECFM):
         
         return sol[-1]
 
-    def compute_loss(self, x1, mask, mu, spks=None, cond=None):
+    def compute_loss(self, x1, mask, mu, spks=None, cond=None, loss_mask=None):
         """Computes diffusion loss
 
         Args:
@@ -140,5 +140,7 @@ class ConditionalCFM(BASECFM):
             cond = cond * cfg_mask.view(-1, 1, 1)
       
         pred = self.estimator(y, mask, mu, t.squeeze(), spks, cond)
-        loss = F.mse_loss(pred * mask, u * mask, reduction="sum") / (torch.sum(mask) * u.shape[1])
+        if loss_mask is None:
+            loss_mask = mask
+        loss = F.mse_loss(pred * loss_mask, u * loss_mask, reduction="sum") / (torch.sum(loss_mask) * u.shape[1])
         return loss, y

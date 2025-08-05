@@ -61,7 +61,9 @@ class MaskedDiffWithXvec(torch.nn.Module):
                  length_regulator: torch.nn.Module = None,
                  decoder: torch.nn.Module = None,
                  decoder_conf: Dict = {'in_channels': 240, 'out_channel': 80, 'spk_emb_dim': 80, 'n_spks': 1, 'cfm_params': DictConfig({'sigma_min': 1e-06, 'solver': 'euler', 't_scheduler': 'cosine', 'training_cfg_rate': 0.2, 'inference_cfg_rate': 0.7, 'reg_loss_type': 'l1'}), 'decoder_params': {'channels': [256, 256], 'dropout': 0.0, 'attention_head_dim': 64, 'n_blocks': 4, 'num_mid_blocks': 12, 'num_heads': 8, 'act_fn': 'gelu'}},
-                 mel_feat_conf: Dict = {'n_fft': 1024, 'num_mels': 80, 'sampling_rate': 22050, 'hop_size': 256, 'win_size': 1024, 'fmin': 0, 'fmax': 8000}):
+                 mel_feat_conf: Dict = {'n_fft': 1024, 'num_mels': 80, 'sampling_rate': 22050, 'hop_size': 256, 'win_size': 1024, 'fmin': 0, 'fmax': 8000},
+                 learnable_prompt: bool = False
+        ):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
@@ -85,6 +87,10 @@ class MaskedDiffWithXvec(torch.nn.Module):
         # Length regulator: aligns encoder output to target mel length
         self.length_regulator = length_regulator
         self.only_mask_loss = only_mask_loss
+        self.learnable_prompt = learnable_prompt
+        if learnable_prompt:
+            self.prompt_token_feat = torch.nn.Parameter(torch.randn(1, 16, output_size))
+            self.prompt_mel_feat = torch.nn.Parameter(torch.randn(1, 16, output_size))
 
     def forward(
             self,
@@ -100,11 +106,11 @@ class MaskedDiffWithXvec(torch.nn.Module):
             Dict with 'loss' key.
         """
         # 1. Prepare input tokens and features
-        token = batch['speech_token'].to(device)
-        token_len = batch['speech_token_len'].to(device)
-        feat = batch['speech_feat'].to(device).transpose(1, 2)  # [B, T, mel] -> [B, mel, T]
-        feat_len = batch['speech_feat_len'].to(device)
-        embedding = batch['embedding'].to(device)
+        token = batch['speech_token'].to(device)    # [B, T]
+        token_len = batch['speech_token_len'].to(device)    # [B]
+        feat = batch['speech_feat'].to(device).transpose(1, 2)      # [B, mel, T] -> [B, T, mel]
+        feat_len = batch['speech_feat_len'].to(device)    # [B]
+        embedding = batch['embedding'].to(device)    # [B, spk_embed_dim]
 
         # 2. Speaker embedding normalization and projection
         embedding = F.normalize(embedding, dim=1)
@@ -112,18 +118,18 @@ class MaskedDiffWithXvec(torch.nn.Module):
 
         # 3. Token embedding with padding mask
         mask = (~make_pad_mask(token_len)).float().unsqueeze(-1).to(device)
-        token = self.input_embedding(torch.clamp(token, min=0)) * mask
+        token = self.input_embedding(torch.clamp(token, min=0)) * mask   # [B, T, input_size]
 
         # 4. Encoder: text tokens -> hidden states
         h, h_lengths = self.encoder(token, token_len)
-        h = self.encoder_proj(h)
+        h = self.encoder_proj(h)    # [B, T, output_size]
 
         # 5. Length regulator: match hidden states to target mel length
-        h, h_lengths = self.length_regulator(h, feat_len)
+        h, h_lengths = self.length_regulator(h, feat_len)    # [B, T, output_size]
 
         # 6. Prepare mask for decoder and interpolate features to match length
         mask = (~make_pad_mask(feat_len)).to(h)
-        feat = F.interpolate(feat.unsqueeze(dim=1), size=h.shape[1:], mode="nearest").squeeze(dim=1)
+        # feat = F.interpolate(feat.unsqueeze(dim=1), size=h.shape[1:], mode="nearest").squeeze(dim=1)
 
         # 7. Prepare conditional input (prompted mel frames)
         conds = torch.zeros(feat.shape, device=token.device)
@@ -135,15 +141,24 @@ class MaskedDiffWithXvec(torch.nn.Module):
             # If causal_mask is enabled, mask out future frames for causality
             if getattr(self, 'causal_mask', False):
                 mask[i, index:] = 0
-        conds = conds.transpose(1, 2)  # [B, mel, T] -> [B, T, mel]
+
+        # 7.5 Learnable prompt
+        loss_mask = mask
+        if self.learnable_prompt:
+            feat = torch.cat([self.prompt_mel_feat.expand(feat.shape[0], -1, -1), feat], dim=1)
+            h = torch.cat([self.prompt_token_feat.expand(h.shape[0], -1, -1), h], dim=1)
+            conds = torch.cat([self.prompt_mel_feat.expand(feat.shape[0], -1, -1), conds], dim=1)
+            loss_mask = torch.cat([torch.zeros(feat.shape[0], 16, device=feat.device, dtype=mask.dtype), mask], dim=1)
+            mask = torch.cat([torch.ones(feat.shape[0], 16, device=feat.device, dtype=mask.dtype), mask], dim=1)
 
         # 8. Decoder: compute loss between predicted and target mel-spectrogram
         loss, _ = self.decoder.compute_loss(
-            feat.transpose(1, 2).contiguous(),  # [B, T, mel]
+            feat.transpose(1, 2).contiguous(),  # [B, T, mel] -> [B, mel, T]
             mask.unsqueeze(1),                  # [B, 1, T]
-            h.transpose(1, 2).contiguous(),     # [B, T, hidden]
+            h.transpose(1, 2).contiguous(),     # [B, T, hidden] -> [B, hidden, T]
             embedding,                          # [B, output_size]
-            cond=conds                          # [B, T, mel]
+            cond=conds.transpose(1, 2).contiguous(),         # [B, T, mel] -> [B, mel, T]
+            loss_mask=loss_mask.unsqueeze(1)
         )
         return {'loss': loss}
 
@@ -176,31 +191,38 @@ class MaskedDiffWithXvec(torch.nn.Module):
         # 2. Concatenate prompt and target tokens
         token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
         mask = (~make_pad_mask(token_len)).float().unsqueeze(-1).to(embedding)
-        token = self.input_embedding(torch.clamp(token, min=0)) * mask
+        token = self.input_embedding(torch.clamp(token, min=0)) * mask    # [B, T, input_size]
 
         # 3. Encoder: text tokens -> hidden states
         h, h_lengths = self.encoder(token, token_len)
-        h = self.encoder_proj(h)
+        h = self.encoder_proj(h)    # [B, T, output_size]
 
         # 4. Estimate output mel length from token length
         feat_len = (token_len / self.input_frame_rate * 22050 / 256).int()
-        h, h_lengths = self.length_regulator(h, feat_len)
+        h, h_lengths = self.length_regulator(h, feat_len)    # [B, T, output_size]
 
         # 5. Prepare conditional input (prompted mel frames)
-        conds = torch.zeros([token.shape[0], feat_len.max().item(), self.output_size], device=token.device)
+        conds = torch.zeros([token.shape[0], feat_len.max().item(), self.output_size], device=token.device)    # [B, T, output_size]
         if prompt_feat.shape[1] != 0:
             for i, j in enumerate(prompt_feat_len):
-                conds[i, :j] = prompt_feat[i]
-        conds = conds.transpose(1, 2)  # [B, T, mel] -> [B, mel, T]
+                conds[i, :j] = prompt_feat[i]    # [B, T, output_size]
 
-        mask = (~make_pad_mask(feat_len)).to(h)
+        mask = (~make_pad_mask(feat_len)).to(h)    # [B, T]
+
+        # 5.5 Learnable prompt
+        loss_mask = mask
+        if self.learnable_prompt:
+            h = torch.cat([self.prompt_token_feat.expand(h.shape[0], -1, -1), h], dim=1)    # [B, T + 16, output_size]
+            conds = torch.cat([self.prompt_mel_feat.expand(conds.shape[0], -1, -1), conds], dim=1)    # [B, T + 16, output_size]
+            loss_mask = torch.cat([torch.zeros(h.shape[0], 16, device=h.device, dtype=mask.dtype), mask], dim=1)    # [B, T + 16]
+            mask = torch.cat([torch.ones(h.shape[0], 16, device=h.device, dtype=mask.dtype), mask], dim=1)    # [B, T + 16]
 
         # 6. Decoder: generate mel-spectrogram
         feat = self.decoder(
             mu=h.transpose(1, 2).contiguous(),  # [B, hidden, T]
             mask=mask.unsqueeze(1),             # [B, 1, T]
             spks=embedding,                     # [B, output_size]
-            cond=conds,                         # [B, mel, T]
+            cond=conds.transpose(1, 2).contiguous(), # [B, mel, T]
             n_timesteps=10                      # Number of reverse diffusion steps
         )
         # Remove prompt frames from output if prompt was used
