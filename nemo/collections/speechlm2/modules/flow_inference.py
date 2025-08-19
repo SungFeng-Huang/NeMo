@@ -22,6 +22,46 @@ def fade_in_out(fade_in_mel, fade_out_mel, window):
     return fade_in_mel.to(device)
 
 
+class StreamStateManager:
+    """
+    Simplified unified state manager for streaming inference
+    """
+    
+    def __init__(self, mel_overlap_len, mel_cache_len, source_cache_len):
+        self.mel_overlap_len = mel_overlap_len
+        self.mel_cache_len = mel_cache_len
+        self.source_cache_len = source_cache_len
+        
+        # Simple state storage
+        self.mel_overlap_dict = {}
+        self.hift_cache_dict = {}
+    
+    def get_mel_overlap(self, uuid_str):
+        """Get stored mel-spectrogram overlap"""
+        return self.mel_overlap_dict.get(uuid_str)
+    
+    def set_mel_overlap(self, uuid_str, mel_spectrogram):
+        """Store mel-spectrogram overlap"""
+        self.mel_overlap_dict[uuid_str] = mel_spectrogram[:, :, -self.mel_overlap_len:]
+    
+    def get_hift_cache(self, uuid_str):
+        """Get stored HiFi-GAN cache"""
+        return self.hift_cache_dict.get(uuid_str)
+    
+    def set_hift_cache(self, uuid_str, mel, source, speech):
+        """Store HiFi-GAN cache"""
+        self.hift_cache_dict[uuid_str] = {
+            'mel': mel[:, :, -self.mel_cache_len:],
+            'source': source[:, :, -self.source_cache_len:],
+            'speech': speech[:, -self.source_cache_len:]
+        }
+    
+    def clear_state(self, uuid_str):
+        """Clear all state for the given UUID"""
+        self.mel_overlap_dict.pop(uuid_str, None)
+        self.hift_cache_dict.pop(uuid_str, None)
+
+
 class AudioDecoder(torch.nn.Module): # from token to wav
     def __init__(self, config_path, flow_ckpt_path, hift_ckpt_path, block_size=10, device="cuda", causal_conv=False, learnable_prompt=False, config_overrides=None):
         super().__init__()
@@ -70,8 +110,8 @@ class AudioDecoder(torch.nn.Module): # from token to wav
         # Move models to the appropriate device
         self.flow.to(self.device)
         self.hift.to(self.device)
-        self.mel_overlap_dict = defaultdict(lambda: None)
-        self.hift_cache_dict = defaultdict(lambda: None)
+        
+        # Initialize unified stream state manager
         self.token_min_hop_len = 2 * self.flow.input_frame_rate
         self.token_max_hop_len = 4 * self.flow.input_frame_rate
         self.token_overlap_len = 5
@@ -83,6 +123,13 @@ class AudioDecoder(torch.nn.Module): # from token to wav
         # speech fade in out
         self.speech_window = np.hamming(2 * self.source_cache_len)
         self.block_size = block_size
+        
+        # Initialize unified state manager
+        self.state_manager = StreamStateManager(
+            mel_overlap_len=self.mel_overlap_len,
+            mel_cache_len=self.mel_cache_len,
+            source_cache_len=self.source_cache_len
+        )
 
         if causal_conv:
             self.causal_config_manager = CausalConfigManager()
@@ -234,7 +281,10 @@ class AudioDecoder(torch.nn.Module): # from token to wav
 
     def token2wav(self, token, uuid, prompt_token=torch.zeros(1, 0, dtype=torch.int32),
                   prompt_feat=torch.zeros(1, 0, 80), embedding=torch.zeros(1, 192), finalize=False):
-
+        """
+        Simplified token2wav with unified state management
+        """
+        # Step 1: Generate mel-spectrogram from tokens
         tts_mel = self.flow.inference(token=token.to(self.device),
                                       token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device).repeat(token.shape[0]),
                                       prompt_token=prompt_token.to(self.device),
@@ -245,37 +295,45 @@ class AudioDecoder(torch.nn.Module): # from token to wav
                                           self.device).repeat(token.shape[0]),
                                       embedding=embedding.to(self.device))
 
-        # mel overlap fade in out
-        if self.mel_overlap_dict[uuid] is not None:
-            tts_mel = fade_in_out(tts_mel, self.mel_overlap_dict[uuid], self.mel_window)
-        # append hift cache
-        if self.hift_cache_dict[uuid] is not None:
-            hift_cache_mel, hift_cache_source = self.hift_cache_dict[uuid]['mel'], self.hift_cache_dict[uuid]['source']
+        # Step 2: Apply mel-spectrogram overlap for smooth transitions
+        mel_overlap = self.state_manager.get_mel_overlap(uuid)
+        if mel_overlap is not None:
+            tts_mel = fade_in_out(tts_mel, mel_overlap, self.mel_window)
+        
+        # Step 3: Apply HiFi-GAN cache for continuous audio generation
+        hift_cache = self.state_manager.get_hift_cache(uuid)
+        if hift_cache is not None:
+            hift_cache_mel, hift_cache_source = hift_cache['mel'], hift_cache['source']
             tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)
-
         else:
             hift_cache_source = torch.zeros(1, 1, 0)
-        # _tts_mel=tts_mel.contiguous()
-        # keep overlap mel and hift cache
-        if finalize is False:
-            self.mel_overlap_dict[uuid] = tts_mel[:, :, -self.mel_overlap_len:]
-            tts_mel = tts_mel[:, :, :-self.mel_overlap_len]
-            tts_speech, tts_source = self.hift.inference(mel=tts_mel, cache_source=hift_cache_source)
 
-            self.hift_cache_dict[uuid] = {'mel': tts_mel[:, :, -self.mel_cache_len:],
-                                          'source': tts_source[:, :, -self.source_cache_len:],
-                                          'speech': tts_speech[:, -self.source_cache_len:]}
-            # if self.hift_cache_dict[uuid] is not None:
-            #     tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
-            tts_speech = tts_speech[:, :-self.source_cache_len]
-
+        # Step 4: Process based on whether this is the final chunk
+        if not finalize:
+            # Store overlap for next iteration
+            self.state_manager.set_mel_overlap(uuid, tts_mel)
+            
+            # Remove overlap from current output
+            tts_mel_output = tts_mel[:, :, :-self.mel_overlap_len]
+            
+            # Generate audio using HiFi-GAN
+            tts_speech, tts_source = self.hift.inference(mel=tts_mel_output, cache_source=hift_cache_source)
+            
+            # Update HiFi-GAN cache
+            self.state_manager.set_hift_cache(uuid, tts_mel_output, tts_source, tts_speech)
+            
+            # Remove cache from output
+            tts_speech_output = tts_speech[:, :-self.source_cache_len]
         else:
+            # Final chunk - generate complete audio
             tts_speech, tts_source = self.hift.inference(mel=tts_mel, cache_source=hift_cache_source)
-            del self.hift_cache_dict[uuid]
-            del self.mel_overlap_dict[uuid]
-            # if uuid in self.hift_cache_dict.keys() and self.hift_cache_dict[uuid] is not None:
-            #     tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
-        return tts_speech, tts_mel
+            tts_speech_output = tts_speech
+            tts_mel_output = tts_mel
+            
+            # Clear all state for this UUID
+            self.state_manager.clear_state(uuid)
+
+        return tts_speech_output, tts_mel_output
 
     def offline_inference(self, token):
         this_uuid = str(uuid.uuid1())
@@ -302,17 +360,13 @@ class AudioDecoder(torch.nn.Module): # from token to wav
             #   --> next prev_idx = enc_block_size + block_size
             # other blocks: prev_idx ~ idx + block_size
             tts_token = token[:, prev_idx:idx + block_size]
-
-            # print(tts_token.size())
+            
+            # Determine if this is the final block
+            is_finalize = (idx + block_size >= token.size(-1))
 
             if prev_mel is not None:
                 prompt_speech_feat = torch.cat(tts_mels, dim=-1).transpose(1, 2)
                 flow_prompt_speech_token = token[:, :idx]
-
-            if idx + block_size >= token.size(-1):
-                is_finalize = True
-            else:
-                is_finalize = False
 
             tts_speech, tts_mel = self.token2wav(tts_token, uuid=this_uuid,
                                                  prompt_token=flow_prompt_speech_token.to(self.device),
