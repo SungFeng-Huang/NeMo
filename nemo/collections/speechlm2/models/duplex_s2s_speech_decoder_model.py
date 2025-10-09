@@ -138,17 +138,28 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         )
 
 
-        flow_config = os.path.join(self.cfg.pretrained_flow,
-                                   "config.yaml")
-        flow_checkpoint = os.path.join(
-            self.cfg.pretrained_flow,
-            'flow.pt')
-        hift_checkpoint = os.path.join(
-            self.cfg.pretrained_flow,
-            'hift.pt')
-        self.audio_decoder = AudioDecoder(config_path=flow_config, flow_ckpt_path=flow_checkpoint,
-                                     hift_ckpt_path=hift_checkpoint, block_size=self.cfg.block_size,
-                                    causal_conv=getattr(self.cfg, 'causal_conv', False), learnable_prompt=getattr(self.cfg, 'learnable_prompt', False))
+        use_cos2 = getattr(self.cfg, "use_cos2_flow", False)
+        if use_cos2:
+            raise NotImplementedError("CosyVoice2 flow is not supported yet")
+        else:
+            use_pf = getattr(self.cfg, "use_pretrained_flow", True)
+            pf_dir = getattr(self.cfg, "pretrained_flow", None)
+            # allow explicit vocoder path override
+            hift_ckpt = getattr(self.cfg, "hift_ckpt", None)
+            if hift_ckpt is None and pf_dir:
+                hift_ckpt = os.path.join(pf_dir, "hift.pt")
+
+            if use_pf:
+                if not pf_dir:
+                    raise ValueError("use_pretrained_flow=True but cfg.pretrained_flow is not set")
+                flow_config = os.path.join(pf_dir, "config.yaml")
+                flow_ckpt = os.path.join(pf_dir, "flow.pt")
+                self.audio_decoder = AudioDecoder(flow_config, flow_ckpt, hift_ckpt,
+                                                    block_size=self.cfg.block_size, causal_conv=getattr(self.cfg, 'causal_conv', False), learnable_prompt=getattr(self.cfg, 'learnable_prompt', False))
+            else:
+                # random-init flow; vocoder optional
+                self.audio_decoder = AudioDecoder(self.cfg.flow_config, None, hift_ckpt)
+
         self.stream_inference = self.cfg.stream_inference
         setattr(self.audio_decoder.flow, 'causal_mask', getattr(self.cfg, 'causal_mask', False))
 
@@ -262,8 +273,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         return ans
 
     def prepare_inputs(self, batch: dict, train=False):
+        """
+        准备模型输入数据，包括语音特征提取和token化
+        这是flow matching训练的关键数据预处理步骤
 
-
+        zhy:
+        这里只用了target_audio，没有用source_audio
+        batch的结构参考 NeMo/nemo/collections/speechlm2/data/s2s_dataset.py: __get_item__ 的返回值
+        """
+        # 1. 处理目标音频：去除padding（值为0的部分），并做最小长度兜底，避免空音频
         # target_audio_list = [sample[sample != 0].unsqueeze(0) for sample in batch["target_audio"]]
         target_audio_list = [
             audio[start:end].unsqueeze(0) if (audio != 0).sum() > 0 else torch.zeros(1, batch["target_audio"].shape[1]).to(audio.device)
@@ -281,33 +299,36 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         # left silence padding when training
         if self.pad_args is not None:
-            if train:
-                target_audio_list = [torch.nn.functional.pad(sample, (torch.randint(0, 8449, (1,)).item(), 0), **self.pad_args) for sample in target_audio_list]
-            else:
-                target_audio_list = [torch.nn.functional.pad(sample, (8448, 0), **self.pad_args) for sample in target_audio_list]
-        
+            target_audio_list = [torch.nn.functional.pad(sample, (torch.randint(0, 8449, (1,)).item() if train else 8448, 0), **self.pad_args) for sample in target_audio_list]
+
         speech_signal = target_audio_list
         audio_lens = torch.tensor([sample.shape[1] for sample in target_audio_list], device=self.device)
 
+        # 2. 提取梅尔频谱特征 - 用于flow matching的条件输入
         target_mel_list = [mel_spectrogram(sample) for sample in target_audio_list]
 
+        # 3. 计算每个样本的频谱长度
         speech_feat_lens = torch.tensor([x.shape[2] for x in target_mel_list], device=target_mel_list[0].device)
 
+        # 4. 将不同长度的频谱特征padding到相同长度
         speech_feat = torch.nn.utils.rnn.pad_sequence(
             [x.squeeze(0).permute(1, 0) for x in target_mel_list],
             batch_first=True
-        ).permute(0, 2, 1)
+        ).permute(0, 2, 1)  # 最终形状: [batch, mel_bins, time_frames]
 
-
+        # 5. 使用fp32精度进行音频重采样（避免bfloat16精度问题）
         with fp32_precision():
+            # 从22050Hz重采样到16000Hz，匹配WhisperVQ的输入要求
             target_audio_list = [resample(target_audio_list[i], 22050, 16000) for i in range(len(target_audio_list))]
 
+            # 6. 使用WhisperVQ提取离散语音token
             speech_tokens = extract_speech_token(
-            self.whispervq,
-            self.feature_extractor,
-            [(target_audio_list[i], 16000) for i in range(len(target_audio_list))],
+                self.whispervq,  # WhisperVQ编码器
+                self.feature_extractor,  # 特征提取器
+                [(target_audio_list[i], 16000) for i in range(len(target_audio_list))],
             )
 
+        # 7. 处理speech tokens的长度和padding
         speech_token_len = torch.tensor([len(seq) for seq in speech_tokens], dtype=torch.long, device=self.device)
         max_len = speech_token_len.max().item()
         padded_tensor = torch.zeros(len(speech_tokens), max_len, dtype=torch.long, device=self.device)
@@ -330,7 +351,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
 
 
-
+        # zhy: 在flow matching训练里没用，暂时注释掉
+        '''
 
         """Prepares input tensors for the model."""
         source_encoded, source_encoded_lens = self.perception(
@@ -421,6 +443,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             "embedding": torch.zeros(speech_tokens.size(0), 192).to(self.device)
         }
 
+        '''
+
 
     def cal_acc(self, pad_outputs, pad_targets, ignore_label):
         pad_pred = pad_outputs.argmax(-1)
@@ -431,6 +455,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         return (numerator / denominator).detach().item()
 
     def training_step(self, batch: dict, batch_idx: int):
+        """
+        Flow matching训练的核心步骤
+        """
+        # 准备输入数据（包括梅尔频谱、语音token等）
         # for m in (self.perception.preprocessor, self.perception.encoder, self.llm, self.speech_generation):
         #     if is_frozen(m):
         #         m.eval()
@@ -438,10 +466,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         self.print(batch_idx, inputs['speech_feat'].shape, inputs['speech_feat_len'].sum().item(), inputs['speech_feat'].shape[0]*inputs['speech_feat'].shape[-1])
 
+        # Flow matching训练的核心：
+        # - inputs包含条件信息（梅尔频谱）和目标（语音token）
+        # - audio_decoder.flow执行flow matching的前向传播和损失计算
         loss = self.audio_decoder.flow(inputs, self.device)
 
+        # 记录训练指标
         ans = {
-            "loss": loss['loss'],
+            "loss": loss['loss'],  # Flow matching损失
             "learning_rate": (
                 torch.as_tensor(self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0)
             ),
@@ -538,46 +570,51 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             with fp32_precision(), torch.no_grad():
 
                 if self.stream_inference:
-                    response_speech = self.audio_decoder.stream_inference(token=inputs['speech_token'],
-                                                                    this_uuid=this_uuid,
-                                                                    flow_prompt_speech_token=flow_prompt_speech_token.to(self.device),
-                                                                    prompt_speech_feat=prompt_speech_feat.to(self.device),
-                                                                    spk_emb=spk_emb,
-                                                                    pad_args=self.pad_args,
-                                                                    # finalize=True,
-                                                                    )
+                    response_speech_stream = self.audio_decoder.stream_inference(
+                        token=inputs['speech_token'],
+                        this_uuid=this_uuid,
+                        flow_prompt_speech_token=flow_prompt_speech_token.to(self.device),
+                        prompt_speech_feat=prompt_speech_feat.to(self.device),
+                        spk_emb=spk_emb,
+                        pad_args=self.pad_args,
+                        # finalize=True,
+                    )
                 else:
-                    response_speech, _ = self.audio_decoder.token2wav(inputs['speech_token'],
-                                                                    uuid=this_uuid,
-                                                                    prompt_token=flow_prompt_speech_token.to(self.device),
-                                                                    prompt_feat=prompt_speech_feat.to(self.device),
-                                                                    embedding=spk_emb,
-                                                                    finalize=True)
-                start_idx = 8448 if self.pad_args is not None else 0
-                audio_lens = inputs['audio_lens']
+                    # fallback to non-streaming token2wav
+                    response_speech_offline, _ = self.audio_decoder.token2wav(inputs['speech_token'],
+                                                                               uuid=this_uuid,
+                                                                               prompt_token=flow_prompt_speech_token.to(self.device),
+                                                                               prompt_feat=prompt_speech_feat.to(self.device),
+                                                                               embedding=spk_emb,
+                                                                               finalize=True)
 
+                # Choose which to feed to metrics (keep previous behavior: prefer streaming if enabled)
+                response_speech = response_speech_stream if response_speech_stream is not None else response_speech_offline
+
+                start_idx = 8448 if self.pad_args is not None else 0
+                audio_lens = inputs['audio_lens'] - start_idx
+                response_speech = response_speech[:, start_idx:]
 
                 os.makedirs(self.cfg.get('audio_save_path'), exist_ok=True)
                 for i in range(batch):
-                    torchaudio.save(f"{self.cfg.audio_save_path}/{name}_{inputs['sample_id'][i]}.wav",
-                                    response_speech[i, start_idx:audio_lens[i]].unsqueeze(0).cpu(), 22050)
-                    torchaudio.save(f"{self.cfg.audio_save_path}/{name}_{inputs['sample_id'][i]}_ref.wav",
-                                    inputs['speech_signal'][i][0, start_idx:].unsqueeze(0).cpu(), 22050)
+                    base = f"{self.cfg.audio_save_path}/{name}_{inputs['sample_id'][i]}"
+                    torchaudio.save(base + ".wav", response_speech[i, :audio_lens[i]].unsqueeze(0).cpu(), 22050)
+                    torchaudio.save(base + "_ref.wav", inputs['speech_signal'][i][0, start_idx:].unsqueeze(0).cpu(), 22050)
 
-                pred_audios = resample(response_speech[:, start_idx:], 22050, 16000)
+                pred_audios = resample(response_speech, 22050, 16000)
 
                 self.asr_bleu.update(
                     name=name,
                     refs=inputs["target_texts"],
                     pred_audio=pred_audios,
-                    pred_audio_lens=torch.tensor((audio_lens - start_idx) / 22050 * 16000).repeat(batch).to(torch.long),
+                    pred_audio_lens=torch.tensor(audio_lens / 22050 * 16000).repeat(batch).to(torch.long),
                 )
 
                 self.mos.update(
                     name=name,
                     pred_audios=pred_audios,
                     tmp_dir=os.path.join(self.cfg.get('audio_save_path'), "tmp"),
-                    pred_audio_lens=torch.tensor((audio_lens - start_idx) / 22050 * 16000).repeat(batch).to(torch.long),
+                    pred_audio_lens=torch.tensor(audio_lens / 22050 * 16000).repeat(batch).to(torch.long),
                 )
 
 
@@ -746,7 +783,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             with fp32_precision(), torch.no_grad():
                 this_uuid = str(uuid.uuid4())
 
-          
+
                 prompt_speech_feat = torch.zeros(input_embeds.shape[0], 0, 80).to(self.device)
                 flow_prompt_speech_token = torch.zeros(input_embeds.shape[0], 0, dtype=torch.int64).to(self.device)
                 if hasattr(self, 'spk_emb'):
@@ -775,7 +812,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 ans["audio"] = response_speech
                 ans["audio_len"] = torch.tensor(response_speech.shape[1]).unsqueeze(0).repeat(input_embeds.shape[0]).to(self.device)
 
-        
+
         return ans
 
     def backward(self, *args, **kwargs):

@@ -1,3 +1,7 @@
+import os
+import sys
+from typing import Dict, Optional
+
 import torch
 import torchaudio
 import numpy as np
@@ -8,7 +12,7 @@ from collections import defaultdict
 from .causal_conv import CausalConfigManager, CausalConvConverter
 import yaml
 import tempfile
-import os
+
 import json
 import hydra
 from omegaconf import OmegaConf
@@ -63,7 +67,7 @@ class StreamStateManager:
 
 
 class AudioDecoder(torch.nn.Module): # from token to wav
-    def __init__(self, config_path, flow_ckpt_path, hift_ckpt_path, block_size=10, device="cuda", causal_conv=False, learnable_prompt=False, config_overrides=None):
+    def __init__(self, config_path, flow_ckpt_path, hift_ckpt_path, device="cuda", block_size=10, causal_conv=False, learnable_prompt=False, config_overrides=None):
         super().__init__()
         self.device = device
 
@@ -103,9 +107,11 @@ class AudioDecoder(torch.nn.Module): # from token to wav
 
         # Load models
         self.flow = self.scratch_configs['flow']
-        self.flow.load_state_dict(torch.load(flow_ckpt_path, map_location=self.device), strict=not (learnable_prompt))
+        if flow_ckpt_path and os.path.isfile(flow_ckpt_path):
+            self.flow.load_state_dict(torch.load(flow_ckpt_path, map_location=self.device), strict=not (learnable_prompt))
         self.hift = self.scratch_configs['hift']
-        self.hift.load_state_dict(torch.load(hift_ckpt_path, map_location=self.device))
+        if hift_ckpt_path and os.path.isfile(hift_ckpt_path):
+            self.hift.load_state_dict(torch.load(hift_ckpt_path, map_location=self.device))
 
         # Move models to the appropriate device
         self.flow.to(self.device)
@@ -279,10 +285,29 @@ class AudioDecoder(torch.nn.Module): # from token to wav
         
         return True
 
-    def token2wav(self, token, uuid, prompt_token=torch.zeros(1, 0, dtype=torch.int32),
-                  prompt_feat=torch.zeros(1, 0, 80), embedding=torch.zeros(1, 192), finalize=False):
-        """
-        Simplified token2wav with unified state management
+    @torch.inference_mode()
+    def token2wav(
+        self,
+        token: torch.Tensor,
+        uuid: str,
+        prompt_token: torch.Tensor = torch.zeros(1, 0, dtype=torch.int32),
+        prompt_feat: torch.Tensor = torch.zeros(1, 0, 80),
+        embedding: torch.Tensor = torch.zeros(1, 192),
+        finalize: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decode tokens to waveform using CosyVoice2 flow + HiFT vocoder.
+
+        Args:
+            token: [B, T_tok] discrete tokens
+            uuid: session id for stream cache (unused for finalize=True)
+            prompt_token: [B, Tp]
+            prompt_feat: [B, Tp_mel, 80] or [B, Tp_mel, 80] (expects [B, Tp_mel, 80])
+            embedding: [B, 192] speaker embedding
+            finalize: end of stream flag; if True, process all remaining frames
+
+        Returns:
+            tts_speech_output: [B, T_wav] at 22050 Hz
+            tts_mel_output: [B, 80, T_mel] generated mel
         """
         # Step 1: Generate mel-spectrogram from tokens
         tts_mel = self.flow.inference(token=token.to(self.device),
@@ -335,12 +360,28 @@ class AudioDecoder(torch.nn.Module): # from token to wav
 
         return tts_speech_output, tts_mel_output
 
-    def offline_inference(self, token):
-        this_uuid = str(uuid.uuid1())
-        tts_speech, tts_mel = self.token2wav(token, uuid=this_uuid, finalize=True)
-        return tts_speech.cpu()
+    @torch.inference_mode()
+    def stream_inference(
+        self,
+        token: torch.Tensor,
+        this_uuid: str,
+        prompt_speech_token: torch.Tensor,
+        prompt_speech_feat: torch.Tensor,
+        spk_emb: torch.Tensor,
+        pad_args: Optional[Dict] = None,
+    ) -> torch.Tensor:
+        """Streaming decode tokens to waveform using flow + HiFT with overlap-fade.
 
-    def stream_inference(self, token, this_uuid, flow_prompt_speech_token, prompt_speech_feat, spk_emb, pad_args=None):
+        Args:
+            token: [B, T_tok]
+            this_uuid: stream session id
+            prompt_speech_token: [B, Tp]
+            prompt_speech_feat: [B, Tp_mel, 80]
+            spk_emb: [B, 192]
+            pad_args: padding arguments
+        Returns:
+            wav22050: [B, T_wav] at 22050 Hz
+        """
 
 
         tts_speechs = []
@@ -366,16 +407,16 @@ class AudioDecoder(torch.nn.Module): # from token to wav
 
             if prev_mel is not None:
                 prompt_speech_feat = torch.cat(tts_mels, dim=-1).transpose(1, 2)
-                flow_prompt_speech_token = token[:, :idx]
+                prompt_speech_token = token[:, :idx]
 
             tts_speech, tts_mel = self.token2wav(tts_token, uuid=this_uuid,
-                                                 prompt_token=flow_prompt_speech_token.to(self.device),
+                                                 prompt_token=prompt_speech_token.to(self.device),
                                                  prompt_feat=prompt_speech_feat.to(self.device),
                                                  embedding=spk_emb,
                                                  finalize=is_finalize)
 
             prev_mel = tts_mel
-            prev_speech = tts_speech
+            # prev_speech = tts_speech
             prev_idx = idx + block_size
             # print(tts_mel.size())
 
@@ -386,3 +427,16 @@ class AudioDecoder(torch.nn.Module): # from token to wav
         tts_speech = torch.cat(tts_speechs, dim=-1)
 
         return tts_speech
+
+
+    @torch.inference_mode()
+    def offline_inference(
+        self,
+        token: torch.Tensor,
+    ) -> torch.Tensor:
+        """Non-streaming inference: run CosyVoice2 flow in finalize=True once and vocoder once.
+        Returns wav at 22050 Hz for direct comparison with streaming path.
+        """
+        this_uuid = str(uuid.uuid1())
+        tts_speech, tts_mel = self.token2wav(token, uuid=this_uuid, finalize=True)
+        return tts_speech.cpu()
