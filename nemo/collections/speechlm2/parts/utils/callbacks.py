@@ -13,10 +13,9 @@
 # limitations under the License.
 
 import os
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type, Any
 
 import librosa
 import numpy as np
@@ -30,6 +29,7 @@ from lightning.pytorch.loggers.wandb import WandbLogger
 from torch import Tensor
 
 from nemo.collections.tts.parts.utils.helpers import create_plot
+from nemo.collections.tts.parts.utils.callbacks import _get_logger, ArtifactGenerator, AudioArtifact, ImageArtifact
 from nemo.collections.tts.parts.utils.callbacks import LoggingCallback as TTSLoggingCallback
 from nemo.utils import logging
 from nemo.utils.decorators import experimental
@@ -39,94 +39,6 @@ try:
     import wandb
 except ModuleNotFoundError:
     HAVE_WANDB = False
-
-
-def _get_logger(loggers: List[Logger], logger_type: Type[Logger]):
-    for logger in loggers:
-        if isinstance(logger, logger_type):
-            if hasattr(logger, "experiment"):
-                return logger.experiment
-            else:
-                return logger
-    logging.warning(f"Could not find {logger_type} logger in {loggers}.")
-    return None
-
-
-def _load_vocoder(model_name: Optional[str], checkpoint_path: Optional[str], type: str):
-    assert (model_name is None) != (
-        checkpoint_path is None
-    ), f"Must provide exactly one of vocoder model_name or checkpoint: ({model_name}, {checkpoint_path})"
-
-    checkpoint_path = str(checkpoint_path)
-    if type == "hifigan":
-        from nemo.collections.tts.models import HifiGanModel
-
-        model_type = HifiGanModel
-    elif type == "univnet":
-        from nemo.collections.tts.models import UnivNetModel
-
-        model_type = UnivNetModel
-    else:
-        raise ValueError(f"Unknown vocoder type '{type}'")
-
-    if model_name is not None:
-        vocoder = model_type.from_pretrained(model_name)
-    elif checkpoint_path.endswith(".nemo"):
-        vocoder = model_type.restore_from(checkpoint_path)
-    else:
-        vocoder = model_type.load_from_checkpoint(checkpoint_path)
-
-    return vocoder.eval()
-
-
-@dataclass
-class AudioArtifact:
-    id: str
-    data: np.ndarray
-    sample_rate: int
-    filepath: Path
-
-
-@dataclass
-class ImageArtifact:
-    id: str
-    data: np.ndarray
-    filepath: Path
-    x_axis: str
-    y_axis: str
-
-
-@dataclass
-class LogAudioParams:
-    vocoder_type: str
-    vocoder_name: str
-    vocoder_checkpoint_path: str
-    log_audio_gta: bool = False
-
-
-def create_id(filepath: Path) -> str:
-    path_prefix = str(filepath.with_suffix(""))
-    file_id = path_prefix.replace(os.sep, "_")
-    return file_id
-
-
-class ArtifactGenerator(ABC):
-    @abstractmethod
-    def generate_artifacts(
-        self, model: LightningModule, batch_dict: Dict, initial_log: bool = False
-    ) -> Tuple[List[AudioArtifact], List[ImageArtifact]]:
-        """
-        Create artifacts for the input model and test batch.
-
-        Args:
-            model: Model instance being trained to use for inference.
-            batch_dict: Test batch to generate artifacts for.
-            initial_log: Flag to denote if this is the initial log, can
-                         be used to save ground-truth data only once.
-
-        Returns:
-            List of audio and image artifacts to log.
-        """
 
 
 @experimental
@@ -147,7 +59,7 @@ class LoggingCallback(TTSLoggingCallback):
 
     def __init__(
         self,
-        generators: List[ArtifactGenerator],
+        generators: List[ArtifactGenerator] = None,
         data_loader: torch.utils.data.DataLoader = None,
         log_epochs: Optional[List[int]] = None,
         epoch_frequency: int = 1,
@@ -156,87 +68,84 @@ class LoggingCallback(TTSLoggingCallback):
         log_tensorboard: bool = False,
         log_wandb: bool = False,
     ):
-        self.generators = generators
-        self.data_loader = data_loader
-        self.log_epochs = log_epochs if log_epochs else []
-        self.epoch_frequency = epoch_frequency
-        self.output_dir = Path(output_dir) if output_dir else None
-        self.loggers = loggers if loggers else []
-        self.log_tensorboard = log_tensorboard
-        self.log_wandb = log_wandb
-
         if log_tensorboard:
-            logging.info('Creating tensorboard logger')
-            self.tensorboard_logger = _get_logger(self.loggers, TensorBoardLogger)
+            try:
+                _get_logger(loggers, TensorBoardLogger)
+            except Exception as e:
+                logging.warning(f"Could not find {TensorBoardLogger} logger in {loggers}.")
+                logging.warning(f"Could not create tensorboard logger: {e}")
+                log_tensorboard = False
         else:
-            logging.debug('Not using tensorbord logger')
-            self.tensorboard_logger = None
+            log_tensorboard = False
 
         if log_wandb:
             if not HAVE_WANDB:
                 raise ValueError("Wandb not installed.")
-            logging.info('Creating wandb logger')
-            self.wandb_logger = _get_logger(self.loggers, WandbLogger)
+            try:
+                _get_logger(loggers, WandbLogger)
+            except Exception as e:
+                logging.warning(f"Could not find {WandbLogger} logger in {loggers}.")
+                logging.warning(f"Could not create wandb logger: {e}")
+                log_wandb = False
         else:
-            logging.debug('Not using wandb logger')
-            self.wandb_logger = None
+            log_wandb = False
 
-        logging.debug('Initialized %s with', self.__class__.__name__)
-        logging.debug('\tlog_epochs:      %s', self.log_epochs)
-        logging.debug('\tepoch_frequency: %s', self.epoch_frequency)
-        logging.debug('\toutput_dir:      %s', self.output_dir)
-        logging.debug('\tlog_tensorboard: %s', self.log_tensorboard)
-        logging.debug('\tlog_wandb:       %s', self.log_wandb)
+        super().__init__(
+            generators=None, data_loader=None, log_epochs=None, epoch_frequency=1,
+            output_dir=output_dir, loggers=loggers, log_tensorboard=log_tensorboard, log_wandb=log_wandb)
 
     def _log_audio(self, audio: AudioArtifact, log_dir: Path, step: int):
+        # Convert torch.Tensor to numpy array if needed
+        audio_data = audio.data
+        if isinstance(audio_data, torch.Tensor):
+            audio_data = audio_data.detach().cpu().numpy()
+        
+        # Ensure audio_data is numpy array
+        if not isinstance(audio_data, np.ndarray):
+            audio_data = np.array(audio_data)
+        
+        # Handle invalid values (NaN, Inf)
+        if np.isnan(audio_data).any() or np.isinf(audio_data).any():
+            logging.warning(f"Audio {audio.id} contains NaN or Inf values, replacing with zeros")
+            audio_data = np.nan_to_num(audio_data, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Ensure correct shape: squeeze to 1D if needed
+        if audio_data.ndim > 1:
+            # If shape is (1, N) or (N, 1), squeeze to 1D
+            if audio_data.shape[0] == 1:
+                audio_data = audio_data.squeeze(0)
+            elif audio_data.shape[1] == 1:
+                audio_data = audio_data.squeeze(1)
+        
+        # Ensure audio is not empty
+        if audio_data.size == 0:
+            logging.warning(f"Audio {audio.id} is empty, skipping logging")
+            return
+        
+        # Clip values to valid range for float32
+        if audio_data.dtype in [np.float32, np.float64]:
+            audio_data = np.clip(audio_data, -1.0, 1.0)
+        
         if log_dir:
             filepath = log_dir / audio.filepath
             filepath.parent.mkdir(parents=True, exist_ok=True)
-            sf.write(file=filepath, data=audio.data, samplerate=audio.sample_rate)
+            sf.write(file=filepath, data=audio_data, samplerate=audio.sample_rate)
 
         if self.tensorboard_logger:
             self.tensorboard_logger.add_audio(
                 tag=audio.id,
-                snd_tensor=audio.data,
+                snd_tensor=audio.data if isinstance(audio.data, torch.Tensor) else torch.from_numpy(audio_data),
                 global_step=step,
                 sample_rate=audio.sample_rate,
             )
 
+        logging.info(f"Logging audio to wandb: {audio.id}")
+        logging.info(f"Wandb logger: {self.wandb_logger}")
         if self.wandb_logger:
-            wandb_audio = (wandb.Audio(audio.data, sample_rate=audio.sample_rate, caption=audio.id),)
+            logging.info(f"Logging audio to wandb: {audio.id}")
+            wandb_audio = (wandb.Audio(audio_data, sample_rate=audio.sample_rate, caption=f"[step: {step}] {audio.id}"),)
             self.wandb_logger.log({audio.id: wandb_audio})
-
-    def _log_image(self, image: ImageArtifact, log_dir: Path, step: int):
-        if log_dir:
-            filepath = log_dir / image.filepath
-            filepath.parent.mkdir(parents=True, exist_ok=True)
-        else:
-            filepath = None
-
-        image_plot = create_plot(output_filepath=filepath, data=image.data, x_axis=image.x_axis, y_axis=image.y_axis)
-
-        if self.tensorboard_logger:
-            self.tensorboard_logger.add_image(
-                tag=image.id,
-                img_tensor=image_plot,
-                global_step=step,
-                dataformats="HWC",
-            )
-
-        if self.wandb_logger:
-            wandb_image = (wandb.Image(image_plot, caption=image.id),)
-            self.wandb_logger.log({image.id: wandb_image})
-
-    def _log_artifacts(self, audio_list: list, image_list: list, log_dir: Optional[Path] = None, global_step: int = 0):
-        """Log audio and image artifacts."""
-        if log_dir is not None:
-            log_dir.mkdir(parents=True, exist_ok=True)
-
-        for audio in audio_list:
-            self._log_audio(audio=audio, log_dir=log_dir, step=global_step)
-
-        for image in image_list:
-            self._log_image(image=image, log_dir=log_dir, step=global_step)
+            logging.info(f"Wandb logged audio: {audio.id}")
 
     def on_fit_start(self, trainer: Trainer, model: LightningModule):
         """Log initial data artifacts."""
@@ -244,25 +153,7 @@ class LoggingCallback(TTSLoggingCallback):
             logging.warning('Data loader is not set, skipping initial artifacts log.')
             return
 
-        audio_list = []
-        image_list = []
-        for batch_dict in self.data_loader:
-            for key, value in batch_dict.items():
-                if isinstance(value, torch.Tensor):
-                    batch_dict[key] = value.to(model.device)
-
-            for generator in self.generators:
-                audio, images = generator.generate_artifacts(model=model, batch_dict=batch_dict, initial_log=True)
-                audio_list += audio
-                image_list += images
-
-        if len(audio_list) == len(image_list) == 0:
-            logging.debug('List are empty, no initial artifacts to log.')
-            return
-
-        log_dir = self.output_dir / "initial" if self.output_dir else None
-
-        self._log_artifacts(audio_list=audio_list, image_list=image_list, log_dir=log_dir)
+        super().on_fit_start(trainer, model)
 
     def on_train_epoch_end(self, trainer: Trainer, model: LightningModule):
         """Log artifacts at the end of an epoch."""
@@ -270,42 +161,27 @@ class LoggingCallback(TTSLoggingCallback):
             logging.warning('Data loader is not set, skipping epoch artifacts log.')
             return
 
-        epoch = 1 + model.current_epoch
-        if (epoch not in self.log_epochs) and (epoch % self.epoch_frequency != 0):
-            return
+        super().on_train_epoch_end(trainer, model)
 
-        audio_list = []
-        image_list = []
-        for batch_dict in self.data_loader:
-            for key, value in batch_dict.items():
-                if isinstance(value, torch.Tensor):
-                    batch_dict[key] = value.to(model.device)
-
-            for generator in self.generators:
-                audio, images = generator.generate_artifacts(model=model, batch_dict=batch_dict)
-                audio_list += audio
-                image_list += images
-
-        if len(audio_list) == len(image_list) == 0:
-            logging.debug('List are empty, no artifacts to log at epoch %d.', epoch)
-            return
-
-        log_dir = self.output_dir / f"epoch_{epoch}" if self.output_dir else None
-
-        self._log_artifacts(audio_list=audio_list, image_list=image_list, log_dir=log_dir)
-
-    def on_validation_batch_end(self, trainer: Trainer, pl_module: LightningModule, outputs: Any, batch: Any, batch_idx: int, dataloader_idx: int) -> None:
+    def on_validation_batch_end(self, trainer: Trainer, model: LightningModule, outputs: Any, batch: Any, batch_idx: int, dataloader_idx: int=0) -> None:
         """Log artifacts at the end of a validation batch."""
         epoch = 1 + model.current_epoch
 
-        audio_list = outputs['audio_list']
-        image_list = outputs['image_list']
+        audio_list = []
+        image_list = []
 
-        if len(audio_list) == len(image_list) == 0:
+        if len(outputs['audio_list']) == len(outputs['image_list']) == 0:
             logging.debug('List are empty, no artifacts to log at batch %d.', batch_idx)
             return
 
+        for audio in outputs['audio_list']:
+            logging.info(f"Appending audio to list")
+            audio_list.append(AudioArtifact(id=audio['id'], data=audio['data'], sample_rate=audio['sample_rate'], filepath=audio['filepath']))
+        for image in outputs['image_list']:
+            logging.info(f"Appending image to list")
+            image_list.append(ImageArtifact(id=image['id'], data=image['data'], filepath=image['filepath'], x_axis=image['x_axis'], y_axis=image['y_axis']))
+
         log_dir = self.output_dir / f"val_epoch_{epoch}_batch_{batch_idx}" if self.output_dir else None
 
-        self._log_artifacts(audio_list=audio_list, image_list=image_list, log_dir=log_dir)
+        self._log_artifacts(audio_list=audio_list, image_list=image_list, log_dir=log_dir, global_step=trainer.global_step)
 

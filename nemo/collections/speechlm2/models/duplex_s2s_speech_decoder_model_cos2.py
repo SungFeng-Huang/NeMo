@@ -445,6 +445,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         # 3. 计算每个样本的频谱长度
         speech_feat_lens = torch.tensor([x.shape[2] for x in target_mel_list], device=target_mel_list[0].device)
+        speech_audio_lens = torch.tensor([x.shape[1] for x in target_audio_list], device=target_audio_list[0].device)
 
         # 4. 将不同长度的频谱特征padding到相同长度
         speech_feat = torch.nn.utils.rnn.pad_sequence(
@@ -455,13 +456,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # 5. 使用fp32精度进行音频重采样（避免bfloat16精度问题）
         with fp32_precision():
             # 从22050Hz重采样到16000Hz，匹配WhisperVQ的输入要求
-            target_audio_list = [resample(target_audio_list[i], 22050, 16000) for i in range(len(target_audio_list))]
+            target_audio_16k_list = [resample(x, 22050, 16000) for x in target_audio_list]
 
             # 6. 使用WhisperVQ提取离散语音token
             speech_tokens = extract_speech_token(
                 self.whispervq,  # WhisperVQ编码器
                 self.feature_extractor,  # 特征提取器
-                [(target_audio_list[i], 16000) for i in range(len(target_audio_list))],
+                [(target_audio_16k_list[i], 16000) for i in range(len(target_audio_16k_list))],
             )
 
         # 7. 处理speech tokens的长度和padding
@@ -502,8 +503,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 self.spk_model.to(self.device)
             except Exception:
                 pass
-            audio_16k = rnn_utils.pad_sequence([x.squeeze(0) for x in target_audio_list], batch_first=True).to(self.device)
-            audio_16k_lens = torch.tensor([x.shape[1] for x in target_audio_list], dtype=torch.long, device=self.device)
+            audio_16k = rnn_utils.pad_sequence([x.squeeze(0) for x in target_audio_16k_list], batch_first=True).to(self.device)
+            audio_16k_lens = torch.tensor([x.shape[1] for x in target_audio_16k_list], dtype=torch.long, device=self.device)
             _, spk_emb = self.spk_model.forward(input_signal=audio_16k, input_signal_length=audio_16k_lens)
 
         self._debug_log_spk(spk_emb, f"prepare_inputs:{'train' if self.training else 'eval'}")
@@ -512,6 +513,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # logging.info(f"[prepared_inputs] text_tokens: {text_tokens}")
 
         return {
+            "speech_audio_lens": speech_audio_lens,
             "speech_feat": speech_feat,
             "speech_feat_len": speech_feat_lens,
             "speech_token": speech_tokens,
@@ -713,7 +715,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
 
-    def validation_step(self, batch: dict, batch_idx: int):
+    def validation_step(self, batch: dict, batch_idx: int, dataloader_idx: int = 0):
+        outputs = {
+            "loss": 0.0,
+            "audio_list": [],
+            "image_list": [],
+        }
         for name, dataset_batch in batch.items():
             if dataset_batch is None:
                 continue  # some dataset is exhausted
@@ -807,23 +814,22 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                                                                                embedding=spk_emb,
                                                                                finalize=True)
 
-                # Choose which to feed to metrics (keep previous behavior: prefer streaming if enabled)
-                response_speech = response_speech_stream if response_speech_stream is not None else response_speech_offline
-
-
 
                 # Save both versions for AB debugging
                 os.makedirs(self.cfg.get('audio_save_path'), exist_ok=True)
                 for i in range(batch):
-                    base = f"{self.cfg.audio_save_path}/{name}_{batch_idx}_{i}_{dataset_batch['sample_id'][i]}"
+                    _base = f"{name}_{dataloader_idx}_{batch_idx}_{i}_{dataset_batch['sample_id'][i]}"
+                    base = f"{self.cfg.audio_save_path}/{_base}"
+
                     target_audio_i = dataset_batch['target_audio'][i][dataset_batch['target_audio'][i] != 0]
                     torchaudio.save(base + "_0_target.wav", target_audio_i.unsqueeze(0).cpu(), 22050)
+                    outputs['audio_list'].append(dict(id=f"{dataloader_idx}_{batch_idx}_{i}_0_target", data=target_audio_i.unsqueeze(0).cpu(), sample_rate=22050, filepath=f"{_base}_0_target.wav"))
                     if response_speech_stream is not None:
                         torchaudio.save(base + "_1_stream.wav", response_speech_stream[i].unsqueeze(0).cpu(), 22050)
+                        outputs['audio_list'].append(dict(id=f"{dataloader_idx}_{batch_idx}_{i}_1_stream", data=response_speech_stream[i].unsqueeze(0).cpu(), sample_rate=22050, filepath=f"{_base}_1_stream.wav"))
                     if response_speech_offline is not None:
                         torchaudio.save(base + "_2_offline.wav", response_speech_offline[i].unsqueeze(0).cpu(), 22050)
-
-                pred_audios = resample(response_speech, 22050, 16000)
+                        outputs['audio_list'].append(dict(id=f"{dataloader_idx}_{batch_idx}_{i}_2_offline", data=response_speech_offline[i].unsqueeze(0).cpu(), sample_rate=22050, filepath=f"{_base}_2_offline.wav"))
 
                 # Ground-truth mel reconstruction via HiFT (quick vocoder sanity check)
                 try:
@@ -885,10 +891,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
                     # Save a few examples per batch (all by default)
                     for i in range(batch):
-                        base = f"{self.cfg.audio_save_path}/{name}_{batch_idx}_{i}_{dataset_batch['sample_id'][i]}"
+                        _base = f"{name}_{dataloader_idx}_{batch_idx}_{i}_{dataset_batch['sample_id'][i]}"
+                        base = f"{self.cfg.audio_save_path}/{_base}"
                         torchaudio.save(base + "_3_reconGT.wav", wav22050_gt[i].unsqueeze(0).cpu(), 22050)
+                        outputs['audio_list'].append(dict(id=f"{dataloader_idx}_{batch_idx}_{i}_3_reconGT", data=wav22050_gt[i].unsqueeze(0).cpu(), sample_rate=22050, filepath=f"{_base}_3_reconGT.wav"))
                         torchaudio.save(base + "_4_reconGT_x2.wav", wav22050_gt_x2[i].unsqueeze(0).cpu(), 22050)
+                        # outputs['audio_list'].append(dict(id=f"{dataloader_idx}_{batch_idx}_{i}_4_reconGT_x2", data=wav22050_gt_x2[i].unsqueeze(0).cpu(), sample_rate=22050, filepath=f"{_base}_4_reconGT_x2.wav"))
                         torchaudio.save(base + "_5_reconGT_x4.wav", wav22050_gt_x4[i].unsqueeze(0).cpu(), 22050)
+                        # outputs['audio_list'].append(dict(id=f"{dataloader_idx}_{batch_idx}_{i}_5_reconGT_x4", data=wav22050_gt_x4[i].unsqueeze(0).cpu(), sample_rate=22050, filepath=f"{_base}_5_reconGT_x4.wav"))
                         if os.environ.get('COS2_VAL_DEBUG', '0') == '1':
                             logging.info(f"[val][reconGT] saved: {base}_reconGT(.wav, _x2.wav, _x4.wav)")
                         # logging.info(f"[val][reconGT] saved: {self.cfg.audio_save_path}/{name}_{i}_{dataset_batch['sample_id'][i]}_reconGT.wav")
@@ -896,11 +906,17 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     logging.info(f"[val][reconGT] failed: {e}")
 
 
+                # Choose which to feed to metrics (keep previous behavior: prefer streaming if enabled)
+                response_speech = response_speech_stream if response_speech_stream is not None else response_speech_offline
+                pred_audios = resample(response_speech, 22050, 16000)
+                speech_audio_lens = dataset_batch['speech_audio_lens']
+
+                # use speech_audio_lens to force the audio length to be the same as the target audio length
                 self.asr_bleu.update(
                     name=name,
                     refs=dataset_batch["target_texts"],
                     pred_audio=pred_audios,
-                    pred_audio_lens=torch.tensor(pred_audios.shape[1] / 22050 * 16000).repeat(batch).to(torch.long),
+                    pred_audio_lens=torch.tensor(speech_audio_lens / 22050 * 16000).repeat(batch).to(torch.long),
                 )
 
                 self.mos.update(
@@ -947,6 +963,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             #                         16000)
             #
             # dist.barrier()
+        return outputs
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
@@ -1228,13 +1245,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.speech_generation = fully_shard(self.speech_generation, **fsdp_config)
 
     def configure_callbacks(self):
-        self.log_config = self.cfg.get('log_config', None)
-        if not self.log_config:
-            return []
+        # self.log_config = self.cfg.get('log_config', None)
+        # if not self.log_config:
+        #     return []
 
         from nemo.collections.speechlm2.parts.utils.callbacks import LoggingCallback
 
-        log_dir = None
+        log_dir = None # no multiple save for now
         log_callback = LoggingCallback(
             generators=None,
             data_loader=None,
