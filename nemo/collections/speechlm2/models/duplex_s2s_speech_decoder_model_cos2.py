@@ -909,7 +909,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 # Choose which to feed to metrics (keep previous behavior: prefer streaming if enabled)
                 response_speech = response_speech_stream if response_speech_stream is not None else response_speech_offline
                 pred_audios = resample(response_speech, 22050, 16000)
-                speech_audio_lens = dataset_batch['speech_audio_lens']
+                speech_audio_lens = inputs['speech_audio_lens']
 
                 # use speech_audio_lens to force the audio length to be the same as the target audio length
                 self.asr_bleu.update(
