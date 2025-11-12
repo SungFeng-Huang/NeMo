@@ -607,6 +607,37 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         self.text_ln = self.text_ln.to(device)
         self.text_ffn = self.text_ffn.to(device)
 
+    def _determine_chunk_block_size(self):
+        """Determine chunking block size in original token units.
+        
+        Returns:
+            block_size (int): Chunking block size in original token units
+        """
+        block_size = None
+        bs = getattr(self.cos2_flow.encoder, 'static_chunk_size', None)
+        if isinstance(bs, (int, float)) and bs > 0:
+            block_size = int(bs)
+        if not block_size:
+            bs = getattr(self.cos2_flow, 'static_chunk_size', None)
+            if isinstance(bs, (int, float)) and bs > 0:
+                block_size = int(bs)
+        if not block_size:
+            block_size = int(os.environ.get('COS2_STATIC_CHUNK_SIZE', '2'))
+        if block_size <= 0:
+            block_size = 2  # safety fallback
+        return block_size
+
+    def _compute_upsample_factor(self):
+        """Compute upsampling factor for token alignment.
+        
+        Returns:
+            upsample_factor (int): Upsampling factor (typically 2)
+        """
+        tmr = float(getattr(self.cos2_flow, 'token_mel_ratio', 4.0))
+        enc_up = 2.0
+        upsample_factor = max(1, int(round(tmr / enc_up)))
+        return upsample_factor
+
     def flow(self, batch: Dict, device: torch.device) -> Dict[str, Optional[torch.Tensor]]:
         """
         计算 CosyVoice2 因果流（Causal Flow, CFM）的训练损失，并显式对齐时间轴。
@@ -741,6 +772,15 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 t_ends (list): End indices for each chunk on text axis
                 device_target (torch.device): Target device for computations
                 b_idx (int): Batch index of the current sample
+
+            Variables:
+                L_ctx (int): Context length for text context (self._L_ctx_default)
+                KV (torch.Tensor): Text embeddings padded to kv_hist_max [N, kv_hist_max, D]
+                mask_kv (torch.Tensor): Mask for KV [N, 1, kv_hist_max]
+                t_starts (list): Start indices for each chunk on original token axis
+                end_tok_list (list): End indices for each chunk on original token axis
+                L_hist_max_tok (int): Maximum length of speech history in original token units
+                s_hist_batch (torch.Tensor): Speech history batch [N, L_hist_max_tok, D]
                 
             Returns:
                 text_ctx_batch (torch.Tensor): Text context batch [N, L_ctx, D]
@@ -1125,21 +1165,6 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             
             return tok_ids_b, tok_len_b, txt_ids_b, txt_len_b
         
-        def _determine_chunk_block_size():
-            """Determine chunking block size in original token units."""
-            block_size = None
-            bs = getattr(self.cos2_flow.encoder, 'static_chunk_size', None)
-            if isinstance(bs, (int, float)) and bs > 0:
-                block_size = int(bs)
-            if not block_size:
-                bs = getattr(self.cos2_flow, 'static_chunk_size', None)
-                if isinstance(bs, (int, float)) and bs > 0:
-                    block_size = int(bs)
-            if not block_size:
-                block_size = int(os.environ.get('COS2_STATIC_CHUNK_SIZE', '2'))
-            if block_size <= 0:
-                block_size = 2  # safety fallback
-            return block_size
         
         def _precompute_token_and_text_embeddings(tok_ids_b, tok_len_b, txt_ids_b, txt_len_b, upsample_f):
             """Precompute upsampled token embeddings and full text embeddings.
@@ -1311,7 +1336,12 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 tok_len_b (int): Effective token length for the current sample
                 b_idx (int): Batch index of the current sample
                 device_target (torch.device): Target device for computations
-                
+
+            Variables:
+                L_ctx (int): Context length for text context (self._L_ctx_default)
+                t_ends (list): End indices for each chunk on text axis
+                kv_hist_max (int): Maximum visible text length for cross-attention
+
             Returns:
                 text_ctx_batch (torch.Tensor): Text context batch [N, L_ctx, D] or None
             """
@@ -1499,9 +1529,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
 
         # Keep original token ids for streaming-chunked path; compute upsample factor only
         T_tok_orig = token_len.clone()
-        tmr = float(getattr(self.cos2_flow, 'token_mel_ratio', 4.0))
-        enc_up = 2.0  # UpsampleConformerEncoder time upsample factor
-        upsample_factor = max(1, int(round(tmr / enc_up)))
+        upsample_factor = self._compute_upsample_factor()
 
         # Optional: build text context for training (used differently for non-streaming vs streaming)
         text_tokens = batch.get('text_tokens', None) if isinstance(batch, dict) else None
@@ -1522,7 +1550,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 )
                 
                 # Determine chunk block size
-                block_size = _determine_chunk_block_size()
+                block_size = self._determine_chunk_block_size()
                 
                 # Precompute upsampled token and text embeddings
                 tok_emb_full, T_eff_full, emb_txt_full = _precompute_token_and_text_embeddings(
@@ -1642,9 +1670,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         tts_mels = []
         vocab_max = None  # WhisperVQ 16384; keep None unless you need clamp
         # determine pre-upsample factor to align token->encoder time
-        tmr = float(getattr(self.cos2_flow, 'token_mel_ratio', 4.0))
-        enc_up = 2.0
-        upsample_factor = max(1, int(round(tmr / enc_up)))
+        upsample_factor = self._compute_upsample_factor()
 
         for b in range(B):
             tok_b = torch.clamp(token[b : b + 1].to(device), min=0)
@@ -1735,52 +1761,14 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         """
         device = token.device
         # resolve block_size/token_fps robustly
-        bs = None
-        try:
-            v = getattr(self.cos2_flow.encoder, 'static_chunk_size')
-            if isinstance(v, (int, float)) and v > 0:
-                bs = int(v)
-        except Exception:
-            bs = None
-        if not bs:
-            try:
-                v = getattr(self.cos2_flow, 'static_chunk_size')
-                if isinstance(v, (int, float)) and v > 0:
-                    bs = int(v)
-            except Exception:
-                bs = None
-        if not bs:
-            bs = int(os.environ.get('COS2_STATIC_CHUNK_SIZE', '2'))
-        if bs <= 0:
-            bs = 2
-        block_size = bs
+        block_size = self._determine_chunk_block_size()
         try:
             token_fps = float(getattr(self.cos2_flow, 'input_frame_rate', 25.0))
         except Exception:
             token_fps = 25.0
 
         # Ensure modules on correct device
-        try:
-            pdev = next(self.cos2_flow.parameters()).device
-        except StopIteration:
-            pdev = device
-        if pdev != device:
-            self.cos2_flow.to(device)
-        # Ensure adapter submodules on correct device
-        self.text_context_emb = self.text_context_emb.to(device)
-        self.cross_text_attn = self.cross_text_attn.to(device)
-        self.q2ctx_attn = self.q2ctx_attn.to(device)
-
-        self.cross_expand = self.cross_expand.to(device)
-        self.cross_ln = self.cross_ln.to(device)
-        self.cross_ffn = self.cross_ffn.to(device)
-        # scheme-1 blocks to device
-        self.speech_sa = self.speech_sa.to(device)
-        self.speech_ln = self.speech_ln.to(device)
-        self.speech_ffn = self.speech_ffn.to(device)
-        self.text_sa = self.text_sa.to(device)
-        self.text_ln = self.text_ln.to(device)
-        self.text_ffn = self.text_ffn.to(device)
+        self._ensure_device(device)
         self._lazy_init_hift()
         try:
             hift_dev = next(self._hift.parameters()).device
@@ -1842,9 +1830,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             pfeat = torch.cat([prompt_feat, prev_mel.transpose(1, 2)], dim=1) if (prev_mel is not None and prev_mel.numel() > 0) else prompt_feat
 
             # pre-upsample so that encoder x2 matches token_mel_ratio (~4 -> upsample_factor~2)
-            tmr = float(getattr(self.cos2_flow, 'token_mel_ratio', 4.0))
-            enc_up = 2.0
-            upsample_factor = max(1, int(round(tmr / enc_up)))
+            upsample_factor = self._compute_upsample_factor()
             if upsample_factor > 1:
                 tok_eff = tok_win.repeat_interleave(upsample_factor, dim=1)
                 ptok_eff = ptok.repeat_interleave(upsample_factor, dim=1) if (ptok is not None and ptok.numel() > 0) else ptok
@@ -2022,51 +2008,14 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
 
         device = token.device
         # resolve block_size/token_fps robustly
-        bs = None
-        try:
-            v = getattr(self.cos2_flow.encoder, 'static_chunk_size')
-            if isinstance(v, (int, float)) and v > 0:
-                bs = int(v)
-        except Exception:
-            bs = None
-        if not bs:
-            try:
-                v = getattr(self.cos2_flow, 'static_chunk_size')
-                if isinstance(v, (int, float)) and v > 0:
-                    bs = int(v)
-            except Exception:
-                bs = None
-        if not bs:
-            bs = int(os.environ.get('COS2_STATIC_CHUNK_SIZE', '2'))
-        if bs <= 0:
-            bs = 2
-        block_size = bs
+        block_size = self._determine_chunk_block_size()
         try:
             token_fps = float(getattr(self.cos2_flow, 'input_frame_rate', 25.0))
         except Exception:
             token_fps = 25.0
 
         # Ensure modules on correct device
-        try:
-            pdev = next(self.cos2_flow.parameters()).device
-        except StopIteration:
-            pdev = device
-        if pdev != device:
-            self.cos2_flow.to(device)
-        # Ensure adapter submodules on correct device
-        self.text_context_emb = self.text_context_emb.to(device)
-        self.cross_text_attn = self.cross_text_attn.to(device)
-        self.q2ctx_attn = self.q2ctx_attn.to(device)
-        self.cross_expand = self.cross_expand.to(device)
-        self.cross_ln = self.cross_ln.to(device)
-        self.cross_ffn = self.cross_ffn.to(device)
-        # scheme-1 blocks to device
-        self.speech_sa = self.speech_sa.to(device)
-        self.speech_ln = self.speech_ln.to(device)
-        self.speech_ffn = self.speech_ffn.to(device)
-        self.text_sa = self.text_sa.to(device)
-        self.text_ln = self.text_ln.to(device)
-        self.text_ffn = self.text_ffn.to(device)
+        self._ensure_device(device)
         self._lazy_init_hift()
         try:
             hift_dev = next(self._hift.parameters()).device
@@ -2074,9 +2023,6 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             hift_dev = device
         if hift_dev != device:
             self._hift.to(device)
-
-        # Move text embed to device
-        self.text_context_emb = self.text_context_emb.to(device)
 
         B = token.shape[0]
         if B > 1:
@@ -2200,9 +2146,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 text_ctx = emb_ctx
 
             # upsample
-            tmr = float(getattr(self.cos2_flow, 'token_mel_ratio', 4.0))
-            enc_up = 2.0
-            upsample_factor = max(1, int(round(tmr / enc_up)))
+            upsample_factor = self._compute_upsample_factor()
             if upsample_factor > 1:
                 tok_eff = tok_win.repeat_interleave(upsample_factor, dim=1)
                 ptok_eff = ptok.repeat_interleave(upsample_factor, dim=1) if (ptok is not None and ptok.numel() > 0) else ptok
@@ -2409,26 +2353,8 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             logging.info("[cos2.offline] spk=ERR")
 
         device = token.device
-        try:
-            pdev = next(self.cos2_flow.parameters()).device
-        except StopIteration:
-            pdev = device
-        if pdev != device:
-            self.cos2_flow.to(device)
-        # Ensure adapter submodules on correct device
-        self.text_context_emb = self.text_context_emb.to(device)
-        self.cross_text_attn = self.cross_text_attn.to(device)
-        self.q2ctx_attn = self.q2ctx_attn.to(device)
-        self.cross_expand = self.cross_expand.to(device)
-        self.cross_ln = self.cross_ln.to(device)
-        self.cross_ffn = self.cross_ffn.to(device)
-        # scheme-1 blocks to device
-        self.speech_sa = self.speech_sa.to(device)
-        self.speech_ln = self.speech_ln.to(device)
-        self.speech_ffn = self.speech_ffn.to(device)
-        self.text_sa = self.text_sa.to(device)
-        self.text_ln = self.text_ln.to(device)
-        self.text_ffn = self.text_ffn.to(device)
+        # Ensure modules on correct device
+        self._ensure_device(device)
         self._lazy_init_hift()
         if next(self._hift.parameters()).device != device:
             self._hift.to(device)
@@ -2442,12 +2368,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             emb_b = embedding[b : b + 1] if embedding is not None and embedding.size(0) == B else embedding
 
             # Option A: pre-upsample tokens so that encoder x2 gives desired token_mel_ratio (e.g., 4)
-            try:
-                tmr = float(getattr(self.cos2_flow, 'token_mel_ratio', 4.0))
-            except Exception:
-                tmr = 4.0
-            enc_up = 2.0
-            upsample_factor = max(1, int(round(tmr / enc_up)))
+            upsample_factor = self._compute_upsample_factor()
             if upsample_factor > 1:
                 tok_b = tok_b.repeat_interleave(upsample_factor, dim=1)
                 ptok_b = ptok_b.repeat_interleave(upsample_factor, dim=1) if (ptok_b is not None and ptok_b.numel() > 0) else ptok_b
