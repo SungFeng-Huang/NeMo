@@ -1589,10 +1589,10 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             h_list = []
             mask_list = []
             
-            for b in range(B):
+            for batch_idx in range(B):
                 # Extract sample tokens and text
                 tok_ids_b, tok_len_b, txt_ids_b, txt_len_b = _extract_sample_tokens_and_text(
-                    batch, b, text_tokens, T_tok_orig, B, device
+                    batch, batch_idx, text_tokens, T_tok_orig, B, device
                 )
                 
                 # Determine chunk block size
@@ -1604,7 +1604,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 )
                 
                 # Compute first chunk length (possibly randomized)
-                first_len_tok = _compute_first_chunk_length(block_size, tok_len_b, upsample_factor, b, device)
+                first_len_tok = _compute_first_chunk_length(block_size, tok_len_b, upsample_factor, batch_idx, device)
                 
                 # Build chunk boundaries
                 chunk_starts_tok, chunk_ends_tok, num_chunks = _build_chunk_boundaries(
@@ -1636,7 +1636,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 # Build text context for all chunks
                 text_ctx_batch = _build_text_context_for_chunks(
                     emb_txt_full, txt_len_b, chunk_starts_tok, chunk_ends_tok, num_chunks,
-                    tok_ids_b, tok_len_b, b, device
+                    tok_ids_b, tok_len_b, batch_idx, device
                 )
                 
                 # Encode chunks with text context
@@ -1653,7 +1653,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 
                 # Print micro-batch debug info
                 _print_microbatch_debug_info(
-                    b, num_chunks, L_max, upsample_factor, block_size, 
+                    batch_idx, num_chunks, L_max, upsample_factor, block_size, 
                     emb_txt_full.shape[1] if isinstance(emb_txt_full, torch.Tensor) else 0,
                     T_eff_full, Li_list, tok_len_b, device
                 )
@@ -1718,11 +1718,11 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         # determine pre-upsample factor to align token->encoder time
         upsample_factor = self._compute_upsample_factor()
 
-        for b in range(B):
-            tok_b = torch.clamp(token[b : b + 1].to(device), min=0)
-            ptok_b = prompt_token[b : b + 1].to(device) if (prompt_token is not None and prompt_token.numel() > 0 and prompt_token.size(0) == B) else (prompt_token.to(device) if (prompt_token is not None and prompt_token.numel() > 0) else torch.zeros(1, 0, dtype=torch.int64, device=device))
-            pfeat_b = prompt_feat[b : b + 1].to(device) if (prompt_feat is not None and prompt_feat.numel() > 0 and prompt_feat.size(0) == B) else (prompt_feat.to(device) if (prompt_feat is not None and prompt_feat.numel() > 0) else torch.zeros(1, 0, self.MEL_DIM, device=device))
-            emb_b = (embedding[b : b + 1].to(device) if (embedding is not None and embedding.size(0) == B) else (embedding.to(device) if embedding is not None else torch.zeros(1, self.SPEAKER_EMBEDDING_DIM, device=device)))
+        for batch_idx in range(B):
+            tok_b = torch.clamp(token[batch_idx : batch_idx + 1].to(device), min=0)
+            ptok_b = prompt_token[batch_idx : batch_idx + 1].to(device) if (prompt_token is not None and prompt_token.numel() > 0 and prompt_token.size(0) == B) else (prompt_token.to(device) if (prompt_token is not None and prompt_token.numel() > 0) else torch.zeros(1, 0, dtype=torch.int64, device=device))
+            pfeat_b = prompt_feat[batch_idx : batch_idx + 1].to(device) if (prompt_feat is not None and prompt_feat.numel() > 0 and prompt_feat.size(0) == B) else (prompt_feat.to(device) if (prompt_feat is not None and prompt_feat.numel() > 0) else torch.zeros(1, 0, self.MEL_DIM, device=device))
+            emb_b = (embedding[batch_idx : batch_idx + 1].to(device) if (embedding is not None and embedding.size(0) == B) else (embedding.to(device) if embedding is not None else torch.zeros(1, self.SPEAKER_EMBEDDING_DIM, device=device)))
 
             if vocab_max is not None and vocab_max >= 0:
                 tok_b = torch.clamp(tok_b, min=0, max=vocab_max)
@@ -1828,13 +1828,13 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         if B > 1:
             wav_list = []
             max_len = 0
-            for b in range(B):
-                uid_b = f"{uuid}#{b}"
-                tok_b = token[b : b + 1]
-                ptok_b = prompt_token[b : b + 1] if prompt_token is not None and hasattr(prompt_token, 'size') and prompt_token.size(0) == B else prompt_token
-                pfeat_b = prompt_feat[b : b + 1] if prompt_feat is not None and hasattr(prompt_feat, 'size') and prompt_feat.size(0) == B else prompt_feat
-                emb_b = embedding[b : b + 1] if embedding is not None and hasattr(embedding, 'size') and embedding.size(0) == B else embedding
-                gt_b = gt_mel_len[b : b + 1] if (gt_mel_len is not None and isinstance(gt_mel_len, torch.Tensor) and gt_mel_len.size(0) == B) else gt_mel_len
+            for batch_idx in range(B):
+                uid_b = f"{uuid}#{batch_idx}"
+                tok_b = token[batch_idx : batch_idx + 1]
+                ptok_b = prompt_token[batch_idx : batch_idx + 1] if prompt_token is not None and hasattr(prompt_token, 'size') and prompt_token.size(0) == B else prompt_token
+                pfeat_b = prompt_feat[batch_idx : batch_idx + 1] if prompt_feat is not None and hasattr(prompt_feat, 'size') and prompt_feat.size(0) == B else prompt_feat
+                emb_b = embedding[batch_idx : batch_idx + 1] if embedding is not None and hasattr(embedding, 'size') and embedding.size(0) == B else embedding
+                gt_b = gt_mel_len[batch_idx : batch_idx + 1] if (gt_mel_len is not None and isinstance(gt_mel_len, torch.Tensor) and gt_mel_len.size(0) == B) else gt_mel_len
                 wav_b = self.stream_inference(tok_b, uid_b, ptok_b, pfeat_b, emb_b, gt_b)
                 wav_list.append(wav_b)
                 max_len = max(max_len, wav_b.shape[1])
@@ -2074,14 +2074,14 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         if B > 1:
             wav_list = []
             max_len = 0
-            for b in range(B):
-                uid_b = f"{uuid}#{b}"
-                tok_b = token[b : b + 1]
-                ttxt_b = text_tokens[b : b + 1] if text_tokens is not None and hasattr(text_tokens, 'size') and text_tokens.size(0) == B else text_tokens
-                ptok_b = prompt_token[b : b + 1] if prompt_token is not None and hasattr(prompt_token, 'size') and prompt_token.size(0) == B else prompt_token
-                pfeat_b = prompt_feat[b : b + 1] if prompt_feat is not None and hasattr(prompt_feat, 'size') and prompt_feat.size(0) == B else prompt_feat
-                emb_b = embedding[b : b + 1] if embedding is not None and hasattr(embedding, 'size') and embedding.size(0) == B else embedding
-                gt_b = gt_mel_len[b : b + 1] if (gt_mel_len is not None and isinstance(gt_mel_len, torch.Tensor) and gt_mel_len.size(0) == B) else gt_mel_len
+            for batch_idx in range(B):
+                uid_b = f"{uuid}#{batch_idx}"
+                tok_b = token[batch_idx : batch_idx + 1]
+                ttxt_b = text_tokens[batch_idx : batch_idx + 1] if text_tokens is not None and hasattr(text_tokens, 'size') and text_tokens.size(0) == B else text_tokens
+                ptok_b = prompt_token[batch_idx : batch_idx + 1] if prompt_token is not None and hasattr(prompt_token, 'size') and prompt_token.size(0) == B else prompt_token
+                pfeat_b = prompt_feat[batch_idx : batch_idx + 1] if prompt_feat is not None and hasattr(prompt_feat, 'size') and prompt_feat.size(0) == B else prompt_feat
+                emb_b = embedding[batch_idx : batch_idx + 1] if embedding is not None and hasattr(embedding, 'size') and embedding.size(0) == B else embedding
+                gt_b = gt_mel_len[batch_idx : batch_idx + 1] if (gt_mel_len is not None and isinstance(gt_mel_len, torch.Tensor) and gt_mel_len.size(0) == B) else gt_mel_len
                 wav_b = self.stream_inference_with_text(tok_b, uid_b, ttxt_b, ptok_b, pfeat_b, emb_b, gt_b)
                 wav_list.append(wav_b)
                 max_len = max(max_len, wav_b.shape[1])
@@ -2397,11 +2397,11 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
 
         B = token.shape[0]
         wavs = []
-        for b in range(B):
-            tok_b = token[b : b + 1]
-            ptok_b = prompt_token[b : b + 1] if prompt_token is not None and prompt_token.size(0) == B else prompt_token
-            pfeat_b = prompt_feat[b : b + 1] if prompt_feat is not None and prompt_feat.size(0) == B else prompt_feat
-            emb_b = embedding[b : b + 1] if embedding is not None and embedding.size(0) == B else embedding
+        for batch_idx in range(B):
+            tok_b = token[batch_idx : batch_idx + 1]
+            ptok_b = prompt_token[batch_idx : batch_idx + 1] if prompt_token is not None and prompt_token.size(0) == B else prompt_token
+            pfeat_b = prompt_feat[batch_idx : batch_idx + 1] if prompt_feat is not None and prompt_feat.size(0) == B else prompt_feat
+            emb_b = embedding[batch_idx : batch_idx + 1] if embedding is not None and embedding.size(0) == B else embedding
 
             # Option A: pre-upsample tokens so that encoder x2 gives desired token_mel_ratio (e.g., 4)
             upsample_factor = self._compute_upsample_factor()
