@@ -123,14 +123,14 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         num_valid_frames       : Valid (non-padded) frames in sequence
         
     Upsampling state suffixes (for token sequences that may be upsampled):
-        *_original             : Original/pre-upsampled state (e.g., token_emb_original, block_size_original)
+        *_original             : Original/pre-upsampled state (e.g., token_emb_original, token_ids_original)
         *_upsampled            : Post-upsampled state (e.g., token_ids_upsampled, block_size_upsampled)
-        *_full                 : Complete sequence (as opposed to partial/chunk)
-                                Can combine: *_original_full, *_upsampled_full
+        
+    Embedding suffixes (for complete sequence embeddings):
+        *_emb_full             : Complete sequence embeddings (entire sequence, not chunked)
         Examples:
-            token_emb_original      : Original token embeddings (pre-upsampling, complete sequence)
-            token_ids_upsampled     : Upsampled token IDs (post-upsampling, complete sequence)
-            block_size_upsampled    : Block size in upsampled coordinate system
+            token_emb_full          : Complete upsampled token embeddings for entire sequence
+            text_token_emb_full     : Complete text token embeddings for entire text sequence
             
     Hidden states & features:
         hidden_*           : Encoder hidden states (e.g., hidden_encoded, hidden_chunk)
