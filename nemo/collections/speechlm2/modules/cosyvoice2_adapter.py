@@ -99,6 +99,31 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
     - .token2wav(...): decode tokens -> mel via CosyVoice2 flow -> waveform via HiFT (HiFi-GAN)
       Note: We resample 24k output to 22.05k to match existing downstream code.
     - .stream_inference(...): streaming decode with overlap-fade and HiFT cache (24k -> 22.05k)
+    
+    Naming Conventions:
+    -------------------
+    Batch-related:
+        batch_size (B)      : Total number of samples in batch
+        batch_idx          : Index variable for iterating over batch (0 to B-1)
+        
+    Token-related:
+        token_*            : Speech token variables (prefer full 'token' over 'tok')
+        text_token_*       : Text token variables
+        num_tokens_*       : Token count/length variables
+        
+    Time dimensions:
+        num_tokens_original    : Original token sequence length (pre-upsampling)
+        num_tokens_upsampled   : Token sequence length after upsampling
+        num_hidden_frames      : Hidden state temporal dimension from encoder
+        num_valid_frames       : Valid (non-padded) frames in sequence
+        
+    Hidden states & features:
+        hidden_*           : Encoder hidden states (e.g., hidden_encoded, hidden_chunk)
+        feat_*             : Mel-spectrogram features
+        embedding_*        : Speaker/text embeddings
+        
+    Masks:
+        *_mask             : Attention/padding masks (suffix convention)
     """
 
     # Audio/Feature dimensions
