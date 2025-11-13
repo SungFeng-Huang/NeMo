@@ -106,6 +106,11 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         batch_size (B)      : Total number of samples in batch
         batch_idx          : Index variable for iterating over batch (0 to B-1)
         
+    Sample-related (single sample from batch):
+        sample_*           : Variables representing a single sample extracted from batch
+                            (e.g., sample_token, sample_mel, sample_waveform, sample_embedding)
+                            Use instead of *_b suffix for clarity
+        
     Token-related:
         token_*            : Speech token variables (prefer full 'token' over 'tok')
         text_token_*       : Text token variables
