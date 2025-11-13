@@ -697,7 +697,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
 
         训练总体流程（含流式/非流式两种路径）：
           1) 将离散语音 token（speech_token）嵌入，按概率走"流式切块编码"或"整段一次编码"。
-          2) 对编码器输出 h 进行 encoder_proj 得到 [B, T_h, 80]，并产出时长掩码 h_masks。
+          2) 对编码器输出 h 进行 encoder_proj 得到 [B, T_h, 80]，并产出时长掩码 hidden_mask。
           3) 将 GT 梅尔谱（speech_feat）沿时间插值到 T_h，得到 x1 = [B, 80, T_h]。
           4) 构造与 CosyVoice2 原训练一致的条件 cond（最多 30% 的随机前缀），同样对齐到 T_h。
           5) 调用 decoder.compute_loss(x1, mask, h^T, embedding, cond, streaming) 计算损失。
@@ -732,13 +732,13 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
           - token_lens:      List[int]       各 chunk 的有效长度（去掉越界 pad 后）
           - token_batch:     [N_chunk, Lmax, D]  将 token_slices pad 后的批处理张量
           - len_vec:       [N_chunk]       每个 chunk 的有效长度向量
-          - mask_tok:      [N_chunk, Lmax, 1]  token 有效位的掩码
+          - token_mask:      [N_chunk, Lmax, 1]  token 有效位的掩码
           - text_token_emb_full:  [1, T_txt, 512] 文本全序列的嵌入（如果提供 text_tokens）
           - t_ends:        List[int]       每个 chunk 当前可见的"文本历史长度"（随时间推进递增）
           - kv_hist_max:   int             所有 chunk 的最大可见文本长度（用于对齐 KV 的 pad）
           - text_ctx_batch:[N_chunk, L_ctx, 512]  cross-attn 得到的上下文序列（替代 pre_lookahead）
-          - h_c/m_c:       编码器对 chunk 批的输出与掩码（m_c: [N_chunk,1,T_enc]）
-          - Li_list:       List[int]       各 chunk 编码器的有效步数（按 m_c 统计）
+          - h_c/chunk_mask:       编码器对 chunk 批的输出与掩码（chunk_mask: [N_chunk,1,T_enc]）
+          - Li_list:       List[int]       各 chunk 编码器的有效步数（按 chunk_mask 统计）
           - h_b/mask_b:    [1, T_total,80]/[1,1,T_total]  将各 chunk 有效部分拼接回单样本时间轴
 
         非流式（streaming=False）时：
@@ -1031,9 +1031,9 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 device_target (torch.device): Target device for computations
                 
             Returns:
-                tuple: (h, h_masks) where:
+                tuple: (h, hidden_mask) where:
                     - h (torch.Tensor): Encoded hidden states from encoder [B, T_h, 80]
-                    - h_masks (torch.Tensor): Encoder output masks [B, 1, T_h] or similar
+                    - hidden_mask (torch.Tensor): Encoder output masks [B, 1, T_h] or similar
             """
             from cosyvoice.utils.mask import make_pad_mask
             
@@ -1043,12 +1043,12 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 token_len_data = token_len_data * upsample_f
             
             # token embedding with padding mask
-            mask_tok = (~make_pad_mask(token_len_data)).float().unsqueeze(-1).to(device_target)
+            token_mask = (~make_pad_mask(token_len_data)).float().unsqueeze(-1).to(device_target)
             token_data = torch.clamp(token_data, min=0)
-            token_data = self.cos2_flow.input_embedding(token_data) * mask_tok
+            token_data = self.cos2_flow.input_embedding(token_data) * token_mask
             
             # Non-streaming: strictly no context injection (pre_lookahead disabled in training)
-            h, h_masks = self.cos2_flow.encoder(token_data, token_len_data, streaming=is_streaming)
+            h, hidden_mask = self.cos2_flow.encoder(token_data, token_len_data, streaming=is_streaming)
             h = self.cos2_flow.encoder_proj(h)  # [B, T_h, 80]
             
             # Lightweight debug: confirm non-streaming path does not use context
@@ -1062,14 +1062,14 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 except Exception:
                     pass
             
-            return h, h_masks
+            return h, hidden_mask
         
-        def _build_condition_and_compute_loss(h_enc, h_masks_enc, feat_data, feat_len_data, embedding_data, is_streaming):
+        def _build_condition_and_compute_loss(h_enc, h_enc_mask, feat_data, feat_len_data, embedding_data, is_streaming):
             """Build partial cond prefix and compute decoder loss.
             
             Args:
                 h_enc (torch.Tensor): Encoded hidden states from encoder [B, T_h, D]
-                h_masks_enc (torch.Tensor): Encoder output masks [B, 1, T_h] or similar
+                h_enc_mask (torch.Tensor): Encoder output masks [B, 1, T_h] or similar
                 feat_data (torch.Tensor): Feature data for conditioning [B, T_feat, 80]
                 feat_len_data (torch.Tensor): Feature length for conditioning [B]
                 embedding_data (torch.Tensor): Embedding data for decoder
@@ -1099,8 +1099,8 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 conds[i, :index] = feat_data[i, :index]
 
             # Build mask based on encoder masks -> lengths
-            if isinstance(h_masks_enc, torch.Tensor):  # [B,1,T_h] bool
-                lengths = h_masks_enc.sum(dim=-1).squeeze(1)
+            if isinstance(h_enc_mask, torch.Tensor):  # [B,1,T_h] bool
+                lengths = h_enc_mask.sum(dim=-1).squeeze(1)
                 mask = (~make_pad_mask(lengths)).to(h_enc)
             else:
                 # fallback: full True mask
@@ -1431,12 +1431,12 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             
             return text_ctx_batch
         
-        def _reconstruct_sample_timeline(h_c, m_c, num_chunks, device_target):
+        def _reconstruct_sample_timeline(h_c, chunk_mask, num_chunks, device_target):
             """Reconstruct per-sample timeline by concatenating valid parts of each chunk.
             
             Args:
                 h_c (torch.Tensor): Encoded hidden states from encoder [N, T_h, D]
-                m_c (torch.Tensor): Encoder output masks [N, 1, T_h] or similar
+                chunk_mask (torch.Tensor): Encoder output masks [N, 1, T_h] or similar
                 num_chunks (int): Number of chunks in the batch
                 device_target (torch.device): Target device for computations
 
@@ -1447,33 +1447,33 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     - Li_list: List of valid lengths for each chunk [N]
             """
             h_parts = []
-            m_parts = []
+            mask_parts = []
             Li_list = []
             
             for i in range(num_chunks):
                 try:
-                    mi = m_c[i, 0]
-                    if mi.dtype != torch.bool:
-                        mi = mi > 0
-                    Li = int(mi.sum().item())
+                    chunk_mask_i = chunk_mask[i, 0]
+                    if chunk_mask_i.dtype != torch.bool:
+                        chunk_mask_i = chunk_mask_i > 0
+                    Li = int(chunk_mask_i.sum().item())
                 except Exception:
                     Li = int(h_c.shape[1])
                 Li_list.append(Li)
                 h_parts.append(h_c[i:i+1, :Li])
                 
-                if isinstance(m_c, torch.Tensor):
-                    m_i = m_c[i:i+1, :, :Li]
-                    if m_i.dtype != torch.bool:
-                        m_i = m_i > 0
-                    m_parts.append(m_i)
+                if isinstance(chunk_mask, torch.Tensor):
+                    chunk_mask_slice = chunk_mask[i:i+1, :, :Li]
+                    if chunk_mask_slice.dtype != torch.bool:
+                        chunk_mask_slice = chunk_mask_slice > 0
+                    mask_parts.append(chunk_mask_slice)
                 else:
-                    m_parts.append(torch.ones(1, 1, Li, dtype=torch.bool, device=device_target))
+                    mask_parts.append(torch.ones(1, 1, Li, dtype=torch.bool, device=device_target))
             
             if len(h_parts) > 0:
                 h_b = torch.cat(h_parts, dim=1)
                 h_b = self.cos2_flow.encoder_proj(h_b)
                 try:
-                    mask_b = torch.cat(m_parts, dim=-1)
+                    mask_b = torch.cat(mask_parts, dim=-1)
                 except Exception:
                     mask_b = torch.ones(1, 1, h_b.shape[1], dtype=torch.bool, device=h_b.device)
             else:
@@ -1549,24 +1549,24 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 mask_list (list): List of encoder output masks [N, 1, T_h] or similar
                 
             Returns:
-                tuple: (h, h_masks) where:
+                tuple: (h, hidden_mask) where:
                     - h: Concatenated hidden states [B, T_h_total, D]
-                    - h_masks: Concatenated masks [B, 1, T_h_total]
+                    - hidden_mask: Concatenated masks [B, 1, T_h_total]
             """
             T_list = [h_i.shape[1] for h_i in h_list]
             T_max = max(T_list) if len(T_list) > 0 else 0
             H_cat = []
             M_cat = []
-            for h_b, m_b in zip(h_list, mask_list):
+            for h_b, mask_b in zip(h_list, mask_list):
                 if h_b.shape[1] < T_max:
                     pad_len = T_max - h_b.shape[1]
                     h_b = torch.cat([h_b, h_b.new_zeros(h_b.shape[0], pad_len, h_b.shape[2])], dim=1)
-                    m_b = torch.cat([m_b, torch.zeros(m_b.shape[0], m_b.shape[1], pad_len, dtype=torch.bool, device=m_b.device)], dim=-1)
+                    mask_b = torch.cat([mask_b, torch.zeros(mask_b.shape[0], mask_b.shape[1], pad_len, dtype=torch.bool, device=mask_b.device)], dim=-1)
                 H_cat.append(h_b)
-                M_cat.append(m_b)
+                M_cat.append(mask_b)
             h = torch.cat(H_cat, dim=0) if len(H_cat) > 1 else H_cat[0]
-            h_masks = torch.cat(M_cat, dim=0) if len(M_cat) > 1 else M_cat[0]
-            return h, h_masks
+            hidden_mask = torch.cat(M_cat, dim=0) if len(M_cat) > 1 else M_cat[0]
+            return h, hidden_mask
         
         # streaming_with_text_context prob from config
         streaming = torch.rand(()) < float(getattr(self, "_stream_train_prob", 0.5))
@@ -1643,12 +1643,12 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 
                 # Encode chunks with text context
                 if isinstance(text_ctx_batch, torch.Tensor) and text_ctx_batch.numel() > 0:
-                    h_c, m_c = self.cos2_flow.encoder(token_batch, len_vec, context=text_ctx_batch, streaming=True)
+                    h_c, chunk_mask = self.cos2_flow.encoder(token_batch, len_vec, context=text_ctx_batch, streaming=True)
                 else:
-                    h_c, m_c = self.cos2_flow.encoder(token_batch, len_vec, streaming=True)
+                    h_c, chunk_mask = self.cos2_flow.encoder(token_batch, len_vec, streaming=True)
                 
                 # Reconstruct per-sample timeline
-                h_b, mask_b, Li_list = _reconstruct_sample_timeline(h_c, m_c, num_chunks, device)
+                h_b, mask_b, Li_list = _reconstruct_sample_timeline(h_c, chunk_mask, num_chunks, device)
                 
                 h_list.append(h_b)
                 mask_list.append(mask_b)
@@ -1661,13 +1661,13 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 )
             
             # Pad and concatenate across batch
-            h, h_masks = _pad_and_concatenate_batch(h_list, mask_list)
+            h, hidden_mask = _pad_and_concatenate_batch(h_list, mask_list)
         else:
             # Non-streaming training: single pass with (global) text context prefix
-            h, h_masks = _process_nonstreaming_path(token, token_len, text_tokens, upsample_factor, streaming, device)
+            h, hidden_mask = _process_nonstreaming_path(token, token_len, text_tokens, upsample_factor, streaming, device)
 
         # Build partial cond prefix and compute decoder loss
-        loss, lengths = _build_condition_and_compute_loss(h, h_masks, feat, feat_len, embedding, streaming)
+        loss, lengths = _build_condition_and_compute_loss(h, hidden_mask, feat, feat_len, embedding, streaming)
 
         # Print periodic training-time debug information
         _print_training_debug_info(loss, streaming, token_len, T_tok_orig, h, lengths, upsample_factor, token)
