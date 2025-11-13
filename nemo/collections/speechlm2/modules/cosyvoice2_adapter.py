@@ -2321,16 +2321,6 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
 
         return wav
 
-
-        wav_24k = torch.cat(wav_chunks, dim=-1)
-        out_sr = 22050
-        if self._cos2_sr != out_sr:
-            wav = nemo_resample(wav_24k, self._cos2_sr, out_sr)
-        else:
-            wav = wav_24k
-
-        return wav
-
     @torch.inference_mode()
     def offline_inference(
         self,
@@ -2398,34 +2388,4 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             wavs.append(wav)
 
         return torch.cat(wavs, dim=0)
-
-        if self._val_debug:
-            try:
-                logging.info(f"[cos2.val] wav24k shape={tts_speech_24k.shape} mean/std={tts_speech_24k.mean().item():.4f}/{tts_speech_24k.std().item():.4f}")
-            except Exception:
-                pass
-
-        # Keep downstream unchanged: resample 24k -> 22.05k to match existing code paths
-        out_sr = 22050
-        if self._cos2_sr != out_sr:
-            tts_speech = nemo_resample(tts_speech_24k, self._cos2_sr, out_sr)
-        else:
-            tts_speech = tts_speech_24k
-
-        if self._val_debug:
-            try:
-                logging.info(f"[cos2.val] wav22050 shape={tts_speech.shape} mean/std={tts_speech.mean().item():.4f}/{tts_speech.std().item():.4f}")
-            except Exception:
-                pass
-
-        return tts_speech, tts_mel
-
-        # Keep downstream unchanged: resample 24k -> 22.05k to match existing code paths
-        out_sr = 22050
-        if self._cos2_sr != out_sr:
-            tts_speech = nemo_resample(tts_speech_24k, self._cos2_sr, out_sr)
-        else:
-            tts_speech = tts_speech_24k
-
-        return tts_speech, tts_mel
 
