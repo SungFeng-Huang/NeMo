@@ -733,7 +733,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
           - token_batch:     [N_chunk, Lmax, D]  将 token_slices pad 后的批处理张量
           - len_vec:       [N_chunk]       每个 chunk 的有效长度向量
           - mask_tok:      [N_chunk, Lmax, 1]  token 有效位的掩码
-          - emb_txt_full:  [1, T_txt, 512] 文本全序列的嵌入（如果提供 text_tokens）
+          - text_token_emb_full:  [1, T_txt, 512] 文本全序列的嵌入（如果提供 text_tokens）
           - t_ends:        List[int]       每个 chunk 当前可见的"文本历史长度"（随时间推进递增）
           - kv_hist_max:   int             所有 chunk 的最大可见文本长度（用于对齐 KV 的 pad）
           - text_ctx_batch:[N_chunk, L_ctx, 512]  cross-attn 得到的上下文序列（替代 pre_lookahead）
@@ -808,14 +808,14 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             return token, token_len, feat, feat_len, embedding
         
         def _build_cross_attention_text_context(
-            emb_txt_full, txt_len_b, chunk_starts_token, chunk_ends_token, token_ids_b, token_len_b,
+            text_token_emb_full, text_token_len_b, chunk_starts_token, chunk_ends_token, token_ids_b, token_len_b,
             token_emb_orig_full, num_chunks, kv_hist_max, t_ends, device_target, b_idx
         ):
             """Build text context using cross-attention mechanism for streaming chunks.
             
             Args:
-                emb_txt_full (torch.Tensor): Full text embeddings [1, N, D]
-                txt_len_b (int): Text token length for the current sample
+                text_token_emb_full (torch.Tensor): Full text embeddings [1, N, D]
+                text_token_len_b (int): Text token length for the current sample
                 chunk_starts_token (list): Start indices for each chunk on token axis
                 chunk_ends_token (list): End indices for each chunk on token axis
                 token_ids_b (torch.Tensor): Speech tokens for the current sample [1, T_tok]
@@ -843,12 +843,12 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             
             L_ctx = self._L_ctx_default
             # Prepare KV (text embeddings) padded/truncated to kv_hist_max; per-chunk variable visible length via mask_kv
-            KV = emb_txt_full[:, :kv_hist_max].repeat(num_chunks, 1, 1)  # [N, kv_hist_max, D]
+            KV = text_token_emb_full[:, :kv_hist_max].repeat(num_chunks, 1, 1)  # [N, kv_hist_max, D]
             mask_kv = torch.zeros(num_chunks, 1, kv_hist_max, dtype=torch.bool, device=device_target)
             for i, te in enumerate(t_ends):
                 t_end_i = int(min(int(te), kv_hist_max))
                 if t_end_i > 0:
-                    KV[i, :t_end_i] = emb_txt_full[0, :t_end_i]
+                    KV[i, :t_end_i] = text_token_emb_full[0, :t_end_i]
                     mask_kv[i, 0, :t_end_i] = True
 
             # Build speech histories per chunk on ORIGINAL token axis (pre-upsampling): use all past + current chunk tokens
@@ -993,11 +993,11 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             
             return text_ctx_batch
         
-        def _build_fallback_text_context(emb_txt_full, t_ends, L_ctx, device_target):
+        def _build_fallback_text_context(text_token_emb_full, t_ends, L_ctx, device_target):
             """Build simple right-aligned text window per chunk using t_end (fallback when cross-attn disabled).
             
             Args:
-                emb_txt_full (torch.Tensor): Full text embeddings [1, N, D]
+                text_token_emb_full (torch.Tensor): Full text embeddings [1, N, D]
                 t_ends (list or torch.Tensor): End indices for each chunk [N]
                 L_ctx (int): Context length to build
                 device_target (torch.device): Target device for computations
@@ -1008,7 +1008,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             ctx_list = []
             for te in t_ends:
                 t_end = int(te)
-                t_win_emb = emb_txt_full[:, :t_end]  # [1, N, D] take up to t_end
+                t_win_emb = text_token_emb_full[:, :t_end]  # [1, N, D] take up to t_end
                 if t_win_emb.shape[1] < L_ctx:
                     pad = torch.zeros(1, L_ctx - t_win_emb.shape[1], t_win_emb.shape[2], device=device_target, dtype=t_win_emb.dtype)
                     text_ctx = torch.cat([t_win_emb, pad], dim=1)  # right-pad to L_ctx
@@ -1193,45 +1193,45 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 device_target (torch.device): Target device to move tensors to
                 
             Returns:
-                tuple: (token_ids_b, token_len_b, txt_ids_b, txt_len_b) where:
+                tuple: (token_ids_b, token_len_b, text_token_ids_b, text_token_len_b) where:
                     - token_ids_b: Speech tokens for sample b_idx, shape [1, T_tok]
                     - token_len_b: Effective token length for sample b_idx (int)
-                    - txt_ids_b: Text tokens for sample b_idx, shape [1, T_text] or None
-                    - txt_len_b: Effective text length for sample b_idx (int)
+                    - text_token_ids_b: Text tokens for sample b_idx, shape [1, T_text] or None
+                    - text_token_len_b: Effective text length for sample b_idx (int)
             """
             token_ids_b = batch_dict['speech_token'][b_idx:b_idx+1].to(device_target)
             token_len_b = int(T_tok_orig_all[b_idx].item())
             
             # text tokens and effective length for this sample
             if isinstance(text_tokens_all, torch.Tensor) and text_tokens_all.size(0) == batch_size:
-                txt_ids_b = text_tokens_all[b_idx:b_idx+1].to(device_target)
+                text_token_ids_b = text_tokens_all[b_idx:b_idx+1].to(device_target)
             else:
-                txt_ids_b = text_tokens_all.to(device_target) if isinstance(text_tokens_all, torch.Tensor) else None
+                text_token_ids_b = text_tokens_all.to(device_target) if isinstance(text_tokens_all, torch.Tensor) else None
             
-            txt_lens = batch_dict.get('text_token_len', None)
-            if isinstance(txt_lens, torch.Tensor) and txt_lens.numel() >= (b_idx + 1):
-                txt_len_b = int(txt_lens[b_idx].item())
+            text_token_lens = batch_dict.get('text_token_len', None)
+            if isinstance(text_token_lens, torch.Tensor) and text_token_lens.numel() >= (b_idx + 1):
+                text_token_len_b = int(text_token_lens[b_idx].item())
             else:
-                txt_len_b = int(txt_ids_b.shape[1]) if isinstance(txt_ids_b, torch.Tensor) else 0
+                text_token_len_b = int(text_token_ids_b.shape[1]) if isinstance(text_token_ids_b, torch.Tensor) else 0
             
-            return token_ids_b, token_len_b, txt_ids_b, txt_len_b
+            return token_ids_b, token_len_b, text_token_ids_b, text_token_len_b
         
         
-        def _precompute_token_and_text_embeddings(token_ids_b, token_len_b, txt_ids_b, txt_len_b, upsample_f):
+        def _precompute_token_and_text_embeddings(token_ids_b, token_len_b, text_token_ids_b, text_token_len_b, upsample_f):
             """Precompute upsampled token embeddings and full text embeddings.
             
             Args:
                 token_ids_b (torch.Tensor): Speech tokens for the current sample [1, T_tok]
                 token_len_b (int): Effective token length for the current sample
-                txt_ids_b (torch.Tensor): Text tokens for the current sample [1, T_text] or None
-                txt_len_b (int): Effective text length for the current sample
+                text_token_ids_b (torch.Tensor): Text tokens for the current sample [1, T_text] or None
+                text_token_len_b (int): Effective text length for the current sample
                 upsample_f (int): Upsampling factor used for token alignment
             
             Returns:
-                tuple: (token_emb_full, T_eff_full, emb_txt_full) where:
+                tuple: (token_emb_full, T_eff_full, text_token_emb_full) where:
                     - token_emb_full: Upsampled token embeddings [1, T_eff_full, D]
                     - T_eff_full: Effective token length after upsampling
-                    - emb_txt_full: Full text embeddings [1, T_text, D] or None
+                    - text_token_emb_full: Full text embeddings [1, T_text, D] or None
             """
             # Upsample tokens
             if upsample_f > 1 and token_ids_b.numel() > 0:
@@ -1243,13 +1243,13 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             token_emb_full = self.cos2_flow.input_embedding(token_ids_eff_full)
             
             # Pre-embed full text once
-            if isinstance(txt_ids_b, torch.Tensor) and txt_ids_b.numel() > 0:
-                txt_ids_b = torch.clamp(txt_ids_b[:, :txt_len_b], min=0, max=self._text_vocab_size - 1)
-                emb_txt_full = self.text_context_emb(txt_ids_b)
+            if isinstance(text_token_ids_b, torch.Tensor) and text_token_ids_b.numel() > 0:
+                text_token_ids_b = torch.clamp(text_token_ids_b[:, :text_token_len_b], min=0, max=self._text_vocab_size - 1)
+                text_token_emb_full = self.text_context_emb(text_token_ids_b)
             else:
-                emb_txt_full = None
+                text_token_emb_full = None
             
-            return token_emb_full, T_eff_full, emb_txt_full
+            return token_emb_full, T_eff_full, text_token_emb_full
         
         def _compute_first_chunk_length(block_size, token_len_b, upsample_f, b_idx, device_target):
             """Compute first chunk length (possibly randomized) and log if needed.
@@ -1372,14 +1372,14 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             return token_batch, len_vec, L_max
         
         def _build_text_context_for_chunks(
-            emb_txt_full, txt_len_b, chunk_starts_token, chunk_ends_token, num_chunks, 
+            text_token_emb_full, text_token_len_b, chunk_starts_token, chunk_ends_token, num_chunks, 
             token_ids_b, token_len_b, b_idx, device_target
         ):
             """Build batched text context for all chunks (debug + cross-attn or fallback).
             
             Args:
-                emb_txt_full (torch.Tensor): Full text embeddings [1, N, D]
-                txt_len_b (int): Text token length for the current sample
+                text_token_emb_full (torch.Tensor): Full text embeddings [1, N, D]
+                text_token_len_b (int): Text token length for the current sample
                 chunk_starts_token (list): Start indices for each chunk on token axis
                 chunk_ends_token (list): End indices for each chunk on token axis
                 num_chunks (int): Number of chunks in the batch
@@ -1396,12 +1396,12 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             Returns:
                 text_ctx_batch (torch.Tensor): Text context batch [N, L_ctx, D] or None
             """
-            if not isinstance(emb_txt_full, torch.Tensor) or emb_txt_full.numel() == 0:
+            if not isinstance(text_token_emb_full, torch.Tensor) or text_token_emb_full.numel() == 0:
                 return None
             
             L_ctx = self._L_ctx_default
-            t_ends = [int(min(int(e), int(txt_len_b))) for e in chunk_ends_token]
-            kv_hist_max = int(min(int(txt_len_b), emb_txt_full.shape[1]))
+            t_ends = [int(min(int(e), int(text_token_len_b))) for e in chunk_ends_token]
+            kv_hist_max = int(min(int(text_token_len_b), text_token_emb_full.shape[1]))
             
             # optional debug: show alignment for chunks spaced every K within the batch
             if getattr(self, '_debug_text_align', False) and (b_idx == 0) and ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0):
@@ -1415,7 +1415,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                         te = int(t_ends[i])
                         kvlen = int(min(te, kv_hist_max))
                         ctx_src = 'xattn' if self._use_cross_text_attn else 'prefix'
-                        logging.info(f"[cos2.train.text-align] b={b_idx} chunk={i}/{num_chunks} t_range=[{st_token_i}:{en_token_i}) -> t_end={te}/{int(txt_len_b)} kv_used=[0:{kvlen}) ctx={ctx_src} L_ctx={L_ctx} (token=[{st_token_i}:{en_token_i}))")
+                        logging.info(f"[cos2.train.text-align] b={b_idx} chunk={i}/{num_chunks} t_range=[{st_token_i}:{en_token_i}) -> t_end={te}/{int(text_token_len_b)} kv_used=[0:{kvlen}) ctx={ctx_src} L_ctx={L_ctx} (token=[{st_token_i}:{en_token_i}))")
                     except Exception as e:
                         logging.info(f"[cos2.train.text-align] warn: {e}")
             
@@ -1424,11 +1424,11 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 token_ids_orig = torch.clamp(token_ids_b[:, :token_len_b], min=0)
                 token_emb_orig_full = self.cos2_flow.input_embedding(token_ids_orig)
                 text_ctx_batch = _build_cross_attention_text_context(
-                    emb_txt_full, txt_len_b, chunk_starts_token, chunk_ends_token, token_ids_b, token_len_b,
+                    text_token_emb_full, text_token_len_b, chunk_starts_token, chunk_ends_token, token_ids_b, token_len_b,
                     token_emb_orig_full, num_chunks, kv_hist_max, t_ends, device_target, b_idx
                 )
             elif not self._use_cross_text_attn:
-                text_ctx_batch = _build_fallback_text_context(emb_txt_full, t_ends, L_ctx, device_target)
+                text_ctx_batch = _build_fallback_text_context(text_token_emb_full, t_ends, L_ctx, device_target)
             else:
                 text_ctx_batch = None
             
@@ -1596,7 +1596,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             
             for batch_idx in range(batch_size):
                 # Extract sample tokens and text
-                token_ids_b, token_len_b, txt_ids_b, txt_len_b = _extract_sample_tokens_and_text(
+                token_ids_b, token_len_b, text_token_ids_b, text_token_len_b = _extract_sample_tokens_and_text(
                     batch, batch_idx, text_tokens, T_tok_orig, batch_size, device
                 )
                 
@@ -1604,8 +1604,8 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 block_size = self._determine_chunk_block_size()
                 
                 # Precompute upsampled token and text embeddings
-                token_emb_full, T_eff_full, emb_txt_full = _precompute_token_and_text_embeddings(
-                    token_ids_b, token_len_b, txt_ids_b, txt_len_b, upsample_factor
+                token_emb_full, T_eff_full, text_token_emb_full = _precompute_token_and_text_embeddings(
+                    token_ids_b, token_len_b, text_token_ids_b, text_token_len_b, upsample_factor
                 )
                 
                 # Compute first chunk length (possibly randomized)
@@ -1640,7 +1640,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 
                 # Build text context for all chunks
                 text_ctx_batch = _build_text_context_for_chunks(
-                    emb_txt_full, txt_len_b, chunk_starts_token, chunk_ends_token, num_chunks,
+                    text_token_emb_full, text_token_len_b, chunk_starts_token, chunk_ends_token, num_chunks,
                     token_ids_b, token_len_b, batch_idx, device
                 )
                 
@@ -1659,7 +1659,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 # Print micro-batch debug info
                 _print_microbatch_debug_info(
                     batch_idx, num_chunks, L_max, upsample_factor, block_size, 
-                    emb_txt_full.shape[1] if isinstance(emb_txt_full, torch.Tensor) else 0,
+                    text_token_emb_full.shape[1] if isinstance(text_token_emb_full, torch.Tensor) else 0,
                     T_eff_full, Li_list, token_len_b, device
                 )
             
