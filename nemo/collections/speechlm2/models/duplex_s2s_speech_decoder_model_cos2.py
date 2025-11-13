@@ -185,6 +185,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 cos2_config_override=cos2_config_override,
                 warmstart_config=warm_cfg,
                 stream_train_prob=float(self.cfg.get("cos2_stream_train_prob", 0.5)),
+                use_text_context_train=bool(self.cfg.get("cos2_use_text_context_train", False)),
                 token_overlap=int(self.cfg.get("cos2_token_overlap", 0)),
                 is_debug=bool(self.cfg.get("is_debug", False)),
                 print_per_n_chunk=int(self.cfg.get("print_per_n_chunk", 50)),

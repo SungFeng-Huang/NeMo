@@ -1,5 +1,6 @@
 import os
 import sys
+import random
 from typing import Dict, Optional
 
 import torch
@@ -108,6 +109,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         cos2_config_override: Optional[Dict] = None,
         warmstart_config: Optional[Dict] = None,
         stream_train_prob: Optional[float] = None,
+        use_text_context_train: Optional[bool] = None,
         token_overlap: Optional[int] = None,
         is_debug: Optional[bool] = None,
         print_per_n_chunk: Optional[int] = None,
@@ -125,6 +127,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             cos2_config_override: Override CosyVoice2 config dictionary
             warmstart_config: Warmstart configuration dictionary
             stream_train_prob: Probability of training in streaming mode
+            use_text_context_train: Whether to use text context in training
             token_overlap: Token overlap length
             is_debug: Debug mode toggle
             print_per_n_chunk: Print frequency for streaming chunks
@@ -138,6 +141,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         self._cos2_config_override = cos2_config_override or {}
         self._warm_cfg = warmstart_config or {}
         self._stream_train_prob = 0.5 if stream_train_prob is None else float(stream_train_prob)
+        self._use_text_context_train = bool(use_text_context_train) if use_text_context_train is not None else False
         self._token_overlap_len_cfg = 0 if token_overlap is None else int(token_overlap)
         self._fixed_window_pad = bool(stream_fixed_window_pad) if stream_fixed_window_pad is not None else False
 
@@ -660,6 +664,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
 
         关键参数/成员（仅与本函数相关）：
           - _stream_train_prob: float  进入流式训练分支的概率（其余样本走非流式）
+          - _use_text_context_train: 是否使用text context in training
           - token_mel_ratio (tmr):     每个 token 约对应的 mel 帧数（默认 4.0）
           - enc_up:                    编码器时间上采样因子（UpsampleConformerEncoder，固定 2.0）
           - upsample_factor:           round(tmr/enc_up)，通常为 2；决定 token 时间与 encoder 时间对齐关系
@@ -967,7 +972,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 text_ctx_batch = None
             return text_ctx_batch
         
-        def _process_nonstreaming_path(token_data, token_len_data, text_tokens_data, upsample_f, device_target):
+        def _process_nonstreaming_path(token_data, token_len_data, text_tokens_data, upsample_f, is_streaming, device_target):
             """Process non-streaming training: single pass without text context injection.
             
             Args:
@@ -975,6 +980,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 token_len_data (torch.Tensor): Token lengths for each sample in batch [B]
                 text_tokens_data (torch.Tensor): Text tokens for conditioning [B, T_text] or None
                 upsample_f (int): Upsampling factor used for token alignment
+                is_streaming (bool): Whether in streaming mode
                 device_target (torch.device): Target device for computations
                 
             Returns:
@@ -995,7 +1001,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             token_data = self.cos2_flow.input_embedding(token_data) * mask_tok
             
             # Non-streaming: strictly no context injection (pre_lookahead disabled in training)
-            h, h_masks = self.cos2_flow.encoder(token_data, token_len_data, streaming=False)
+            h, h_masks = self.cos2_flow.encoder(token_data, token_len_data, streaming=is_streaming)
             h = self.cos2_flow.encoder_proj(h)  # [B, T_h, 80]
             
             # Lightweight debug: confirm non-streaming path does not use context
@@ -1011,13 +1017,14 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             
             return h, h_masks
         
-        def _build_condition_and_compute_loss(h_enc, h_masks_enc, feat_data, embedding_data, is_streaming, device_target):
+        def _build_condition_and_compute_loss(h_enc, h_masks_enc, feat_data, feat_len_data, embedding_data, is_streaming, device_target):
             """Build partial cond prefix and compute decoder loss.
             
             Args:
                 h_enc (torch.Tensor): Encoded hidden states from encoder [B, T_h, D]
                 h_masks_enc (torch.Tensor): Encoder output masks [B, 1, T_h] or similar
                 feat_data (torch.Tensor): Feature data for conditioning [B, T_feat, 80]
+                feat_len_data (torch.Tensor): Feature length for conditioning [B]
                 embedding_data (torch.Tensor): Embedding data for decoder
                 is_streaming (bool): Whether in streaming mode
                 device_target (torch.device): Target device for computations
@@ -1032,20 +1039,18 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             # Build partial cond prefix consistent with CosyVoice2 training (<=30% prefix)
             # Then resample to match encoder output length T_h
             T_h = h_enc.shape[1]
-            conds = feat_data.new_zeros((feat_data.shape[0], T_h, feat_data.shape[2]))  # [B, T_h, 80]
-            for i in range(feat_data.shape[0]):
-                max_prefix = int(0.3 * T_h)
-                prefix = int(torch.randint(low=0, high=max_prefix + 1, size=(1,), device=feat_data.device).item()) if max_prefix > 0 else 0
-                prefix = min(prefix, T_h)
-                if prefix > 0:
-                    # src_time: [T_feat, 80]
-                    src_time = feat_data[i]  # [T_src, 80]
-                    # resize along time to T_h using 1D interpolate over length dimension
-                    if src_time.shape[0] != T_h:
-                        src_chw = src_time.transpose(0, 1).unsqueeze(0)        # [1, 80, T_src]
-                        src_res = F.interpolate(src_chw, size=T_h, mode='linear', align_corners=False)
-                        src_time = src_res.squeeze(0).transpose(0, 1).contiguous()  # [T_h, 80]
-                    conds[i, :prefix] = src_time[:prefix]
+            feat_dim = feat_data.shape[2] # 80
+
+            # Interpolate feat_data to T_h
+            feat_len_data = feat_len_data * T_h / feat_data.shape[1] # [B]
+            feat_data = F.interpolate(feat_data.unsqueeze(dim=1), size=(T_h, feat_dim), mode='nearest').squeeze(dim=1) # [B, T_h, 80]
+
+            conds = feat_data.new_zeros(feat_data.shape)  # [B, T_h, 80]
+            for i, j in enumerate(feat_len_data):
+                if random.random() < 0.5:
+                    continue
+                index = random.randint(0, int(0.3 * j))
+                conds[i, :index] = feat_data[i, :index]
 
             # Build mask based on encoder masks -> lengths
             if isinstance(h_masks_enc, torch.Tensor):  # [B,1,T_h] bool
@@ -1056,10 +1061,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 mask = torch.ones(h_enc.shape[0], h_enc.shape[1], dtype=torch.bool, device=h_enc.device)
 
             # resample feat to T_h (target x1)
-            feat_chw = feat_data.transpose(1, 2)  # [B, 80, T_feat]
-            if feat_chw.shape[-1] != T_h:
-                feat_chw = F.interpolate(feat_chw, size=T_h, mode='linear', align_corners=False)
-            x1 = feat_chw  # [B, 80, T_h]
+            x1 = feat_data.transpose(1, 2).contiguous()  # [B, 80, T_h]
 
             conds_chw = conds.transpose(1, 2).contiguous()  # [B, 80, T_h]
 
@@ -1520,7 +1522,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             h_masks = torch.cat(M_cat, dim=0) if len(M_cat) > 1 else M_cat[0]
             return h, h_masks
         
-        # streaming prob from config
+        # streaming_with_text_context prob from config
         streaming = torch.rand(()) < float(getattr(self, "_stream_train_prob", 0.5))
         
         # Infer actual device and prepare inputs
@@ -1537,7 +1539,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
 
         from cosyvoice.utils.mask import make_pad_mask  # local import after sys.path patch
 
-        if bool(streaming):
+        if bool(streaming) and self._use_text_context_train:
             # Streaming-like training: per-sample, per-chunk encode with sliding text window
             B = token.shape[0]
             h_list = []
@@ -1616,10 +1618,10 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             h, h_masks = _pad_and_concatenate_batch(h_list, mask_list)
         else:
             # Non-streaming training: single pass with (global) text context prefix
-            h, h_masks = _process_nonstreaming_path(token, token_len, text_tokens, upsample_factor, device)
+            h, h_masks = _process_nonstreaming_path(token, token_len, text_tokens, upsample_factor, streaming, device)
 
         # Build partial cond prefix and compute decoder loss
-        loss, lengths = _build_condition_and_compute_loss(h, h_masks, feat, embedding, streaming, device)
+        loss, lengths = _build_condition_and_compute_loss(h, h_masks, feat, feat_len, embedding, streaming, device)
 
         # Print periodic training-time debug information
         _print_training_debug_info(loss, streaming, token_len, T_tok_orig, h, lengths, upsample_factor, token)
