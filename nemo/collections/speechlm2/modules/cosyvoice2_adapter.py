@@ -101,6 +101,25 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
     - .stream_inference(...): streaming decode with overlap-fade and HiFT cache (24k -> 22.05k)
     """
 
+    # Audio/Feature dimensions
+    MEL_DIM = 80
+    SPEAKER_EMBEDDING_DIM = 192
+    DEFAULT_CONTEXT_DIM = 512 # Attention dim is 512 per CosyVoice2 encoder input size
+    
+    # Sample rates
+    OUTPUT_SAMPLE_RATE = 22050
+    DEFAULT_COSYVOICE2_SAMPLE_RATE = 24000
+    
+    # Token-mel alignment
+    DEFAULT_TOKEN_MEL_RATIO = 4.0 # 50fps / 4 = 12.5 fps; one token -> 4 mel frames in CosyVoice2
+    ENCODER_UPSAMPLE_FACTOR = 2.0 # Upsample factor from CosyVoice2 encoder to CosyVoice2 flow
+    
+    # Vocoder settings
+    MEL_HOP_LENGTH = 480 # 24k / 480 = 50 fps; one mel frame -> 480 waveform samples in HiFT
+    
+    # Text/token settings
+    DEFAULT_TEXT_VOCAB_SIZE = 32000
+
     def __init__(
         self,
         cos2_config_path: str,
@@ -258,13 +277,13 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         # The pre_lookahead_len (L_ctx) controls expected context length to encoder
         self._L_ctx_default = int(getattr(self.cos2_flow.encoder.pre_lookahead_layer, 'pre_lookahead_len', 4))
         # Attention dim is 512 per CosyVoice2 encoder input size
-        self._ctx_dim = 512
+        self._ctx_dim = self.DEFAULT_CONTEXT_DIM
 
         # Text embedding for context-based lookahead (initialized here; trained later if needed)
         # infer text vocab size from env (default 32000)
-        text_vocab_size = int(os.environ.get("COS2_TEXT_VOCAB_SIZE", "32000"))
+        text_vocab_size = int(os.environ.get("COS2_TEXT_VOCAB_SIZE", str(self.DEFAULT_TEXT_VOCAB_SIZE)))
         self._text_vocab_size = text_vocab_size
-        self.text_context_emb = torch.nn.Embedding(self._text_vocab_size, 512)
+        self.text_context_emb = torch.nn.Embedding(self._text_vocab_size, self._ctx_dim)
 
         # Create cross-attention layer once with all configs resolved
         self.cross_text_attn = MultiHeadedAttention(
@@ -332,7 +351,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
 
 
 
-        self._cos2_sr = int(configs.get("sample_rate", 24000)) if isinstance(configs, dict) else 24000
+        self._cos2_sr = int(configs.get("sample_rate", self.DEFAULT_COSYVOICE2_SAMPLE_RATE)) if isinstance(configs, dict) else self.DEFAULT_COSYVOICE2_SAMPLE_RATE
         # Lazy-initialized vocoder (HiFT)
         self._hift = None
         # Streaming overlap/cache buffers
@@ -345,7 +364,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         # prefer YAML-configured token overlap; default 0 for CosyVoice2
         self._token_overlap_len = int(self._token_overlap_len_cfg)
         # 24k / 480 = 50 fps; one mel frame -> 480 waveform samples in HiFT
-        self._mel_hop = 480
+        self._mel_hop = self.MEL_HOP_LENGTH
         mel_fps = float(self._cos2_sr) / float(self._mel_hop)
         self._mel_overlap_len = int(self._token_overlap_len / token_fps * mel_fps)
         self._mel_window = np.hamming(max(2 * self._mel_overlap_len, 2))
@@ -637,8 +656,8 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         Returns:
             upsample_factor (int): Upsampling factor (typically 2)
         """
-        tmr = float(getattr(self.cos2_flow, 'token_mel_ratio', 4.0))
-        enc_up = 2.0
+        tmr = float(getattr(self.cos2_flow, 'token_mel_ratio', self.DEFAULT_TOKEN_MEL_RATIO))
+        enc_up = self.ENCODER_UPSAMPLE_FACTOR
         upsample_factor = max(1, int(round(tmr / enc_up)))
         return upsample_factor
 
@@ -744,7 +763,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             token = batch_dict['speech_token'].to(target_device)
             token_len = batch_dict['speech_token_len'].to(target_device)
             feat = batch_dict['speech_feat'].to(target_device)
-            if feat.ndim == 3 and feat.shape[1] == 80:  # [B, 80, T] -> [B, T, 80]
+            if feat.ndim == 3 and feat.shape[1] == self.MEL_DIM:  # [B, MEL_DIM, T] -> [B, T, MEL_DIM]
                 feat = feat.transpose(1, 2).contiguous()
             feat_len = batch_dict['speech_feat_len'].to(target_device)
 
@@ -1431,7 +1450,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 except Exception:
                     mask_b = torch.ones(1, 1, h_b.shape[1], dtype=torch.bool, device=h_b.device)
             else:
-                h_b = torch.zeros(1, 0, 80, device=device_target)
+                h_b = torch.zeros(1, 0, self.MEL_DIM, device=device_target)
                 mask_b = torch.zeros(1, 1, 0, dtype=torch.bool, device=device_target)
             
             return h_b, mask_b, Li_list
@@ -1569,7 +1588,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 
                 # Handle empty chunks case
                 if num_chunks == 0:
-                    h_b = torch.zeros(1, 0, 80, device=device)
+                    h_b = torch.zeros(1, 0, self.MEL_DIM, device=device)
                     mask_b = torch.zeros(1, 1, 0, dtype=torch.bool, device=device)
                     h_list.append(h_b)
                     mask_list.append(mask_b)
@@ -1583,7 +1602,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 
                 # Handle case where slicing produced no valid chunks
                 if tok_batch is None:
-                    h_b = torch.zeros(1, 0, 80, device=device)
+                    h_b = torch.zeros(1, 0, self.MEL_DIM, device=device)
                     mask_b = torch.zeros(1, 1, 0, dtype=torch.bool, device=device)
                     h_list.append(h_b)
                     mask_list.append(mask_b)
@@ -1636,8 +1655,8 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         token: torch.Tensor,
         uuid: str,
         prompt_token: torch.Tensor = torch.zeros(1, 0, dtype=torch.int64),
-        prompt_feat: torch.Tensor = torch.zeros(1, 0, 80),
-        embedding: torch.Tensor = torch.zeros(1, 192),
+        prompt_feat: torch.Tensor = None,
+        embedding: torch.Tensor = None,
         finalize: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Decode tokens to waveform using CosyVoice2 flow + HiFT vocoder.
@@ -1677,8 +1696,8 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         for b in range(B):
             tok_b = torch.clamp(token[b : b + 1].to(device), min=0)
             ptok_b = prompt_token[b : b + 1].to(device) if (prompt_token is not None and prompt_token.numel() > 0 and prompt_token.size(0) == B) else (prompt_token.to(device) if (prompt_token is not None and prompt_token.numel() > 0) else torch.zeros(1, 0, dtype=torch.int64, device=device))
-            pfeat_b = prompt_feat[b : b + 1].to(device) if (prompt_feat is not None and prompt_feat.numel() > 0 and prompt_feat.size(0) == B) else (prompt_feat.to(device) if (prompt_feat is not None and prompt_feat.numel() > 0) else torch.zeros(1, 0, 80, device=device))
-            emb_b = (embedding[b : b + 1].to(device) if (embedding is not None and embedding.size(0) == B) else (embedding.to(device) if embedding is not None else torch.zeros(1, 192, device=device)))
+            pfeat_b = prompt_feat[b : b + 1].to(device) if (prompt_feat is not None and prompt_feat.numel() > 0 and prompt_feat.size(0) == B) else (prompt_feat.to(device) if (prompt_feat is not None and prompt_feat.numel() > 0) else torch.zeros(1, 0, self.MEL_DIM, device=device))
+            emb_b = (embedding[b : b + 1].to(device) if (embedding is not None and embedding.size(0) == B) else (embedding.to(device) if embedding is not None else torch.zeros(1, self.SPEAKER_EMBEDDING_DIM, device=device)))
 
             if vocab_max is not None and vocab_max >= 0:
                 tok_b = torch.clamp(tok_b, min=0, max=vocab_max)
@@ -1726,7 +1745,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         # HiFT vocoder: mel->wav (CosyVoice2 uses 24kHz by default)
         tts_speech_24k, _ = self._hift.inference(speech_feat=tts_mel)
         # Keep downstream unchanged: resample 24k -> 22.05k to match existing code paths
-        out_sr = 22050
+        out_sr = self.OUTPUT_SAMPLE_RATE
         if self._cos2_sr != out_sr:
             tts_speech = nemo_resample(tts_speech_24k, self._cos2_sr, out_sr)
         else:
@@ -1929,7 +1948,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                                 _v_list = [int(x) for x in gt_mel_len.view(-1).tolist()]
                         else:
                             _v_list = [int(gt_mel_len)]
-                        gt_sec_list = [round(v * 256.0 / 22050.0, 3) for v in _v_list]
+                        gt_sec_list = [round(v * 256.0 / float(self.OUTPUT_SAMPLE_RATE), 3) for v in _v_list]
                         _v = _v_list[0] if len(_v_list) == 1 else _v_list
                         _s = gt_sec_list[0] if len(gt_sec_list) == 1 else gt_sec_list
                         gt_info = f" gt_mel_len={_v} gt_sec={_s}"
@@ -1974,7 +1993,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         if len(wav_chunks) == 0:
             return torch.zeros(B, 0, device=device)
         wav_24k = torch.cat(wav_chunks, dim=-1)
-        out_sr = 22050
+        out_sr = self.OUTPUT_SAMPLE_RATE
         if self._cos2_sr != out_sr:
             wav = nemo_resample(wav_24k, self._cos2_sr, out_sr)
         else:
@@ -2263,7 +2282,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                                         _v_list = [int(x) for x in gt_mel_len.view(-1).tolist()]
                                 else:
                                     _v_list = [int(gt_mel_len)]
-                                gt_sec_list = [round(v * 256.0 / 22050.0, 3) for v in _v_list]
+                                gt_sec_list = [round(v * 256.0 / float(self.OUTPUT_SAMPLE_RATE), 3) for v in _v_list]
                                 _v = _v_list[0] if len(_v_list) == 1 else _v_list
                                 _s = gt_sec_list[0] if len(gt_sec_list) == 1 else gt_sec_list
                                 gt_info = f" gt_mel_len={_v} gt_sec={_s}"
@@ -2287,7 +2306,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                                     _v_list = [int(x) for x in gt_mel_len.view(-1).tolist()]
                             else:
                                 _v_list = [int(gt_mel_len)]
-                            gt_sec_list = [round(v * 256.0 / 22050.0, 3) for v in _v_list]
+                            gt_sec_list = [round(v * 256.0 / float(self.OUTPUT_SAMPLE_RATE), 3) for v in _v_list]
                             _v = _v_list[0] if len(_v_list) == 1 else _v_list
                             _s = gt_sec_list[0] if len(gt_sec_list) == 1 else gt_sec_list
                             gt_info = f" gt_mel_len={_v} gt_sec={_s}"
@@ -2313,7 +2332,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             wav_chunks.append(speech_24k)
 
         wav_24k = torch.cat(wav_chunks, dim=-1)
-        out_sr = 22050
+        out_sr = self.OUTPUT_SAMPLE_RATE
         if self._cos2_sr != out_sr:
             wav = nemo_resample(wav_24k, self._cos2_sr, out_sr)
         else:
@@ -2380,7 +2399,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             # one-shot vocoder to avoid boundary artifacts
             speech_24k, _ = self._hift.inference(speech_feat=mel_b)
             # resample once at the end
-            out_sr = 22050
+            out_sr = self.OUTPUT_SAMPLE_RATE
             if self._cos2_sr != out_sr:
                 wav = nemo_resample(speech_24k, self._cos2_sr, out_sr)
             else:
