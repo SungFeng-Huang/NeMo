@@ -808,17 +808,15 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             return token, token_len, feat, feat_len, embedding
         
         def _build_cross_attention_text_context(
-            text_token_emb_full, text_token_len_b, chunk_starts_token, chunk_ends_token, token_ids_b, token_len_b,
+            text_token_emb_full, chunk_starts_token, chunk_ends_token, token_len_b,
             token_emb_orig_full, num_chunks, kv_hist_max, t_ends, device_target, b_idx
         ):
             """Build text context using cross-attention mechanism for streaming chunks.
             
             Args:
                 text_token_emb_full (torch.Tensor): Full text embeddings [1, N, D]
-                text_token_len_b (int): Text token length for the current sample
                 chunk_starts_token (list): Start indices for each chunk on token axis
                 chunk_ends_token (list): End indices for each chunk on token axis
-                token_ids_b (torch.Tensor): Speech tokens for the current sample [1, T_tok]
                 token_len_b (int): Effective token length for the current sample
                 token_emb_orig_full (torch.Tensor): Original token embeddings [1, T_tok, D]
                 num_chunks (int): Number of chunks in the batch
@@ -1066,7 +1064,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             
             return h, h_masks
         
-        def _build_condition_and_compute_loss(h_enc, h_masks_enc, feat_data, feat_len_data, embedding_data, is_streaming, device_target):
+        def _build_condition_and_compute_loss(h_enc, h_masks_enc, feat_data, feat_len_data, embedding_data, is_streaming):
             """Build partial cond prefix and compute decoder loss.
             
             Args:
@@ -1076,7 +1074,6 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 feat_len_data (torch.Tensor): Feature length for conditioning [B]
                 embedding_data (torch.Tensor): Embedding data for decoder
                 is_streaming (bool): Whether in streaming mode
-                device_target (torch.device): Target device for computations
                 
             Returns:
                 tuple: (loss, lengths) where:
@@ -1424,7 +1421,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 token_ids_orig = torch.clamp(token_ids_b[:, :token_len_b], min=0)
                 token_emb_orig_full = self.cos2_flow.input_embedding(token_ids_orig)
                 text_ctx_batch = _build_cross_attention_text_context(
-                    text_token_emb_full, text_token_len_b, chunk_starts_token, chunk_ends_token, token_ids_b, token_len_b,
+                    text_token_emb_full, chunk_starts_token, chunk_ends_token, token_len_b,
                     token_emb_orig_full, num_chunks, kv_hist_max, t_ends, device_target, b_idx
                 )
             elif not self._use_cross_text_attn:
@@ -1670,7 +1667,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             h, h_masks = _process_nonstreaming_path(token, token_len, text_tokens, upsample_factor, streaming, device)
 
         # Build partial cond prefix and compute decoder loss
-        loss, lengths = _build_condition_and_compute_loss(h, h_masks, feat, feat_len, embedding, streaming, device)
+        loss, lengths = _build_condition_and_compute_loss(h, h_masks, feat, feat_len, embedding, streaming)
 
         # Print periodic training-time debug information
         _print_training_debug_info(loss, streaming, token_len, T_tok_orig, h, lengths, upsample_factor, token)
