@@ -952,13 +952,13 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     # attn_w expected shape [N, H, Q, K] or [N, Q, K]
                     if isinstance(attn_w, torch.Tensor):
                         if attn_w.dim() == 4:
-                            aw = attn_w.mean(dim=1)  # [N,Q,K]
+                            attn_weights_debug = attn_w.mean(dim=1)  # [N,Q,K]
                         elif attn_w.dim() == 3:
-                            aw = attn_w
+                            attn_weights_debug = attn_w
                         else:
-                            aw = None
+                            attn_weights_debug = None
                     else:
-                        aw = None
+                        attn_weights_debug = None
                     Kb = int(getattr(self, '_print_every_k_in_batch', 10))
                     for i in range(N):
                         if (i % max(Kb,1) != 0) and (i != N - 1):
@@ -967,18 +967,18 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                         key_len = int(min(int(text_chunk_ends[i]), kv_hist_max))
                         token_start_i = int(token_chunk_starts[i]) if 'token_chunk_starts' in locals() else 0
                         token_end_i = int(token_chunk_ends[i]) if 'token_chunk_ends' in locals() else query_len
-                        if aw is not None and query_len > 0 and key_len > 0:
-                            qdim = int(aw.shape[1])
-                            kdim = int(aw.shape[2])
-                            q_idx = int(max(0, min(query_len - 1, qdim - 1)))
+                        if attn_weights_debug is not None and query_len > 0 and key_len > 0:
+                            qdim = int(attn_weights_debug.shape[1])
+                            kdim = int(attn_weights_debug.shape[2])
+                            query_idx = int(max(0, min(query_len - 1, qdim - 1)))
                             k_use = int(max(1, min(key_len, kdim)))
-                            vec = aw[i, q_idx, :k_use]
+                            vec = attn_weights_debug[i, query_idx, :k_use]
                             vec = torch.softmax(vec, dim=-1)
                             k = int(min(3, k_use))
                             vals, idxs = torch.topk(vec, k)
                             idxs = idxs.tolist(); vals = [float(v) for v in vals.tolist()]
-                            if q_idx != query_len - 1 or k_use != key_len:
-                                logging.info(f"[cos2.train.xattn] chunk={i}/{num_chunks} Q_len={query_len} K_len={key_len} qidx={q_idx}/{qdim} kdim={kdim} topk_idx={idxs} topk_val={[round(v,4) for v in vals]} (token=[{token_start_i}:{token_end_i}))")
+                            if query_idx != query_len - 1 or k_use != key_len:
+                                logging.info(f"[cos2.train.xattn] chunk={i}/{num_chunks} Q_len={query_len} K_len={key_len} qidx={query_idx}/{qdim} kdim={kdim} topk_idx={idxs} topk_val={[round(v,4) for v in vals]} (token=[{token_start_i}:{token_end_i}))")
                             else:
                                 logging.info(f"[cos2.train.xattn] chunk={i}/{num_chunks} Q_len={query_len} K_len={key_len} topk_idx={idxs} topk_val={[round(v,4) for v in vals]} (token=[{token_start_i}:{token_end_i}))")
                         else:
@@ -991,9 +991,9 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             # Key mask: valid Q positions only
             key_mask = mask_qkv  # [N,1,max_query_len] with True at valid positions
             ctx_raw, _ = self.q2ctx_attn(query=q_ctx, key=attn_out, value=attn_out, mask=key_mask)  # [N,context_len,D]
-            x = self.cross_ln(ctx_raw)
-            x = x + self.cross_ffn(x)
-            text_ctx_batch = x  # [N, context_len, D]
+            text_ctx_processed = self.cross_ln(ctx_raw)
+            text_ctx_processed = text_ctx_processed + self.cross_ffn(text_ctx_processed)
+            text_ctx_batch = text_ctx_processed  # [N, context_len, D]
             
             return text_ctx_batch
         
@@ -2163,16 +2163,16 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                         # attn_w expected shape [B,H,Q,K] or [B,Q,K]
                         if isinstance(attn_w, torch.Tensor):
                             if attn_w.dim() == 4:
-                                aw = attn_w.mean(dim=1)
+                                attn_weights_debug = attn_w.mean(dim=1)
                             elif attn_w.dim() == 3:
-                                aw = attn_w
+                                attn_weights_debug = attn_w
                             else:
-                                aw = None
+                                attn_weights_debug = None
                         else:
-                            aw = None
+                            attn_weights_debug = None
                         Bq = int(speech_query.shape[1]); Kt = int(kv_ref.shape[1])
-                        if aw is not None and real_len > 0:
-                            vec = aw[0, real_len - 1, :Kt]
+                        if attn_weights_debug is not None and real_len > 0:
+                            vec = attn_weights_debug[0, real_len - 1, :Kt]
                             k = int(min(3, Kt))
                             vec = torch.softmax(vec, dim=-1)
                             vals, idxs = torch.topk(vec, k)
@@ -2185,10 +2185,10 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 q_ctx = self.ctx_queries.to(attn_out.device).unsqueeze(0).expand(attn_out.shape[0], -1, -1)  # [B,context_len,D]
                 key_mask = torch.ones(attn_out.shape[0], 1, attn_out.shape[1], dtype=torch.bool, device=attn_out.device)
                 ctx_raw, _ = self.q2ctx_attn(query=q_ctx, key=attn_out, value=attn_out, mask=key_mask)  # [B,context_len,D]
-                x = self.cross_ln(ctx_raw)
-                x = x + self.cross_ffn(x)
+                text_ctx_processed = self.cross_ln(ctx_raw)
+                text_ctx_processed = text_ctx_processed + self.cross_ffn(text_ctx_processed)
                 context_len = int(getattr(self.cos2_flow.encoder.pre_lookahead_layer, 'pre_lookahead_len', 4))
-                text_ctx = x  # already [B, context_len, D]
+                text_ctx = text_ctx_processed  # already [B, context_len, D]
             else:
                 emb = self.text_context_emb(torch.clamp(text_tokens[:, :text_end_idx], min=0, max=self._text_vocab_size - 1))
                 context_len = int(getattr(self.cos2_flow.encoder.pre_lookahead_layer, 'pre_lookahead_len', 4))
