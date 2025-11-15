@@ -701,885 +701,888 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         upsample_factor = max(1, int(round(tmr / enc_up)))
         return upsample_factor
 
-    def flow(self, batch: Dict, device: torch.device) -> Dict[str, Optional[torch.Tensor]]:
+    def _infer_device_from_batch(self, batch_dict, fallback_device):
+        """Infer device from batch tensors to align with DDP shard device.
+        
+        Args:
+            batch_dict (dict): The input batch dictionary containing 'speech_token', 'speech_feat', 'embedding'
+            fallback_device (torch.device): Default device to use if no tensor is found
+            
+        Returns:
+            self_device (torch.device): The inferred device
         """
-        计算 CosyVoice2 因果流（Causal Flow, CFM）的训练损失，并显式对齐时间轴。
-
-        训练总体流程（含流式/非流式两种路径）：
-          1) 将离散语音 token（speech_token）嵌入，按概率走"流式切块编码"或"整段一次编码"。
-          2) 对编码器输出 hidden 进行 encoder_proj 得到 [B, T_h, 80]，并产出时长掩码 hidden_mask。
-          3) 将 GT 梅尔谱（speech_feat）沿时间插值到 T_h，得到 x1 = [B, 80, T_h]。
-          4) 构造与 CosyVoice2 原训练一致的条件 cond（最多 30% 的随机前缀），同样对齐到 T_h。
-          5) 调用 decoder.compute_loss(x1, mask, h^T, embedding, cond, streaming) 计算损失。
-
-        输入 batch 字段与形状：
-          - speech_token:      [B, T_tok]       离散语音 token 序列（WhisperVQ 12.5Hz）
-          - speech_token_len:  [B]              每条样本的 token 有效长度
-          - speech_feat:       [B, 80, T_feat] 或 [B, T_feat, 80]   目标梅尔谱
-          - speech_feat_len:   [B]              梅尔帧有效长度（主要用于日志/校验）
-          - embedding:         [B, 192]         说话人嵌入；本函数内先归一化再经 spk_embed_affine_layer 投影
-          - text_tokens:       [B, T_txt] 可选  文本 token（用于流式 cross-attention 上下文）
-          - text_token_len:    [B]       可选  文本 token 有效长度
-
-        关键参数/成员（仅与本函数相关）：
-          - _stream_train_prob: float  进入流式训练分支的概率（其余样本走非流式）
-          - _use_text_context_train: 是否使用text context in training
-          - token_mel_ratio (tmr):     每个 token 约对应的 mel 帧数（默认 4.0）
-          - enc_up:                    编码器时间上采样因子（UpsampleConformerEncoder，固定 2.0）
-          - upsample_factor:           round(tmr/enc_up)，通常为 2；决定 token 时间与 encoder 时间对齐关系
-          - context_len:                     上下文长度槽位（等价于原 pre_lookahead_len），供 encoder(context=...) 使用
-          - _use_cross_text_attn:      是否用文本跨注意力来替代 pre_lookahead（True 时启用 cross-attn）
-          - _cross_q_pool:             Q 的池化方式，'mean' 或 'last'（从当前 chunk 的 token 表征池化而来）
-          - static_chunk_size:         流式块长（单位：原始 token）；从 encoder/static_chunk_size 或环境变量获取
-
-        流式（streaming=True）时每个样本的中间变量：
-          - num_tokens_original:    [B]             原始 token 长度（未上采样）
-          - token_ids_upsampled: [1, T_upsampled]   上采样后 token 序列（按 upsample_factor 重复）
-          - num_tokens_upsampled:    int             上采样后的总步数（可能包含 pad）
-          - block_size_upsampled:int             一个 chunk 在"上采样后时间"里的长度（= block_size * upsample_factor）
-          - chunk_starts:  List[int]       每个 chunk 的起始下标（上采样后坐标系）
-          - token_slices:    List[Tensor]    各 chunk 的变长 token 嵌入切片（未 pad）
-          - token_lens:      List[int]       各 chunk 的有效长度（去掉越界 pad 后）
-          - token_batch:     [N_chunk, Lmax, D]  将 token_slices pad 后的批处理张量
-          - len_vec:       [N_chunk]       每个 chunk 的有效长度向量
-          - token_mask:      [N_chunk, Lmax, 1]  token 有效位的掩码
-          - text_token_emb_full:  [1, T_txt, 512] 文本全序列的嵌入（如果提供 text_tokens）
-          - text_chunk_ends:        List[int]       每个 chunk 当前可见的"文本历史长度"（随时间推进递增）
-          - kv_hist_max:   int             所有 chunk 的最大可见文本长度（用于对齐 KV 的 pad）
-          - text_ctx_batch:[N_chunk, context_len, 512]  cross-attn 得到的上下文序列（替代 pre_lookahead）
-          - hidden_chunks/hidden_chunks_mask:       编码器对 chunk 批的输出与掩码（hidden_chunks_mask: [N_chunk,1,T_enc]）
-          - chunk_lengths:       List[int]       各 chunk 编码器的有效步数（按 hidden_chunks_mask 统计）
-          - sample_hidden/sample_mask:    [1, T_total,80]/[1,1,T_total]  将各 chunk 有效部分拼接回单样本时间轴
-
-        非流式（streaming=False）时：
-          - 直接对上采样后的整段 token 一次前向，训练阶段不注入任何上下文（ctx_used=False）。
-
-        输出：
-          - 返回字典 {'loss': Tensor 标量}
-
-        日志与一致性校验：
-          - [cos2.train.mb] 打印流式每样本的 chunk 统计、显存占用、期望/实际步数等
-          - [cos2.train]    打印对齐比例：T_h_valid/T_tok(orig/eff) 与 token_mel_ratio/上采样因子的关系
+        self_device = fallback_device
+        if isinstance(batch_dict, dict):
+            for k in ("speech_token", "speech_feat", "embedding"):
+                if k in batch_dict and isinstance(batch_dict[k], torch.Tensor):
+                    self_device = batch_dict[k].device
+                    break
+        return self_device
+    
+    def _prepare_inputs_and_ensure_device(self, batch_dict, target_device):
+        """Prepare inputs from batch and ensure all modules are on the correct device.
+        
+        Args:
+            batch_dict (dict): The input batch dictionary containing 'speech_token', 'speech_token_len', 'speech_feat', 'embedding'
+            target_device (torch.device): Target device to move tensors to
+            
+        Returns:
+            tuple: (token, token_len, feat, feat_len, embedding) where:
+                - token: Speech tokens for the batch [B, T_tok]
+                - token_len: Token lengths for each sample in batch [B]
+                - feat: Feature data for conditioning [B, T_feat, 80]
+                - feat_len: Feature lengths for each sample in batch [B]
+                - embedding: Embedding data for decoder [B, D]
         """
+        # Prepare inputs
+        token = batch_dict['speech_token'].to(target_device)
+        token_len = batch_dict['speech_token_len'].to(target_device)
+        feat = batch_dict['speech_feat'].to(target_device)
+        if feat.ndim == 3 and feat.shape[1] == self.MEL_DIM:  # [B, MEL_DIM, T] -> [B, T, MEL_DIM]
+            feat = feat.transpose(1, 2).contiguous()
+        feat_len = batch_dict['speech_feat_len'].to(target_device)
+
+        embedding = batch_dict['embedding'].to(target_device)
+
+        # xvec projection
+        embedding = F.normalize(embedding, dim=1)
+        embedding = self.cos2_flow.spk_embed_affine_layer(embedding)
+
+        self._ensure_device(target_device)
         
-        # ============================================================================
-        # Helper functions (defined within flow() for encapsulation and readability)
-        # ============================================================================
+        return token, token_len, feat, feat_len, embedding
+
+    def _build_cross_attention_text_context(
+        self,
+        text_token_emb_full, token_chunk_starts, token_chunk_ends, sample_token_len,
+        token_emb_original, num_chunks, kv_hist_max, text_chunk_ends, device_target, b_idx
+    ):
+        """Build text context using cross-attention mechanism for streaming chunks.
         
-        def _infer_device_from_batch(batch_dict, fallback_device):
-            """Infer device from batch tensors to align with DDP shard device.
+        Args:
+            text_token_emb_full (torch.Tensor): Full text embeddings [1, N, D]
+            token_chunk_starts (list): Start indices for each chunk on token axis
+            token_chunk_ends (list): End indices for each chunk on token axis
+            sample_token_len (int): Effective token length for the current sample
+            token_emb_original (torch.Tensor): Original token embeddings [1, T_tok, D]
+            num_chunks (int): Number of chunks in the batch
+            kv_hist_max (int): Maximum visible text length for cross-attention
+            text_chunk_ends (list): End indices for each chunk on text axis
+            device_target (torch.device): Target device for computations
+            b_idx (int): Batch index of the current sample
+
+        Variables:
+            context_len (int): Context length for text context (self._default_context_len)
+            KV (torch.Tensor): Text embeddings padded to kv_hist_max [N, kv_hist_max, D]
+            mask_kv (torch.Tensor): Mask for KV [N, 1, kv_hist_max]
+            token_history_max_len (int): Maximum length of speech history in original token units
+            speech_hist_batch (torch.Tensor): Speech history batch [N, token_history_max_len, D]
             
-            Args:
-                batch_dict (dict): The input batch dictionary containing 'speech_token', 'speech_feat', 'embedding'
-                fallback_device (torch.device): Default device to use if no tensor is found
-                
-            Returns:
-                self_device (torch.device): The inferred device
-            """
-            self_device = fallback_device
-            if isinstance(batch_dict, dict):
-                for k in ("speech_token", "speech_feat", "embedding"):
-                    if k in batch_dict and isinstance(batch_dict[k], torch.Tensor):
-                        self_device = batch_dict[k].device
-                        break
-            return self_device
+        Returns:
+            text_ctx_batch (torch.Tensor): Text context batch [N, context_len, D]
+        """
+        from cosyvoice.utils.mask import make_pad_mask
         
-        def _prepare_inputs_and_ensure_device(batch_dict, target_device):
-            """Prepare inputs from batch and ensure all modules are on the correct device.
-            
-            Args:
-                batch_dict (dict): The input batch dictionary containing 'speech_token', 'speech_token_len', 'speech_feat', 'embedding'
-                target_device (torch.device): Target device to move tensors to
-                
-            Returns:
-                tuple: (token, token_len, feat, feat_len, embedding) where:
-                    - token: Speech tokens for the batch [B, T_tok]
-                    - token_len: Token lengths for each sample in batch [B]
-                    - feat: Feature data for conditioning [B, T_feat, 80]
-                    - feat_len: Feature lengths for each sample in batch [B]
-                    - embedding: Embedding data for decoder [B, D]
-            """
-            # Prepare inputs
-            token = batch_dict['speech_token'].to(target_device)
-            token_len = batch_dict['speech_token_len'].to(target_device)
-            feat = batch_dict['speech_feat'].to(target_device)
-            if feat.ndim == 3 and feat.shape[1] == self.MEL_DIM:  # [B, MEL_DIM, T] -> [B, T, MEL_DIM]
-                feat = feat.transpose(1, 2).contiguous()
-            feat_len = batch_dict['speech_feat_len'].to(target_device)
+        context_len = self._default_context_len
+        # Prepare KV (text embeddings) padded/truncated to kv_hist_max; per-chunk variable visible length via mask_kv
+        KV = text_token_emb_full[:, :kv_hist_max].repeat(num_chunks, 1, 1)  # [N, kv_hist_max, D]
+        mask_kv = torch.zeros(num_chunks, 1, kv_hist_max, dtype=torch.bool, device=device_target)
+        for i, te in enumerate(text_chunk_ends):
+            text_end_i = int(min(int(te), kv_hist_max))
+            if text_end_i > 0:
+                KV[i, :text_end_i] = text_token_emb_full[0, :text_end_i]
+                mask_kv[i, 0, :text_end_i] = True
 
-            embedding = batch_dict['embedding'].to(target_device)
-
-            # xvec projection
-            embedding = F.normalize(embedding, dim=1)
-            embedding = self.cos2_flow.spk_embed_affine_layer(embedding)
-
-            self._ensure_device(target_device)
-            
-            return token, token_len, feat, feat_len, embedding
+        # Build speech histories per chunk on ORIGINAL token axis (pre-upsampling): use all past + current chunk tokens
+        N = len(token_chunk_starts)
+        # Start/end on original axis come directly from token_chunk_starts/token_chunk_ends
+        token_history_max_len = max(token_chunk_ends) if len(token_chunk_ends) > 0 else 1
         
-        def _build_cross_attention_text_context(
-            text_token_emb_full, token_chunk_starts, token_chunk_ends, sample_token_len,
-            token_emb_original, num_chunks, kv_hist_max, text_chunk_ends, device_target, b_idx
-        ):
-            """Build text context using cross-attention mechanism for streaming chunks.
-            
-            Args:
-                text_token_emb_full (torch.Tensor): Full text embeddings [1, N, D]
-                token_chunk_starts (list): Start indices for each chunk on token axis
-                token_chunk_ends (list): End indices for each chunk on token axis
-                sample_token_len (int): Effective token length for the current sample
-                token_emb_original (torch.Tensor): Original token embeddings [1, T_tok, D]
-                num_chunks (int): Number of chunks in the batch
-                kv_hist_max (int): Maximum visible text length for cross-attention
-                text_chunk_ends (list): End indices for each chunk on text axis
-                device_target (torch.device): Target device for computations
-                b_idx (int): Batch index of the current sample
+        # Assemble history batches padded to token_history_max_len
+        speech_hist_batch = token_emb_original.new_zeros((N, token_history_max_len, token_emb_original.shape[-1]))
+        for i in range(N):
+            token_end = token_chunk_ends[i]
+            if token_end > 0:
+                speech_hist_batch[i, :token_end] = token_emb_original[0, :token_end]
+        
+        # Causal mask over speech history (allow full look-back) on original axis
+        mask_speech_hist = torch.zeros(N, token_history_max_len, token_history_max_len, dtype=torch.bool, device=token_emb_original.device)
+        for i in range(N):
+            e = token_chunk_ends[i]
+            if e > 0:
+                mask_speech_hist[i, :e, :e] = torch.tril(torch.ones((e, e), dtype=torch.bool, device=token_emb_original.device))
+        
+        # Self-attn + FFN over speech histories
+        speech_hist_attn, _ = self.speech_sa(query=speech_hist_batch, key=speech_hist_batch, value=speech_hist_batch, mask=mask_speech_hist)
+        speech_hist = self.speech_ln(speech_hist_attn)
+        
+        # Debug: stats before and after speech FFN (first batch only, periodic)
+        if getattr(self, '_debug_blocks', False) and (b_idx == 0) and ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0):
+            try:
+                _s_pre = speech_hist
+                _m_pre = float(_s_pre.mean().item()); _sd_pre = float(_s_pre.std(unbiased=False).item())
+            except Exception:
+                _m_pre = 0.0; _sd_pre = 0.0
+        speech_hist = speech_hist + self.speech_ffn(speech_hist)
+        if getattr(self, '_debug_blocks', False) and (b_idx == 0) and ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0):
+            try:
+                _m_post = float(speech_hist.mean().item()); _sd_post = float(speech_hist.std(unbiased=False).item())
+                logging.info(f"[cos2.train.block.speech] b=0 T_hist_max={int(token_history_max_len)} mean_pre={_m_pre:.4f} std_pre={_sd_pre:.4f} mean_post={_m_post:.4f} std_post={_sd_post:.4f}")
+            except Exception:
+                pass
+        
+        # Extract current-chunk subrange per row [t_start:text_end_idx) as multi-query Q (original axis), pad to max_query_len
+        token_query_lens = [max(0, token_chunk_ends[i] - token_chunk_starts[i]) for i in range(N)]
+        max_query_len = max(token_query_lens) if len(token_query_lens) > 0 else 1
+        Dq = speech_hist.shape[-1]
+        speech_query = speech_hist.new_zeros((N, max_query_len, Dq))
+        for i in range(N):
+            query_len = int(token_query_lens[i])
+            if query_len <= 0:
+                continue
+            speech_query[i, :query_len] = speech_hist[i, token_chunk_starts[i]:token_chunk_ends[i]]
+        
+        # mask for Q length (not strictly needed by current cross_attn impl, but useful for clarity)
+        mask_qkv = torch.zeros(N, 1, max_query_len, dtype=torch.bool, device=speech_query.device)
+        for i in range(N):
+            query_len = int(token_query_lens[i])
+            if query_len > 0:
+                mask_qkv[i, 0, :query_len] = True
+        
+        # Scheme-1: text-side causal self-attn + FFN
+        # Causal self-attn on text (only look-back w.r.t. each position and text_end_idx)
+        mask_kv_causal = torch.zeros(num_chunks, kv_hist_max, kv_hist_max, dtype=torch.bool, device=device_target)
+        for i, te in enumerate(text_chunk_ends):
+            t = int(min(int(te), kv_hist_max))
+            if t > 0:
+                mask_kv_causal[i, :t, :t] = torch.tril(torch.ones((t, t), dtype=torch.bool, device=device_target))
+        kv_attn, _ = self.text_sa(query=KV, key=KV, value=KV, mask=mask_kv_causal)
+        kv_ref = self.text_ln(kv_attn)
+        
+        # Debug: stats before and after text FFN (use first chunk's visible length)
+        if getattr(self, '_debug_blocks', False) and (b_idx == 0) and ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0):
+            try:
+                _t0 = int(min(int(text_chunk_ends[0]), kv_hist_max)) if isinstance(text_chunk_ends, (list, tuple)) and len(text_chunk_ends) > 0 else kv_hist_max
+                _t0 = max(0, _t0)
+                _kv_pre = kv_ref[0, :_t0] if _t0 > 0 else kv_ref[0:1, :0]
+                _m_pre = float(_kv_pre.mean().item()) if _t0 > 0 else 0.0
+                _sd_pre = float(_kv_pre.std(unbiased=False).item()) if _t0 > 0 else 0.0
+            except Exception:
+                _m_pre = 0.0; _sd_pre = 0.0
+        kv_ref = kv_ref + self.text_ffn(kv_ref)
+        if getattr(self, '_debug_blocks', False) and (b_idx == 0) and ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0):
+            try:
+                _kv_post = kv_ref[0, :_t0] if '_t0' in locals() and _t0 > 0 else kv_ref[0:1, :0]
+                _m_post = float(_kv_post.mean().item()) if '_t0' in locals() and _t0 > 0 else 0.0
+                _sd_post = float(_kv_post.std(unbiased=False).item()) if '_t0' in locals() and _t0 > 0 else 0.0
+                logging.info(f"[cos2.train.block.text] b=0 K_max={int(kv_hist_max)} K_vis={int(_t0)} mean_pre={_m_pre:.4f} std_pre={_sd_pre:.4f} mean_post={_m_post:.4f} std_post={_sd_post:.4f}")
+            except Exception:
+                pass
 
-            Variables:
-                context_len (int): Context length for text context (self._default_context_len)
-                KV (torch.Tensor): Text embeddings padded to kv_hist_max [N, kv_hist_max, D]
-                mask_kv (torch.Tensor): Mask for KV [N, 1, kv_hist_max]
-                token_history_max_len (int): Maximum length of speech history in original token units
-                speech_hist_batch (torch.Tensor): Speech history batch [N, token_history_max_len, D]
-                
-            Returns:
-                text_ctx_batch (torch.Tensor): Text context batch [N, context_len, D]
-            """
-            from cosyvoice.utils.mask import make_pad_mask
-            
-            context_len = self._default_context_len
-            # Prepare KV (text embeddings) padded/truncated to kv_hist_max; per-chunk variable visible length via mask_kv
-            KV = text_token_emb_full[:, :kv_hist_max].repeat(num_chunks, 1, 1)  # [N, kv_hist_max, D]
-            mask_kv = torch.zeros(num_chunks, 1, kv_hist_max, dtype=torch.bool, device=device_target)
-            for i, te in enumerate(text_chunk_ends):
-                text_end_i = int(min(int(te), kv_hist_max))
-                if text_end_i > 0:
-                    KV[i, :text_end_i] = text_token_emb_full[0, :text_end_i]
-                    mask_kv[i, 0, :text_end_i] = True
-
-            # Build speech histories per chunk on ORIGINAL token axis (pre-upsampling): use all past + current chunk tokens
-            N = len(token_chunk_starts)
-            # Start/end on original axis come directly from token_chunk_starts/token_chunk_ends
-            token_history_max_len = max(token_chunk_ends) if len(token_chunk_ends) > 0 else 1
-            
-            # Assemble history batches padded to token_history_max_len
-            speech_hist_batch = token_emb_original.new_zeros((N, token_history_max_len, token_emb_original.shape[-1]))
-            for i in range(N):
-                token_end = token_chunk_ends[i]
-                if token_end > 0:
-                    speech_hist_batch[i, :token_end] = token_emb_original[0, :token_end]
-            
-            # Causal mask over speech history (allow full look-back) on original axis
-            mask_speech_hist = torch.zeros(N, token_history_max_len, token_history_max_len, dtype=torch.bool, device=token_emb_original.device)
-            for i in range(N):
-                e = token_chunk_ends[i]
-                if e > 0:
-                    mask_speech_hist[i, :e, :e] = torch.tril(torch.ones((e, e), dtype=torch.bool, device=token_emb_original.device))
-            
-            # Self-attn + FFN over speech histories
-            speech_hist_attn, _ = self.speech_sa(query=speech_hist_batch, key=speech_hist_batch, value=speech_hist_batch, mask=mask_speech_hist)
-            speech_hist = self.speech_ln(speech_hist_attn)
-            
-            # Debug: stats before and after speech FFN (first batch only, periodic)
-            if getattr(self, '_debug_blocks', False) and (b_idx == 0) and ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0):
-                try:
-                    _s_pre = speech_hist
-                    _m_pre = float(_s_pre.mean().item()); _sd_pre = float(_s_pre.std(unbiased=False).item())
-                except Exception:
-                    _m_pre = 0.0; _sd_pre = 0.0
-            speech_hist = speech_hist + self.speech_ffn(speech_hist)
-            if getattr(self, '_debug_blocks', False) and (b_idx == 0) and ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0):
-                try:
-                    _m_post = float(speech_hist.mean().item()); _sd_post = float(speech_hist.std(unbiased=False).item())
-                    logging.info(f"[cos2.train.block.speech] b=0 T_hist_max={int(token_history_max_len)} mean_pre={_m_pre:.4f} std_pre={_sd_pre:.4f} mean_post={_m_post:.4f} std_post={_sd_post:.4f}")
-                except Exception:
-                    pass
-            
-            # Extract current-chunk subrange per row [t_start:text_end_idx) as multi-query Q (original axis), pad to max_query_len
-            token_query_lens = [max(0, token_chunk_ends[i] - token_chunk_starts[i]) for i in range(N)]
-            max_query_len = max(token_query_lens) if len(token_query_lens) > 0 else 1
-            Dq = speech_hist.shape[-1]
-            speech_query = speech_hist.new_zeros((N, max_query_len, Dq))
-            for i in range(N):
-                query_len = int(token_query_lens[i])
-                if query_len <= 0:
-                    continue
-                speech_query[i, :query_len] = speech_hist[i, token_chunk_starts[i]:token_chunk_ends[i]]
-            
-            # mask for Q length (not strictly needed by current cross_attn impl, but useful for clarity)
-            mask_qkv = torch.zeros(N, 1, max_query_len, dtype=torch.bool, device=speech_query.device)
-            for i in range(N):
-                query_len = int(token_query_lens[i])
-                if query_len > 0:
-                    mask_qkv[i, 0, :query_len] = True
-            
-            # Scheme-1: text-side causal self-attn + FFN
-            # Causal self-attn on text (only look-back w.r.t. each position and text_end_idx)
-            mask_kv_causal = torch.zeros(num_chunks, kv_hist_max, kv_hist_max, dtype=torch.bool, device=device_target)
-            for i, te in enumerate(text_chunk_ends):
-                t = int(min(int(te), kv_hist_max))
-                if t > 0:
-                    mask_kv_causal[i, :t, :t] = torch.tril(torch.ones((t, t), dtype=torch.bool, device=device_target))
-            kv_attn, _ = self.text_sa(query=KV, key=KV, value=KV, mask=mask_kv_causal)
-            kv_ref = self.text_ln(kv_attn)
-            
-            # Debug: stats before and after text FFN (use first chunk's visible length)
-            if getattr(self, '_debug_blocks', False) and (b_idx == 0) and ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0):
-                try:
-                    _t0 = int(min(int(text_chunk_ends[0]), kv_hist_max)) if isinstance(text_chunk_ends, (list, tuple)) and len(text_chunk_ends) > 0 else kv_hist_max
-                    _t0 = max(0, _t0)
-                    _kv_pre = kv_ref[0, :_t0] if _t0 > 0 else kv_ref[0:1, :0]
-                    _m_pre = float(_kv_pre.mean().item()) if _t0 > 0 else 0.0
-                    _sd_pre = float(_kv_pre.std(unbiased=False).item()) if _t0 > 0 else 0.0
-                except Exception:
-                    _m_pre = 0.0; _sd_pre = 0.0
-            kv_ref = kv_ref + self.text_ffn(kv_ref)
-            if getattr(self, '_debug_blocks', False) and (b_idx == 0) and ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0):
-                try:
-                    _kv_post = kv_ref[0, :_t0] if '_t0' in locals() and _t0 > 0 else kv_ref[0:1, :0]
-                    _m_post = float(_kv_post.mean().item()) if '_t0' in locals() and _t0 > 0 else 0.0
-                    _sd_post = float(_kv_post.std(unbiased=False).item()) if '_t0' in locals() and _t0 > 0 else 0.0
-                    logging.info(f"[cos2.train.block.text] b=0 K_max={int(kv_hist_max)} K_vis={int(_t0)} mean_pre={_m_pre:.4f} std_pre={_sd_pre:.4f} mean_post={_m_post:.4f} std_post={_sd_post:.4f}")
-                except Exception:
-                    pass
-
-            # Cross-attn: multi-query (aligned to chunk length). Then pool last valid to 1 vector per chunk
-            attn_out, attn_w = self.cross_text_attn(query=speech_query, key=kv_ref, value=kv_ref, mask=mask_kv)  # [N, Lmax, D]
-            
-            # Optional debug: inspect attention on chunks spaced every K within the batch
-            if getattr(self, '_debug_xattn', False) and (b_idx == 0) and ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0):
-                try:
-                    # attn_w expected shape [N, H, Q, K] or [N, Q, K]
-                    if isinstance(attn_w, torch.Tensor):
-                        if attn_w.dim() == 4:
-                            attn_weights_debug = attn_w.mean(dim=1)  # [N,Q,K]
-                        elif attn_w.dim() == 3:
-                            attn_weights_debug = attn_w
-                        else:
-                            attn_weights_debug = None
+        # Cross-attn: multi-query (aligned to chunk length). Then pool last valid to 1 vector per chunk
+        attn_out, attn_w = self.cross_text_attn(query=speech_query, key=kv_ref, value=kv_ref, mask=mask_kv)  # [N, Lmax, D]
+        
+        # Optional debug: inspect attention on chunks spaced every K within the batch
+        if getattr(self, '_debug_xattn', False) and (b_idx == 0) and ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0):
+            try:
+                # attn_w expected shape [N, H, Q, K] or [N, Q, K]
+                if isinstance(attn_w, torch.Tensor):
+                    if attn_w.dim() == 4:
+                        attn_weights_debug = attn_w.mean(dim=1)  # [N,Q,K]
+                    elif attn_w.dim() == 3:
+                        attn_weights_debug = attn_w
                     else:
                         attn_weights_debug = None
-                    Kb = int(getattr(self, '_print_every_k_in_batch', 10))
-                    for i in range(N):
-                        if (i % max(Kb,1) != 0) and (i != N - 1):
-                            continue
-                        query_len = int(token_query_lens[i])
-                        key_len = int(min(int(text_chunk_ends[i]), kv_hist_max))
-                        token_start_i = int(token_chunk_starts[i]) if 'token_chunk_starts' in locals() else 0
-                        token_end_i = int(token_chunk_ends[i]) if 'token_chunk_ends' in locals() else query_len
-                        if attn_weights_debug is not None and query_len > 0 and key_len > 0:
-                            qdim = int(attn_weights_debug.shape[1])
-                            kdim = int(attn_weights_debug.shape[2])
-                            query_idx = int(max(0, min(query_len - 1, qdim - 1)))
-                            k_use = int(max(1, min(key_len, kdim)))
-                            vec = attn_weights_debug[i, query_idx, :k_use]
-                            vec = torch.softmax(vec, dim=-1)
-                            k = int(min(3, k_use))
-                            vals, idxs = torch.topk(vec, k)
-                            idxs = idxs.tolist(); vals = [float(v) for v in vals.tolist()]
-                            if query_idx != query_len - 1 or k_use != key_len:
-                                logging.info(f"[cos2.train.xattn] chunk={i}/{num_chunks} Q_len={query_len} K_len={key_len} qidx={query_idx}/{qdim} kdim={kdim} topk_idx={idxs} topk_val={[round(v,4) for v in vals]} (token=[{token_start_i}:{token_end_i}))")
-                            else:
-                                logging.info(f"[cos2.train.xattn] chunk={i}/{num_chunks} Q_len={query_len} K_len={key_len} topk_idx={idxs} topk_val={[round(v,4) for v in vals]} (token=[{token_start_i}:{token_end_i}))")
-                        else:
-                            logging.info(f"[cos2.train.xattn] chunk={i}/{num_chunks} Q_len={query_len} K_len={key_len} (no attn_w) (token=[{token_start_i}:{token_end_i}))")
-                except Exception as e:
-                    logging.info(f"[cos2.train.xattn] warn: {e}")
-            
-            # Aggregate full-Q features to context_len via learned queries (no temporal pooling)
-            q_ctx = self.ctx_queries.to(attn_out.device).unsqueeze(0).expand(num_chunks, -1, -1)  # [N,context_len,D]
-            # Key mask: valid Q positions only
-            key_mask = mask_qkv  # [N,1,max_query_len] with True at valid positions
-            ctx_raw, _ = self.q2ctx_attn(query=q_ctx, key=attn_out, value=attn_out, mask=key_mask)  # [N,context_len,D]
-            text_ctx_processed = self.cross_ln(ctx_raw)
-            text_ctx_processed = text_ctx_processed + self.cross_ffn(text_ctx_processed)
-            text_ctx_batch = text_ctx_processed  # [N, context_len, D]
-            
-            return text_ctx_batch
-        
-        def _build_fallback_text_context(text_token_emb_full, text_chunk_ends, context_len, device_target):
-            """Build simple right-aligned text window per chunk using text_end_idx (fallback when cross-attn disabled).
-            
-            Args:
-                text_token_emb_full (torch.Tensor): Full text embeddings [1, N, D]
-                text_chunk_ends (list or torch.Tensor): End indices for each chunk [N]
-                context_len (int): Context length to build
-                device_target (torch.device): Target device for computations
-
-            Returns:
-                text_ctx_batch (torch.Tensor): Text context batch [N, context_len, D]
-            """
-            ctx_list = []
-            for te in text_chunk_ends:
-                text_end_idx = int(te)
-                text_window_emb = text_token_emb_full[:, :text_end_idx]  # [1, N, D] take up to text_end_idx
-                if text_window_emb.shape[1] < context_len:
-                    pad = torch.zeros(1, context_len - text_window_emb.shape[1], text_window_emb.shape[2], device=device_target, dtype=text_window_emb.dtype)
-                    text_ctx = torch.cat([text_window_emb, pad], dim=1)  # right-pad to context_len
                 else:
-                    text_ctx = text_window_emb[:, -context_len:]  # take the most recent context_len tokens
-                ctx_list.append(text_ctx.squeeze(0))  # [context_len, D]
-            if len(ctx_list) > 0:
-                text_ctx_batch = torch.stack(ctx_list, dim=0)  # [N, context_len, D]
-            else:
-                text_ctx_batch = None
-            return text_ctx_batch
-        
-        def _process_nonstreaming_path(token_data, token_len_data, text_tokens_data, upsample_f, is_streaming, device_target):
-            """Process non-streaming training: single pass without text context injection.
-            
-            Args:
-                token_data (torch.Tensor): Token data for conditioning [B, T_tok]
-                token_len_data (torch.Tensor): Token lengths for each sample in batch [B]
-                text_tokens_data (torch.Tensor): Text tokens for conditioning [B, T_text] or None
-                upsample_f (int): Upsampling factor used for token alignment
-                is_streaming (bool): Whether in streaming mode
-                device_target (torch.device): Target device for computations
-                
-            Returns:
-                tuple: (hidden, hidden_mask) where:
-                    - hidden (torch.Tensor): Encoded hidden states from encoder [B, T_h, 80]
-                    - hidden_mask (torch.Tensor): Encoder output masks [B, 1, T_h] or similar
-            """
-            from cosyvoice.utils.mask import make_pad_mask
-            
-            # upsample entire sequence if needed
-            if upsample_f > 1:
-                token_data = token_data.repeat_interleave(upsample_f, dim=1)
-                token_len_data = token_len_data * upsample_f
-            
-            # token embedding with padding mask
-            token_mask = (~make_pad_mask(token_len_data)).float().unsqueeze(-1).to(device_target)
-            token_data = torch.clamp(token_data, min=0)
-            token_data = self.cos2_flow.input_embedding(token_data) * token_mask
-            
-            # Non-streaming: strictly no context injection (pre_lookahead disabled in training)
-            hidden, hidden_mask = self.cos2_flow.encoder(token_data, token_len_data, streaming=is_streaming)
-            hidden = self.cos2_flow.encoder_proj(hidden)  # [B, T_h, 80]
-            
-            # Lightweight debug: confirm non-streaming path does not use context
-            if (int(self._step) % max(self._debug_every, 1)) == 0 and self._val_debug:
-                try:
-                    b0 = 0
-                    num_text_tokens = int(text_tokens_data.shape[1]) if isinstance(text_tokens_data, torch.Tensor) else 0
-                    logging.info(
-                        f"[cos2.train.nonstream] B={token_data.shape[0]} num_tokens_upsampled={int(token_len_data[b0].item())} num_text_tokens={num_text_tokens} ctx_used=False xattn={self._use_cross_text_attn}"
-                    )
-                except Exception:
-                    pass
-            
-            return hidden, hidden_mask
-        
-        def _build_condition_and_compute_loss(hidden_encoded, hidden_encoded_mask, feat_data, feat_len_data, embedding_data, is_streaming):
-            """Build partial cond prefix and compute decoder loss.
-            
-            Args:
-                hidden_encoded (torch.Tensor): Encoded hidden states from encoder [B, T_h, D]
-                hidden_encoded_mask (torch.Tensor): Encoder output masks [B, 1, T_h] or similar
-                feat_data (torch.Tensor): Feature data for conditioning [B, T_feat, 80]
-                feat_len_data (torch.Tensor): Feature length for conditioning [B]
-                embedding_data (torch.Tensor): Embedding data for decoder
-                is_streaming (bool): Whether in streaming mode
-                
-            Returns:
-                tuple: (loss, lengths) where:
-                    - loss (torch.Tensor): Computed decoder loss
-                    - lengths (torch.Tensor): Sequence lengths [B]
-            """
-            from cosyvoice.utils.mask import make_pad_mask
-            
-            # Build partial cond prefix consistent with CosyVoice2 training (<=30% prefix)
-            # Then resample to match encoder output length
-            num_hidden_frames = hidden_encoded.shape[1]
-            feat_dim = feat_data.shape[2] # 80
-
-            # Interpolate feat_data to num_hidden_frames
-            feat_len_data = feat_len_data * num_hidden_frames / feat_data.shape[1] # [B]
-            feat_data = F.interpolate(feat_data.unsqueeze(dim=1), size=(num_hidden_frames, feat_dim), mode='nearest').squeeze(dim=1) # [B, T_h, 80]
-
-            conds = feat_data.new_zeros(feat_data.shape)  # [B, T_h, 80]
-            for i, j in enumerate(feat_len_data):
-                if random.random() < 0.5:
-                    continue
-                index = random.randint(0, int(0.3 * j))
-                conds[i, :index] = feat_data[i, :index]
-
-            # Build mask based on encoder masks -> lengths
-            if isinstance(hidden_encoded_mask, torch.Tensor):  # [B,1,T_h] bool
-                lengths = hidden_encoded_mask.sum(dim=-1).squeeze(1)
-                mask = (~make_pad_mask(lengths)).to(hidden_encoded)
-            else:
-                # fallback: full True mask
-                mask = torch.ones(hidden_encoded.shape[0], hidden_encoded.shape[1], dtype=torch.bool, device=hidden_encoded.device)
-
-            # resample feat to T_h (target x1)
-            x1 = feat_data.transpose(1, 2).contiguous()  # [B, 80, T_h]
-
-            conds_chw = conds.transpose(1, 2).contiguous()  # [B, 80, T_h]
-
-            # call decoder loss
-            loss, _ = self.cos2_flow.decoder.compute_loss(
-                x1,
-                mask.unsqueeze(1),
-                hidden_encoded.transpose(1, 2).contiguous(),
-                embedding_data,
-                cond=conds_chw,
-                streaming=bool(is_streaming),
-            )
-            
-            return loss, lengths
-        
-        def _print_training_debug_info(
-            loss_val, is_streaming, token_len_data, num_tokens_original_data, hidden_encoded, lengths_data, 
-            upsample_f, token_data
-        ):
-            """Print periodic training-time debug information.
-            
-            Args:
-                loss_val (torch.Tensor): The computed loss value
-                is_streaming (bool): Whether streaming mode is enabled
-                token_len_data (torch.Tensor): Token lengths for each sample in batch
-                num_tokens_original_data (torch.Tensor): Original token lengths before upsampling
-                hidden_encoded (torch.Tensor): Encoder hidden states, shape [B, T_h, D]
-                lengths_data (torch.Tensor): Valid lengths from encoder masks
-                upsample_f (int): Upsampling factor used for token alignment
-                token_data (torch.Tensor): Token data tensor
-                
-            Returns:
-                None: This function only prints debug information to logs
-            """
-            if int(self._step) % int(self._debug_every) == 0:
-                try:
-                    # pick the first sample in batch for concise logging
-                    b0 = 0
-                    num_tokens_upsampled_current = int(token_len_data[b0].item()) if torch.is_tensor(token_len_data) else int(token_data.shape[1])
-                    # original (pre-upsample) length if available
-                    try:
-                        num_tokens_original0 = int(num_tokens_original_data[b0].item())
-                    except Exception:
-                        num_tokens_original0 = int(round(num_tokens_upsampled_current / max(upsample_f, 1))) if upsample_f else num_tokens_upsampled_current
-                    # raw encoder time and valid time (from mask)
-                    num_hidden_frames_raw = int(hidden_encoded.shape[1])
-                    try:
-                        num_hidden_frames_valid = int(lengths_data[b0].item())
-                    except Exception:
-                        num_hidden_frames_valid = num_hidden_frames_raw
-                    num_feat_frames = num_hidden_frames_raw  # feat is resampled to hidden frames
-                    # ratios computed with valid length (more meaningful than raw tensor length)
-                    ratio_upsampled = (num_hidden_frames_valid / max(num_tokens_upsampled_current, 1)) if num_tokens_upsampled_current > 0 else 0.0
-                    ratio_original = (num_hidden_frames_valid / max(num_tokens_original0, 1)) if num_tokens_original0 > 0 else 0.0
-                    token_fps = getattr(self.cos2_flow, 'input_frame_rate', 'NA')
-                    tmr = getattr(self.cos2_flow, 'token_mel_ratio', 'NA')
-                    try:
-                        _loss_val = float(loss_val.detach().item())
-                    except Exception:
-                        _loss_val = float('nan')
-                    logging.info(
-                        f"[cos2.train] step={int(self._step)} streaming={bool(is_streaming)} num_tokens_original={num_tokens_original0} num_tokens_upsampled={num_tokens_upsampled_current} num_hidden_raw={num_hidden_frames_raw} num_hidden_valid={num_hidden_frames_valid} num_feat={num_feat_frames} valid/original={ratio_original:.3f} valid/upsampled={ratio_upsampled:.3f} loss={_loss_val:.6f} cfg: token_fps={token_fps} token_mel_ratio={tmr} up_factor={upsample_f}"
-                    )
-                except Exception:
-                    pass
-        
-        # ============================================================================
-        # Streaming-specific helper functions
-        # ============================================================================
-        
-        def _extract_sample_tokens_and_text(batch_dict, b_idx, text_tokens_all, num_tokens_original_all, batch_size, device_target):
-            """Extract tokens and text for a single sample from the batch.
-            
-            Args:
-                batch_dict (dict): The input batch dictionary containing 'speech_token' and other keys
-                b_idx (int): The batch index of the sample to extract (0-based)
-                text_tokens_all (torch.Tensor or None): All text tokens for the batch, shape [B, T_text] or None
-                num_tokens_original_all (torch.Tensor): Original token lengths for all samples in batch, shape [B]
-                batch_size (int): Batch size
-                device_target (torch.device): Target device to move tensors to
-                
-            Returns:
-                tuple: (sample_token_ids, sample_token_len, sample_text_token_ids, sample_text_token_len) where:
-                    - sample_token_ids: Speech tokens for sample b_idx, shape [1, T_tok]
-                    - sample_token_len: Effective token length for sample b_idx (int)
-                    - sample_text_token_ids: Text tokens for sample b_idx, shape [1, T_text] or None
-                    - sample_text_token_len: Effective text length for sample b_idx (int)
-            """
-            sample_token_ids = batch_dict['speech_token'][b_idx:b_idx+1].to(device_target)
-            sample_token_len = int(num_tokens_original_all[b_idx].item())
-            
-            # text tokens and effective length for this sample
-            if isinstance(text_tokens_all, torch.Tensor) and text_tokens_all.size(0) == batch_size:
-                sample_text_token_ids = text_tokens_all[b_idx:b_idx+1].to(device_target)
-            else:
-                sample_text_token_ids = text_tokens_all.to(device_target) if isinstance(text_tokens_all, torch.Tensor) else None
-            
-            text_token_lens = batch_dict.get('text_token_len', None)
-            if isinstance(text_token_lens, torch.Tensor) and text_token_lens.numel() >= (b_idx + 1):
-                sample_text_token_len = int(text_token_lens[b_idx].item())
-            else:
-                sample_text_token_len = int(sample_text_token_ids.shape[1]) if isinstance(sample_text_token_ids, torch.Tensor) else 0
-            
-            return sample_token_ids, sample_token_len, sample_text_token_ids, sample_text_token_len
-        
-        
-        def _precompute_token_and_text_embeddings(sample_token_ids, sample_token_len, sample_text_token_ids, sample_text_token_len, upsample_f):
-            """Precompute upsampled token embeddings and full text embeddings.
-            
-            Args:
-                sample_token_ids (torch.Tensor): Speech tokens for the current sample [1, T_tok]
-                sample_token_len (int): Effective token length for the current sample
-                sample_text_token_ids (torch.Tensor): Text tokens for the current sample [1, T_text] or None
-                sample_text_token_len (int): Effective text length for the current sample
-                upsample_f (int): Upsampling factor used for token alignment
-            
-            Returns:
-                tuple: (token_emb_full, num_tokens_upsampled, text_token_emb_full) where:
-                    - token_emb_full: Upsampled token embeddings [1, num_tokens_upsampled, D]
-                    - num_tokens_upsampled: Effective token length after upsampling
-                    - text_token_emb_full: Full text embeddings [1, T_text, D] or None
-            """
-            # Upsample tokens
-            if upsample_f > 1 and sample_token_ids.numel() > 0:
-                token_ids_upsampled = sample_token_ids.repeat_interleave(upsample_f, dim=1)
-            else:
-                token_ids_upsampled = sample_token_ids
-            num_tokens_upsampled = token_ids_upsampled.shape[1]
-            token_ids_upsampled = torch.clamp(token_ids_upsampled, min=0)
-            token_emb_full = self.cos2_flow.input_embedding(token_ids_upsampled)
-            
-            # Pre-embed full text once
-            if isinstance(sample_text_token_ids, torch.Tensor) and sample_text_token_ids.numel() > 0:
-                sample_text_token_ids = torch.clamp(sample_text_token_ids[:, :sample_text_token_len], min=0, max=self._text_vocab_size - 1)
-                text_token_emb_full = self.text_context_emb(sample_text_token_ids)
-            else:
-                text_token_emb_full = None
-            
-            return token_emb_full, num_tokens_upsampled, text_token_emb_full
-        
-        def _compute_first_chunk_length(block_size, sample_token_len, upsample_f, b_idx, device_target):
-            """Compute first chunk length (possibly randomized) and log if needed.
-            
-            Args:
-                block_size (int): Chunking block size in original token units
-                sample_token_len (int): Effective token length for the current sample
-                upsample_f (int): Upsampling factor used for token alignment
-                b_idx (int): Batch index of the current sample
-                device_target (torch.device): Target device for computations
-                
-            Returns:
-                token_first_chunk_len (int): First chunk length in original token units
-            """
-            if self._stream_train_first_block_random and block_size > 0:
-                token_first_chunk_len = int(torch.randint(low=1, high=block_size + 1, size=(1,), device=device_target).item())
-            else:
-                token_first_chunk_len = int(block_size)
-            token_first_chunk_len = max(1, min(token_first_chunk_len, int(sample_token_len))) if int(sample_token_len) > 0 else 0
-            first_len_upsampled = int(token_first_chunk_len * int(upsample_f)) if token_first_chunk_len > 0 else 0
-            
-            # training-time log: show randomized first block length (once per batch: b==0)
-            if token_first_chunk_len > 0 and b_idx == 0 and (int(self._step) % max(self._print_per_n_chunk, 1) == 0):
-                block_size_upsampled = max(1, block_size * int(upsample_f))
-                num_tokens_upsampled_real = int(sample_token_len * upsample_f)
-                logging.info(f"[cos2.train.rand_first] token_first_chunk_len={token_first_chunk_len} first_len_upsampled={first_len_upsampled} block_size={block_size} block_size_upsampled={block_size_upsampled} num_tokens_upsampled_real={num_tokens_upsampled_real}")
-            
-            return token_first_chunk_len
-        
-        def _build_chunk_boundaries(sample_token_len, token_first_chunk_len, block_size):
-            """Build chunk start/end positions on original token axis.
-            
-            Args:
-                sample_token_len (int): Effective token length for the current sample
-                token_first_chunk_len (int): First chunk length in original token units
-                block_size (int): Chunking block size in original token units
-            
-            Returns:
-                tuple: (token_chunk_starts, token_chunk_ends, num_chunks) where:
-                    - token_chunk_starts: Start indices for each chunk on token axis
-                    - token_chunk_ends: End indices for each chunk on token axis
-                    - num_chunks: Number of chunks in the batch
-            """
-            if int(sample_token_len) <= 0:
-                return [], [], 0
-            
-            token_chunk_starts = [0]
-            if token_first_chunk_len < int(sample_token_len):
-                token_chunk_starts += list(range(token_first_chunk_len, int(sample_token_len), int(block_size)))
-            
-            # corresponding ends
-            token_chunk_ends = []
-            for i, st in enumerate(token_chunk_starts):
-                if i == 0:
-                    en = min(st + token_first_chunk_len, int(sample_token_len))
-                else:
-                    en = min(st + int(block_size), int(sample_token_len))
-                token_chunk_ends.append(en)
-            
-            num_chunks = len(token_chunk_starts)
-            return token_chunk_starts, token_chunk_ends, num_chunks
-        
-        def _slice_and_batch_token_embeddings(
-            token_chunk_starts, token_chunk_ends, token_emb_full, upsample_f, sample_token_len, 
-            block_size, device_target
-        ):
-            """Slice token embeddings per chunk and build padded batch tensor.
-            
-            Args:
-                token_chunk_starts (list): Start indices for each chunk on token axis
-                token_chunk_ends (list): End indices for each chunk on token axis
-                token_emb_full (torch.Tensor): Upsampled token embeddings [1, num_tokens_upsampled, D]
-                upsample_f (int): Upsampling factor used for token alignment
-                sample_token_len (int): Effective token length for the current sample
-                block_size (int): Chunking block size in original token units
-                device_target (torch.device): Target device for computations
-
-            Returns:
-                tuple: (token_batch, len_vec, max_len) where:
-                    - token_batch: Padded token embeddings [Nchunk, Lmax, D]
-                    - len_vec: Sequence lengths [Nchunk]
-                    - max_len: Maximum length of token embeddings in the batch
-            """
-            from cosyvoice.utils.mask import make_pad_mask
-            
-            block_size_upsampled = max(1, block_size * int(upsample_f))
-            num_tokens_upsampled_real = int(sample_token_len * upsample_f)
-            
-            token_slices = []
-            token_lens = []
-            for i, token_start in enumerate(token_chunk_starts):
-                idx_upsampled = int(token_start) * int(upsample_f)
-                token_end = int(token_chunk_ends[i])
-                token_chunk_len = max(0, token_end - int(token_start))
-                len_upsampled = int(max(0, min(int(token_chunk_len) * int(upsample_f), num_tokens_upsampled_real - idx_upsampled)))
-                if len_upsampled <= 0:
-                    continue
-                te = token_emb_full[:, idx_upsampled: idx_upsampled + len_upsampled]
-                if self._fixed_window_pad and te.shape[1] < block_size_upsampled:
-                    pad = te.new_zeros(1, block_size_upsampled - te.shape[1], te.shape[2])
-                    te = torch.cat([te, pad], dim=1)
-                token_slices.append(te.squeeze(0))
-                token_lens.append(len_upsampled)
-            
-            if len(token_lens) == 0:
-                return None, None, None
-            
-            # pad to [Nchunk, Lmax, D]
-            max_len = block_size_upsampled if self._fixed_window_pad else max(token_lens)
-            D = token_emb_full.shape[-1]
-            token_batch = token_emb_full.new_zeros((len(token_slices), max_len, D))
-            for i, te in enumerate(token_slices):
-                te_len = min(te.shape[0], max_len)
-                token_batch[i, :te_len] = te[:te_len]
-            
-            len_vec = torch.tensor(token_lens, dtype=torch.int32, device=device_target)
-            token_mask = (~make_pad_mask(len_vec, max_len)).float().unsqueeze(-1).to(device_target)
-            token_batch = token_batch * token_mask
-            
-            return token_batch, len_vec, max_len
-        
-        def _build_text_context_for_chunks(
-            text_token_emb_full, sample_text_token_len, token_chunk_starts, token_chunk_ends, num_chunks, 
-            sample_token_ids, sample_token_len, b_idx, device_target
-        ):
-            """Build batched text context for all chunks (debug + cross-attn or fallback).
-            
-            Args:
-                text_token_emb_full (torch.Tensor): Full text embeddings [1, N, D]
-                sample_text_token_len (int): Text token length for the current sample
-                token_chunk_starts (list): Start indices for each chunk on token axis
-                token_chunk_ends (list): End indices for each chunk on token axis
-                num_chunks (int): Number of chunks in the batch
-                sample_token_ids (torch.Tensor): Speech tokens for the current sample [1, T_tok]
-                sample_token_len (int): Effective token length for the current sample
-                b_idx (int): Batch index of the current sample
-                device_target (torch.device): Target device for computations
-
-            Variables:
-                context_len (int): Context length for text context (self._default_context_len)
-                text_chunk_ends (list): End indices for each chunk on text axis
-                kv_hist_max (int): Maximum visible text length for cross-attention
-
-            Returns:
-                text_ctx_batch (torch.Tensor): Text context batch [N, context_len, D] or None
-            """
-            if not isinstance(text_token_emb_full, torch.Tensor) or text_token_emb_full.numel() == 0:
-                return None
-            
-            context_len = self._default_context_len
-            text_chunk_ends = [int(min(int(e), int(sample_text_token_len))) for e in token_chunk_ends]
-            kv_hist_max = int(min(int(sample_text_token_len), text_token_emb_full.shape[1]))
-            
-            # optional debug: show alignment for chunks spaced every K within the batch
-            if getattr(self, '_debug_text_align', False) and (b_idx == 0) and ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0):
-                K = int(getattr(self, '_print_every_k_in_batch', 10))
-                for i in range(num_chunks):
-                    if (i % max(K,1) != 0) and (i != num_chunks - 1):
+                    attn_weights_debug = None
+                Kb = int(getattr(self, '_print_every_k_in_batch', 10))
+                for i in range(N):
+                    if (i % max(Kb,1) != 0) and (i != N - 1):
                         continue
-                    try:
-                        token_start_i = int(token_chunk_starts[i])
-                        token_end_i = int(token_chunk_ends[i])
-                        te = int(text_chunk_ends[i])
-                        kvlen = int(min(te, kv_hist_max))
-                        ctx_src = 'xattn' if self._use_cross_text_attn else 'prefix'
-                        logging.info(f"[cos2.train.text-align] b={b_idx} chunk={i}/{num_chunks} token_range=[{token_start_i}:{token_end_i}) -> text_end_idx={te}/{int(sample_text_token_len)} kv_used=[0:{kvlen}) ctx={ctx_src} context_len={context_len}")
-                    except Exception as e:
-                        logging.info(f"[cos2.train.text-align] warn: {e}")
-            
-            # Build text context using cross-attention or fallback
-            if self._use_cross_text_attn and kv_hist_max > 0:
-                token_ids_original = torch.clamp(sample_token_ids[:, :sample_token_len], min=0)
-                token_emb_original = self.cos2_flow.input_embedding(token_ids_original)
-                text_ctx_batch = _build_cross_attention_text_context(
-                    text_token_emb_full, token_chunk_starts, token_chunk_ends, sample_token_len,
-                    token_emb_original, num_chunks, kv_hist_max, text_chunk_ends, device_target, b_idx
-                )
-            elif not self._use_cross_text_attn:
-                text_ctx_batch = _build_fallback_text_context(text_token_emb_full, text_chunk_ends, context_len, device_target)
-            else:
-                text_ctx_batch = None
-            
-            return text_ctx_batch
+                    query_len = int(token_query_lens[i])
+                    key_len = int(min(int(text_chunk_ends[i]), kv_hist_max))
+                    token_start_i = int(token_chunk_starts[i]) if 'token_chunk_starts' in locals() else 0
+                    token_end_i = int(token_chunk_ends[i]) if 'token_chunk_ends' in locals() else query_len
+                    if attn_weights_debug is not None and query_len > 0 and key_len > 0:
+                        qdim = int(attn_weights_debug.shape[1])
+                        kdim = int(attn_weights_debug.shape[2])
+                        query_idx = int(max(0, min(query_len - 1, qdim - 1)))
+                        k_use = int(max(1, min(key_len, kdim)))
+                        vec = attn_weights_debug[i, query_idx, :k_use]
+                        vec = torch.softmax(vec, dim=-1)
+                        k = int(min(3, k_use))
+                        vals, idxs = torch.topk(vec, k)
+                        idxs = idxs.tolist(); vals = [float(v) for v in vals.tolist()]
+                        if query_idx != query_len - 1 or k_use != key_len:
+                            logging.info(f"[cos2.train.xattn] chunk={i}/{num_chunks} Q_len={query_len} K_len={key_len} qidx={query_idx}/{qdim} kdim={kdim} topk_idx={idxs} topk_val={[round(v,4) for v in vals]} (token=[{token_start_i}:{token_end_i}))")
+                        else:
+                            logging.info(f"[cos2.train.xattn] chunk={i}/{num_chunks} Q_len={query_len} K_len={key_len} topk_idx={idxs} topk_val={[round(v,4) for v in vals]} (token=[{token_start_i}:{token_end_i}))")
+                    else:
+                        logging.info(f"[cos2.train.xattn] chunk={i}/{num_chunks} Q_len={query_len} K_len={key_len} (no attn_w) (token=[{token_start_i}:{token_end_i}))")
+            except Exception as e:
+                logging.info(f"[cos2.train.xattn] warn: {e}")
         
-        def _reconstruct_sample_timeline(hidden_chunks, hidden_chunks_mask, num_chunks, device_target):
-            """Reconstruct per-sample timeline by concatenating valid parts of each chunk.
-            
-            Args:
-                hidden_chunks (torch.Tensor): Encoded hidden states from encoder [N, T_h, D]
-                hidden_chunks_mask (torch.Tensor): Encoder output masks [N, 1, T_h] or similar
-                num_chunks (int): Number of chunks in the batch
-                device_target (torch.device): Target device for computations
+        # Aggregate full-Q features to context_len via learned queries (no temporal pooling)
+        q_ctx = self.ctx_queries.to(attn_out.device).unsqueeze(0).expand(num_chunks, -1, -1)  # [N,context_len,D]
+        # Key mask: valid Q positions only
+        key_mask = mask_qkv  # [N,1,max_query_len] with True at valid positions
+        ctx_raw, _ = self.q2ctx_attn(query=q_ctx, key=attn_out, value=attn_out, mask=key_mask)  # [N,context_len,D]
+        text_ctx_processed = self.cross_ln(ctx_raw)
+        text_ctx_processed = text_ctx_processed + self.cross_ffn(text_ctx_processed)
+        text_ctx_batch = text_ctx_processed  # [N, context_len, D]
+        
+        return text_ctx_batch
+    
+    def _build_fallback_text_context(self, text_token_emb_full, text_chunk_ends, context_len, device_target):
+        """Build simple right-aligned text window per chunk using text_end_idx (fallback when cross-attn disabled).
+        
+        Args:
+            text_token_emb_full (torch.Tensor): Full text embeddings [1, N, D]
+            text_chunk_ends (list or torch.Tensor): End indices for each chunk [N]
+            context_len (int): Context length to build
+            device_target (torch.device): Target device for computations
 
-            Returns:
-                tuple: (sample_hidden, sample_mask, chunk_lengths) where:
-                    - sample_hidden: Concatenated hidden states [1, T_h_total, D]
-                    - sample_mask: Concatenated masks [1, 1, T_h_total]
-                    - chunk_lengths: List of lengths for each chunk [N]
-            """
-            hidden_parts = []
-            mask_parts = []
-            chunk_lengths = []
-            
-            for i in range(num_chunks):
-                try:
-                    hidden_chunks_mask_i = hidden_chunks_mask[i, 0]
-                    if hidden_chunks_mask_i.dtype != torch.bool:
-                        hidden_chunks_mask_i = hidden_chunks_mask_i > 0
-                    chunk_len = int(hidden_chunks_mask_i.sum().item())
-                except Exception:
-                    chunk_len = int(hidden_chunks.shape[1])
-                chunk_lengths.append(chunk_len)
-                hidden_parts.append(hidden_chunks[i:i+1, :chunk_len])
-                
-                if isinstance(hidden_chunks_mask, torch.Tensor):
-                    hidden_chunks_mask_slice = hidden_chunks_mask[i:i+1, :, :chunk_len]
-                    if hidden_chunks_mask_slice.dtype != torch.bool:
-                        hidden_chunks_mask_slice = hidden_chunks_mask_slice > 0
-                    mask_parts.append(hidden_chunks_mask_slice)
-                else:
-                    mask_parts.append(torch.ones(1, 1, chunk_len, dtype=torch.bool, device=device_target))
-            
-            if len(hidden_parts) > 0:
-                sample_hidden = torch.cat(hidden_parts, dim=1)
-                sample_hidden = self.cos2_flow.encoder_proj(sample_hidden)
-                try:
-                    sample_mask = torch.cat(mask_parts, dim=-1)
-                except Exception:
-                    sample_mask = torch.ones(1, 1, sample_hidden.shape[1], dtype=torch.bool, device=sample_hidden.device)
+        Returns:
+            text_ctx_batch (torch.Tensor): Text context batch [N, context_len, D]
+        """
+        ctx_list = []
+        for te in text_chunk_ends:
+            text_end_idx = int(te)
+            text_window_emb = text_token_emb_full[:, :text_end_idx]  # [1, N, D] take up to text_end_idx
+            if text_window_emb.shape[1] < context_len:
+                pad = torch.zeros(1, context_len - text_window_emb.shape[1], text_window_emb.shape[2], device=device_target, dtype=text_window_emb.dtype)
+                text_ctx = torch.cat([text_window_emb, pad], dim=1)  # right-pad to context_len
             else:
-                sample_hidden = torch.zeros(1, 0, self.MEL_DIM, device=device_target)
-                sample_mask = torch.zeros(1, 1, 0, dtype=torch.bool, device=device_target)
-            
-            return sample_hidden, sample_mask, chunk_lengths
+                text_ctx = text_window_emb[:, -context_len:]  # take the most recent context_len tokens
+            ctx_list.append(text_ctx.squeeze(0))  # [context_len, D]
+        if len(ctx_list) > 0:
+            text_ctx_batch = torch.stack(ctx_list, dim=0)  # [N, context_len, D]
+        else:
+            text_ctx_batch = None
+        return text_ctx_batch
+    
+    def _process_nonstreaming_path(self, token_data, token_len_data, text_tokens_data, upsample_f, is_streaming, device_target):
+        """Process non-streaming training: single pass without text context injection.
         
-        def _print_microbatch_debug_info(
-            b_idx, num_chunks, max_len, upsample_f, block_size, kv_hist_max, 
-            num_tokens_upsampled, chunk_lengths, sample_token_len, device_target
-        ):
-            """Print micro-batch debug statistics (first sample only, periodic).
+        Args:
+            token_data (torch.Tensor): Token data for conditioning [B, T_tok]
+            token_len_data (torch.Tensor): Token lengths for each sample in batch [B]
+            text_tokens_data (torch.Tensor): Text tokens for conditioning [B, T_text] or None
+            upsample_f (int): Upsampling factor used for token alignment
+            is_streaming (bool): Whether in streaming mode
+            device_target (torch.device): Target device for computations
             
-            Args:
-                b_idx (int): Batch index of the current sample
-                num_chunks (int): Number of chunks in the batch
-                max_len (int): Maximum length of token embeddings in the batch
-                upsample_f (int): Upsampling factor used for token alignment
-                block_size (int): Chunking block size in original token units
-                kv_hist_max (int): Maximum visible text length for cross-attention
-                num_tokens_upsampled (int): Effective token length after upsampling
-                chunk_lengths (list): List of lengths for each chunk [N]
-                sample_token_len (int): Effective token length for the current sample
-                device_target (torch.device): Target device for computations
-                
-            Returns:
-                None: This function only prints debug information to logs
-            """
-            if not (self._val_debug and b_idx == 0 and (int(self._step) % max(self._debug_every, 1) == 0)):
-                return
-            
+        Returns:
+            tuple: (hidden, hidden_mask) where:
+                - hidden (torch.Tensor): Encoded hidden states from encoder [B, T_h, 80]
+                - hidden_mask (torch.Tensor): Encoder output masks [B, 1, T_h] or similar
+        """
+        from cosyvoice.utils.mask import make_pad_mask
+        
+        # upsample entire sequence if needed
+        if upsample_f > 1:
+            token_data = token_data.repeat_interleave(upsample_f, dim=1)
+            token_len_data = token_len_data * upsample_f
+        
+        # token embedding with padding mask
+        token_mask = (~make_pad_mask(token_len_data)).float().unsqueeze(-1).to(device_target)
+        token_data = torch.clamp(token_data, min=0)
+        token_data = self.cos2_flow.input_embedding(token_data) * token_mask
+        
+        # Non-streaming: strictly no context injection (pre_lookahead disabled in training)
+        hidden, hidden_mask = self.cos2_flow.encoder(token_data, token_len_data, streaming=is_streaming)
+        hidden = self.cos2_flow.encoder_proj(hidden)  # [B, T_h, 80]
+        
+        # Lightweight debug: confirm non-streaming path does not use context
+        if (int(self._step) % max(self._debug_every, 1)) == 0 and self._val_debug:
             try:
-                kv_hist_max_val = int(kv_hist_max) if 'kv_hist_max' in locals() else 0
-            except Exception:
-                kv_hist_max_val = 0
-            
-            context_len_val = int(self._default_context_len)
-            
-            try:
-                mem_alloc = torch.cuda.memory_allocated(device_target) if torch.cuda.is_available() else 0
-                mem_reserved = torch.cuda.memory_reserved(device_target) if torch.cuda.is_available() else 0
-            except Exception:
-                mem_alloc, mem_reserved = 0, 0
-            
-            try:
-                tmr_dbg = float(getattr(self.cos2_flow, 'token_mel_ratio', 4.0))
-            except Exception:
-                tmr_dbg = 4.0
-            
-            try:
-                sum_lens = int(sum(chunk_lengths)) if chunk_lengths and len(chunk_lengths) > 0 else 0
-                min_chunk_len = min(chunk_lengths) if chunk_lengths and len(chunk_lengths) > 0 else 0
-                max_chunk_len = max(chunk_lengths) if chunk_lengths and len(chunk_lengths) > 0 else 0
-                avg_chunk_len = (sum_lens / max(len(chunk_lengths), 1)) if chunk_lengths and len(chunk_lengths) > 0 else 0
-            except Exception:
-                sum_lens, min_chunk_len, max_chunk_len, avg_chunk_len = 0, 0, 0, 0
-            
-            expected_len = int(round(sample_token_len * tmr_dbg))
-            
-            try:
+                b0 = 0
+                num_text_tokens = int(text_tokens_data.shape[1]) if isinstance(text_tokens_data, torch.Tensor) else 0
                 logging.info(
-                    f"[cos2.train.mb] b={b_idx} chunks={num_chunks} max_len={max_len} up={upsample_f} block={block_size} xattn={self._use_cross_text_attn} kv_hist_max={kv_hist_max_val} context_len={context_len_val} num_tokens_upsampled={num_tokens_upsampled} | chunk_len(min/avg/max/sum)={min_chunk_len}/{avg_chunk_len:.1f}/{max_chunk_len}/{sum_lens} expected_len≈{expected_len} | mem(MB) alloc={mem_alloc/1e6:.1f} reserved={mem_reserved/1e6:.1f}"
+                    f"[cos2.train.nonstream] B={token_data.shape[0]} num_tokens_upsampled={int(token_len_data[b0].item())} num_text_tokens={num_text_tokens} ctx_used=False xattn={self._use_cross_text_attn}"
                 )
             except Exception:
                 pass
         
-        def _pad_and_concatenate_batch(hidden_list, mask_list):
-            """Pad all samples to max time and concatenate into batch.
-            
-            Args:
-                hidden_list (list): List of hidden states from encoder [N, T_h, D]
-                mask_list (list): List of encoder output masks [N, 1, T_h] or similar
-                
-            Returns:
-                tuple: (hidden, hidden_mask) where:
-                    - hidden: Concatenated hidden states [B, T_h_total, D]
-                    - hidden_mask: Concatenated masks [B, 1, T_h_total]
-            """
-            time_lengths = [hidden_i.shape[1] for hidden_i in hidden_list]
-            max_time_length = max(time_lengths) if len(time_lengths) > 0 else 0
-            H_cat = []
-            M_cat = []
-            for sample_hidden, sample_mask in zip(hidden_list, mask_list):
-                if sample_hidden.shape[1] < max_time_length:
-                    pad_len = max_time_length - sample_hidden.shape[1]
-                    sample_hidden = torch.cat([sample_hidden, sample_hidden.new_zeros(sample_hidden.shape[0], pad_len, sample_hidden.shape[2])], dim=1)
-                    sample_mask = torch.cat([sample_mask, torch.zeros(sample_mask.shape[0], sample_mask.shape[1], pad_len, dtype=torch.bool, device=sample_mask.device)], dim=-1)
-                H_cat.append(sample_hidden)
-                M_cat.append(sample_mask)
-            hidden = torch.cat(H_cat, dim=0) if len(H_cat) > 1 else H_cat[0]
-            hidden_mask = torch.cat(M_cat, dim=0) if len(M_cat) > 1 else M_cat[0]
-            return hidden, hidden_mask
+        return hidden, hidden_mask
+    
+    def _build_condition_and_compute_loss(self, hidden_encoded, hidden_encoded_mask, feat_data, feat_len_data, embedding_data, is_streaming):
+        """Build partial cond prefix and compute decoder loss.
         
+        Args:
+            hidden_encoded (torch.Tensor): Encoded hidden states from encoder [B, T_h, D]
+            hidden_encoded_mask (torch.Tensor): Encoder output masks [B, 1, T_h] or similar
+            feat_data (torch.Tensor): Feature data for conditioning [B, T_feat, 80]
+            feat_len_data (torch.Tensor): Feature length for conditioning [B]
+            embedding_data (torch.Tensor): Embedding data for decoder
+            is_streaming (bool): Whether in streaming mode
+            
+        Returns:
+            tuple: (loss, lengths) where:
+                - loss (torch.Tensor): Computed decoder loss
+                - lengths (torch.Tensor): Sequence lengths [B]
+        """
+        from cosyvoice.utils.mask import make_pad_mask
+        
+        # Build partial cond prefix consistent with CosyVoice2 training (<=30% prefix)
+        # Then resample to match encoder output length
+        num_hidden_frames = hidden_encoded.shape[1]
+        feat_dim = feat_data.shape[2] # 80
+
+        # Interpolate feat_data to num_hidden_frames
+        feat_len_data = feat_len_data * num_hidden_frames / feat_data.shape[1] # [B]
+        feat_data = F.interpolate(feat_data.unsqueeze(dim=1), size=(num_hidden_frames, feat_dim), mode='nearest').squeeze(dim=1) # [B, T_h, 80]
+
+        conds = feat_data.new_zeros(feat_data.shape)  # [B, T_h, 80]
+        for i, j in enumerate(feat_len_data):
+            if random.random() < 0.5:
+                continue
+            index = random.randint(0, int(0.3 * j))
+            conds[i, :index] = feat_data[i, :index]
+
+        # Build mask based on encoder masks -> lengths
+        if isinstance(hidden_encoded_mask, torch.Tensor):  # [B,1,T_h] bool
+            lengths = hidden_encoded_mask.sum(dim=-1).squeeze(1)
+            mask = (~make_pad_mask(lengths)).to(hidden_encoded)
+        else:
+            # fallback: full True mask
+            mask = torch.ones(hidden_encoded.shape[0], hidden_encoded.shape[1], dtype=torch.bool, device=hidden_encoded.device)
+
+        # resample feat to T_h (target x1)
+        x1 = feat_data.transpose(1, 2).contiguous()  # [B, 80, T_h]
+
+        conds_chw = conds.transpose(1, 2).contiguous()  # [B, 80, T_h]
+
+        # call decoder loss
+        loss, _ = self.cos2_flow.decoder.compute_loss(
+            x1,
+            mask.unsqueeze(1),
+            hidden_encoded.transpose(1, 2).contiguous(),
+            embedding_data,
+            cond=conds_chw,
+            streaming=bool(is_streaming),
+        )
+        
+        return loss, lengths
+    
+    def _print_training_debug_info(
+        self,
+        loss_val, is_streaming, token_len_data, num_tokens_original_data, hidden_encoded, lengths_data, 
+        upsample_f, token_data
+    ):
+        """Print periodic training-time debug information.
+        
+        Args:
+            loss_val (torch.Tensor): The computed loss value
+            is_streaming (bool): Whether streaming mode is enabled
+            token_len_data (torch.Tensor): Token lengths for each sample in batch
+            num_tokens_original_data (torch.Tensor): Original token lengths before upsampling
+            hidden_encoded (torch.Tensor): Encoder hidden states, shape [B, T_h, D]
+            lengths_data (torch.Tensor): Valid lengths from encoder masks
+            upsample_f (int): Upsampling factor used for token alignment
+            token_data (torch.Tensor): Token data tensor
+            
+        Returns:
+            None: This function only prints debug information to logs
+        """
+        if int(self._step) % int(self._debug_every) == 0:
+            try:
+                # pick the first sample in batch for concise logging
+                b0 = 0
+                num_tokens_upsampled_current = int(token_len_data[b0].item()) if torch.is_tensor(token_len_data) else int(token_data.shape[1])
+                # original (pre-upsample) length if available
+                try:
+                    num_tokens_original0 = int(num_tokens_original_data[b0].item())
+                except Exception:
+                    num_tokens_original0 = int(round(num_tokens_upsampled_current / max(upsample_f, 1))) if upsample_f else num_tokens_upsampled_current
+                # raw encoder time and valid time (from mask)
+                num_hidden_frames_raw = int(hidden_encoded.shape[1])
+                try:
+                    num_hidden_frames_valid = int(lengths_data[b0].item())
+                except Exception:
+                    num_hidden_frames_valid = num_hidden_frames_raw
+                num_feat_frames = num_hidden_frames_raw  # feat is resampled to hidden frames
+                # ratios computed with valid length (more meaningful than raw tensor length)
+                ratio_upsampled = (num_hidden_frames_valid / max(num_tokens_upsampled_current, 1)) if num_tokens_upsampled_current > 0 else 0.0
+                ratio_original = (num_hidden_frames_valid / max(num_tokens_original0, 1)) if num_tokens_original0 > 0 else 0.0
+                token_fps = getattr(self.cos2_flow, 'input_frame_rate', 'NA')
+                tmr = getattr(self.cos2_flow, 'token_mel_ratio', 'NA')
+                try:
+                    _loss_val = float(loss_val.detach().item())
+                except Exception:
+                    _loss_val = float('nan')
+                logging.info(
+                    f"[cos2.train] step={int(self._step)} streaming={bool(is_streaming)} num_tokens_original={num_tokens_original0} num_tokens_upsampled={num_tokens_upsampled_current} num_hidden_raw={num_hidden_frames_raw} num_hidden_valid={num_hidden_frames_valid} num_feat={num_feat_frames} valid/original={ratio_original:.3f} valid/upsampled={ratio_upsampled:.3f} loss={_loss_val:.6f} cfg: token_fps={token_fps} token_mel_ratio={tmr} up_factor={upsample_f}"
+                )
+            except Exception:
+                pass
+
+    def _extract_sample_tokens_and_text(self, batch_dict, b_idx, text_tokens_all, num_tokens_original_all, batch_size, device_target):
+        """Extract tokens and text for a single sample from the batch.
+        
+        Args:
+            batch_dict (dict): The input batch dictionary containing 'speech_token' and other keys
+            b_idx (int): The batch index of the sample to extract (0-based)
+            text_tokens_all (torch.Tensor or None): All text tokens for the batch, shape [B, T_text] or None
+            num_tokens_original_all (torch.Tensor): Original token lengths for all samples in batch, shape [B]
+            batch_size (int): Batch size
+            device_target (torch.device): Target device to move tensors to
+            
+        Returns:
+            tuple: (sample_token_ids, sample_token_len, sample_text_token_ids, sample_text_token_len) where:
+                - sample_token_ids: Speech tokens for sample b_idx, shape [1, T_tok]
+                - sample_token_len: Effective token length for sample b_idx (int)
+                - sample_text_token_ids: Text tokens for sample b_idx, shape [1, T_text] or None
+                - sample_text_token_len: Effective text length for sample b_idx (int)
+        """
+        sample_token_ids = batch_dict['speech_token'][b_idx:b_idx+1].to(device_target)
+        sample_token_len = int(num_tokens_original_all[b_idx].item())
+        
+        # text tokens and effective length for this sample
+        if isinstance(text_tokens_all, torch.Tensor) and text_tokens_all.size(0) == batch_size:
+            sample_text_token_ids = text_tokens_all[b_idx:b_idx+1].to(device_target)
+        else:
+            sample_text_token_ids = text_tokens_all.to(device_target) if isinstance(text_tokens_all, torch.Tensor) else None
+        
+        text_token_lens = batch_dict.get('text_token_len', None)
+        if isinstance(text_token_lens, torch.Tensor) and text_token_lens.numel() >= (b_idx + 1):
+            sample_text_token_len = int(text_token_lens[b_idx].item())
+        else:
+            sample_text_token_len = int(sample_text_token_ids.shape[1]) if isinstance(sample_text_token_ids, torch.Tensor) else 0
+        
+        return sample_token_ids, sample_token_len, sample_text_token_ids, sample_text_token_len
+    
+    def _precompute_token_and_text_embeddings(self, sample_token_ids, sample_token_len, sample_text_token_ids, sample_text_token_len, upsample_f):
+        """Precompute upsampled token embeddings and full text embeddings.
+        
+        Args:
+            sample_token_ids (torch.Tensor): Speech tokens for the current sample [1, T_tok]
+            sample_token_len (int): Effective token length for the current sample
+            sample_text_token_ids (torch.Tensor): Text tokens for the current sample [1, T_text] or None
+            sample_text_token_len (int): Effective text length for the current sample
+            upsample_f (int): Upsampling factor used for token alignment
+        
+        Returns:
+            tuple: (token_emb_full, num_tokens_upsampled, text_token_emb_full) where:
+                - token_emb_full: Upsampled token embeddings [1, num_tokens_upsampled, D]
+                - num_tokens_upsampled: Effective token length after upsampling
+                - text_token_emb_full: Full text embeddings [1, T_text, D] or None
+        """
+        # Upsample tokens
+        if upsample_f > 1 and sample_token_ids.numel() > 0:
+            token_ids_upsampled = sample_token_ids.repeat_interleave(upsample_f, dim=1)
+        else:
+            token_ids_upsampled = sample_token_ids
+        num_tokens_upsampled = token_ids_upsampled.shape[1]
+        token_ids_upsampled = torch.clamp(token_ids_upsampled, min=0)
+        token_emb_full = self.cos2_flow.input_embedding(token_ids_upsampled)
+        
+        # Pre-embed full text once
+        if isinstance(sample_text_token_ids, torch.Tensor) and sample_text_token_ids.numel() > 0:
+            sample_text_token_ids = torch.clamp(sample_text_token_ids[:, :sample_text_token_len], min=0, max=self._text_vocab_size - 1)
+            text_token_emb_full = self.text_context_emb(sample_text_token_ids)
+        else:
+            text_token_emb_full = None
+        
+        return token_emb_full, num_tokens_upsampled, text_token_emb_full
+    
+    def _compute_first_chunk_length(self, block_size, sample_token_len, upsample_f, b_idx, device_target):
+        """Compute first chunk length (possibly randomized) and log if needed.
+        
+        Args:
+            block_size (int): Chunking block size in original token units
+            sample_token_len (int): Effective token length for the current sample
+            upsample_f (int): Upsampling factor used for token alignment
+            b_idx (int): Batch index of the current sample
+            device_target (torch.device): Target device for computations
+            
+        Returns:
+            token_first_chunk_len (int): First chunk length in original token units
+        """
+        if self._stream_train_first_block_random and block_size > 0:
+            token_first_chunk_len = int(torch.randint(low=1, high=block_size + 1, size=(1,), device=device_target).item())
+        else:
+            token_first_chunk_len = int(block_size)
+        token_first_chunk_len = max(1, min(token_first_chunk_len, int(sample_token_len))) if int(sample_token_len) > 0 else 0
+        first_len_upsampled = int(token_first_chunk_len * int(upsample_f)) if token_first_chunk_len > 0 else 0
+        
+        # training-time log: show randomized first block length (once per batch: b==0)
+        if token_first_chunk_len > 0 and b_idx == 0 and (int(self._step) % max(self._print_per_n_chunk, 1) == 0):
+            block_size_upsampled = max(1, block_size * int(upsample_f))
+            num_tokens_upsampled_real = int(sample_token_len * upsample_f)
+            logging.info(f"[cos2.train.rand_first] token_first_chunk_len={token_first_chunk_len} first_len_upsampled={first_len_upsampled} block_size={block_size} block_size_upsampled={block_size_upsampled} num_tokens_upsampled_real={num_tokens_upsampled_real}")
+        
+        return token_first_chunk_len
+    
+    def _build_chunk_boundaries(self, sample_token_len, token_first_chunk_len, block_size):
+        """Build chunk start/end positions on original token axis.
+        
+        Args:
+            sample_token_len (int): Effective token length for the current sample
+            token_first_chunk_len (int): First chunk length in original token units
+            block_size (int): Chunking block size in original token units
+        
+        Returns:
+            tuple: (token_chunk_starts, token_chunk_ends, num_chunks) where:
+                - token_chunk_starts: Start indices for each chunk on token axis
+                - token_chunk_ends: End indices for each chunk on token axis
+                - num_chunks: Number of chunks in the batch
+        """
+        if int(sample_token_len) <= 0:
+            return [], [], 0
+        
+        token_chunk_starts = [0]
+        if token_first_chunk_len < int(sample_token_len):
+            token_chunk_starts += list(range(token_first_chunk_len, int(sample_token_len), int(block_size)))
+        
+        # corresponding ends
+        token_chunk_ends = []
+        for i, st in enumerate(token_chunk_starts):
+            if i == 0:
+                en = min(st + token_first_chunk_len, int(sample_token_len))
+            else:
+                en = min(st + int(block_size), int(sample_token_len))
+            token_chunk_ends.append(en)
+        
+        num_chunks = len(token_chunk_starts)
+        return token_chunk_starts, token_chunk_ends, num_chunks
+    
+    def _slice_and_batch_token_embeddings(
+        self,
+        token_chunk_starts, token_chunk_ends, token_emb_full, upsample_f, sample_token_len, 
+        block_size, device_target
+    ):
+        """Slice token embeddings per chunk and build padded batch tensor.
+        
+        Args:
+            token_chunk_starts (list): Start indices for each chunk on token axis
+            token_chunk_ends (list): End indices for each chunk on token axis
+            token_emb_full (torch.Tensor): Upsampled token embeddings [1, num_tokens_upsampled, D]
+            upsample_f (int): Upsampling factor used for token alignment
+            sample_token_len (int): Effective token length for the current sample
+            block_size (int): Chunking block size in original token units
+            device_target (torch.device): Target device for computations
+
+        Returns:
+            tuple: (token_batch, len_vec, max_len) where:
+                - token_batch: Padded token embeddings [Nchunk, Lmax, D]
+                - len_vec: Sequence lengths [Nchunk]
+                - max_len: Maximum length of token embeddings in the batch
+        """
+        from cosyvoice.utils.mask import make_pad_mask
+        
+        block_size_upsampled = max(1, block_size * int(upsample_f))
+        num_tokens_upsampled_real = int(sample_token_len * upsample_f)
+        
+        token_slices = []
+        token_lens = []
+        for i, token_start in enumerate(token_chunk_starts):
+            idx_upsampled = int(token_start) * int(upsample_f)
+            token_end = int(token_chunk_ends[i])
+            token_chunk_len = max(0, token_end - int(token_start))
+            len_upsampled = int(max(0, min(int(token_chunk_len) * int(upsample_f), num_tokens_upsampled_real - idx_upsampled)))
+            if len_upsampled <= 0:
+                continue
+            te = token_emb_full[:, idx_upsampled: idx_upsampled + len_upsampled]
+            if self._fixed_window_pad and te.shape[1] < block_size_upsampled:
+                pad = te.new_zeros(1, block_size_upsampled - te.shape[1], te.shape[2])
+                te = torch.cat([te, pad], dim=1)
+            token_slices.append(te.squeeze(0))
+            token_lens.append(len_upsampled)
+        
+        if len(token_lens) == 0:
+            return None, None, None
+        
+        # pad to [Nchunk, Lmax, D]
+        max_len = block_size_upsampled if self._fixed_window_pad else max(token_lens)
+        D = token_emb_full.shape[-1]
+        token_batch = token_emb_full.new_zeros((len(token_slices), max_len, D))
+        for i, te in enumerate(token_slices):
+            te_len = min(te.shape[0], max_len)
+            token_batch[i, :te_len] = te[:te_len]
+        
+        len_vec = torch.tensor(token_lens, dtype=torch.int32, device=device_target)
+        token_mask = (~make_pad_mask(len_vec, max_len)).float().unsqueeze(-1).to(device_target)
+        token_batch = token_batch * token_mask
+        
+        return token_batch, len_vec, max_len
+    
+    def _build_text_context_for_chunks(
+        self,
+        text_token_emb_full, sample_text_token_len, token_chunk_starts, token_chunk_ends, num_chunks, 
+        sample_token_ids, sample_token_len, b_idx, device_target
+    ):
+        """Build batched text context for all chunks (debug + cross-attn or fallback).
+        
+        Args:
+            text_token_emb_full (torch.Tensor): Full text embeddings [1, N, D]
+            sample_text_token_len (int): Text token length for the current sample
+            token_chunk_starts (list): Start indices for each chunk on token axis
+            token_chunk_ends (list): End indices for each chunk on token axis
+            num_chunks (int): Number of chunks in the batch
+            sample_token_ids (torch.Tensor): Speech tokens for the current sample [1, T_tok]
+            sample_token_len (int): Effective token length for the current sample
+            b_idx (int): Batch index of the current sample
+            device_target (torch.device): Target device for computations
+
+        Variables:
+            context_len (int): Context length for text context (self._default_context_len)
+            text_chunk_ends (list): End indices for each chunk on text axis
+            kv_hist_max (int): Maximum visible text length for cross-attention
+
+        Returns:
+            text_ctx_batch (torch.Tensor): Text context batch [N, context_len, D] or None
+        """
+        if not isinstance(text_token_emb_full, torch.Tensor) or text_token_emb_full.numel() == 0:
+            return None
+        
+        context_len = self._default_context_len
+        text_chunk_ends = [int(min(int(e), int(sample_text_token_len))) for e in token_chunk_ends]
+        kv_hist_max = int(min(int(sample_text_token_len), text_token_emb_full.shape[1]))
+        
+        # optional debug: show alignment for chunks spaced every K within the batch
+        if getattr(self, '_debug_text_align', False) and (b_idx == 0) and ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0):
+            K = int(getattr(self, '_print_every_k_in_batch', 10))
+            for i in range(num_chunks):
+                if (i % max(K,1) != 0) and (i != num_chunks - 1):
+                    continue
+                try:
+                    token_start_i = int(token_chunk_starts[i])
+                    token_end_i = int(token_chunk_ends[i])
+                    te = int(text_chunk_ends[i])
+                    kvlen = int(min(te, kv_hist_max))
+                    ctx_src = 'xattn' if self._use_cross_text_attn else 'prefix'
+                    logging.info(f"[cos2.train.text-align] b={b_idx} chunk={i}/{num_chunks} token_range=[{token_start_i}:{token_end_i}) -> text_end_idx={te}/{int(sample_text_token_len)} kv_used=[0:{kvlen}) ctx={ctx_src} context_len={context_len}")
+                except Exception as e:
+                    logging.info(f"[cos2.train.text-align] warn: {e}")
+        
+        # Build text context using cross-attention or fallback
+        if self._use_cross_text_attn and kv_hist_max > 0:
+            token_ids_original = torch.clamp(sample_token_ids[:, :sample_token_len], min=0)
+            token_emb_original = self.cos2_flow.input_embedding(token_ids_original)
+            text_ctx_batch = self._build_cross_attention_text_context(
+                text_token_emb_full, token_chunk_starts, token_chunk_ends, sample_token_len,
+                token_emb_original, num_chunks, kv_hist_max, text_chunk_ends, device_target, b_idx
+            )
+        elif not self._use_cross_text_attn:
+            text_ctx_batch = self._build_fallback_text_context(text_token_emb_full, text_chunk_ends, context_len, device_target)
+        else:
+            text_ctx_batch = None
+        
+        return text_ctx_batch
+    
+    def _reconstruct_sample_timeline(self, hidden_chunks, hidden_chunks_mask, num_chunks, device_target):
+        """Reconstruct per-sample timeline by concatenating valid parts of each chunk.
+        
+        Args:
+            hidden_chunks (torch.Tensor): Encoded hidden states from encoder [N, T_h, D]
+            hidden_chunks_mask (torch.Tensor): Encoder output masks [N, 1, T_h] or similar
+            num_chunks (int): Number of chunks in the batch
+            device_target (torch.device): Target device for computations
+
+        Returns:
+            tuple: (sample_hidden, sample_mask, chunk_lengths) where:
+                - sample_hidden: Concatenated hidden states [1, T_h_total, D]
+                - sample_mask: Concatenated masks [1, 1, T_h_total]
+                - chunk_lengths: List of lengths for each chunk [N]
+        """
+        hidden_parts = []
+        mask_parts = []
+        chunk_lengths = []
+        
+        for i in range(num_chunks):
+            try:
+                hidden_chunks_mask_i = hidden_chunks_mask[i, 0]
+                if hidden_chunks_mask_i.dtype != torch.bool:
+                    hidden_chunks_mask_i = hidden_chunks_mask_i > 0
+                chunk_len = int(hidden_chunks_mask_i.sum().item())
+            except Exception:
+                chunk_len = int(hidden_chunks.shape[1])
+            chunk_lengths.append(chunk_len)
+            hidden_parts.append(hidden_chunks[i:i+1, :chunk_len])
+            
+            if isinstance(hidden_chunks_mask, torch.Tensor):
+                hidden_chunks_mask_slice = hidden_chunks_mask[i:i+1, :, :chunk_len]
+                if hidden_chunks_mask_slice.dtype != torch.bool:
+                    hidden_chunks_mask_slice = hidden_chunks_mask_slice > 0
+                mask_parts.append(hidden_chunks_mask_slice)
+            else:
+                mask_parts.append(torch.ones(1, 1, chunk_len, dtype=torch.bool, device=device_target))
+        
+        if len(hidden_parts) > 0:
+            sample_hidden = torch.cat(hidden_parts, dim=1)
+            sample_hidden = self.cos2_flow.encoder_proj(sample_hidden)
+            try:
+                sample_mask = torch.cat(mask_parts, dim=-1)
+            except Exception:
+                sample_mask = torch.ones(1, 1, sample_hidden.shape[1], dtype=torch.bool, device=sample_hidden.device)
+        else:
+            sample_hidden = torch.zeros(1, 0, self.MEL_DIM, device=device_target)
+            sample_mask = torch.zeros(1, 1, 0, dtype=torch.bool, device=device_target)
+        
+        return sample_hidden, sample_mask, chunk_lengths
+    
+    def _print_microbatch_debug_info(
+        self,
+        b_idx, num_chunks, max_len, upsample_f, block_size, kv_hist_max, 
+        num_tokens_upsampled, chunk_lengths, sample_token_len, device_target
+    ):
+        """Print micro-batch debug statistics (first sample only, periodic).
+        
+        Args:
+            b_idx (int): Batch index of the current sample
+            num_chunks (int): Number of chunks in the batch
+            max_len (int): Maximum length of token embeddings in the batch
+            upsample_f (int): Upsampling factor used for token alignment
+            block_size (int): Chunking block size in original token units
+            kv_hist_max (int): Maximum visible text length for cross-attention
+            num_tokens_upsampled (int): Effective token length after upsampling
+            chunk_lengths (list): List of lengths for each chunk [N]
+            sample_token_len (int): Effective token length for the current sample
+            device_target (torch.device): Target device for computations
+            
+        Returns:
+            None: This function only prints debug information to logs
+        """
+        if not (self._val_debug and b_idx == 0 and (int(self._step) % max(self._debug_every, 1) == 0)):
+            return
+        
+        try:
+            kv_hist_max_val = int(kv_hist_max) if 'kv_hist_max' in locals() else 0
+        except Exception:
+            kv_hist_max_val = 0
+        
+        context_len_val = int(self._default_context_len)
+        
+        try:
+            mem_alloc = torch.cuda.memory_allocated(device_target) if torch.cuda.is_available() else 0
+            mem_reserved = torch.cuda.memory_reserved(device_target) if torch.cuda.is_available() else 0
+        except Exception:
+            mem_alloc, mem_reserved = 0, 0
+        
+        try:
+            tmr_dbg = float(getattr(self.cos2_flow, 'token_mel_ratio', 4.0))
+        except Exception:
+            tmr_dbg = 4.0
+        
+        try:
+            sum_lens = int(sum(chunk_lengths)) if chunk_lengths and len(chunk_lengths) > 0 else 0
+            min_chunk_len = min(chunk_lengths) if chunk_lengths and len(chunk_lengths) > 0 else 0
+            max_chunk_len = max(chunk_lengths) if chunk_lengths and len(chunk_lengths) > 0 else 0
+            avg_chunk_len = (sum_lens / max(len(chunk_lengths), 1)) if chunk_lengths and len(chunk_lengths) > 0 else 0
+        except Exception:
+            sum_lens, min_chunk_len, max_chunk_len, avg_chunk_len = 0, 0, 0, 0
+        
+        expected_len = int(round(sample_token_len * tmr_dbg))
+        
+        try:
+            logging.info(
+                f"[cos2.train.mb] b={b_idx} chunks={num_chunks} max_len={max_len} up={upsample_f} block={block_size} xattn={self._use_cross_text_attn} kv_hist_max={kv_hist_max_val} context_len={context_len_val} num_tokens_upsampled={num_tokens_upsampled} | chunk_len(min/avg/max/sum)={min_chunk_len}/{avg_chunk_len:.1f}/{max_chunk_len}/{sum_lens} expected_len≈{expected_len} | mem(MB) alloc={mem_alloc/1e6:.1f} reserved={mem_reserved/1e6:.1f}"
+            )
+        except Exception:
+            pass
+    
+    def _pad_and_concatenate_batch(self, hidden_list, mask_list):
+        """Pad all samples to max time and concatenate into batch.
+        
+        Args:
+            hidden_list (list): List of hidden states from encoder [N, T_h, D]
+            mask_list (list): List of encoder output masks [N, 1, T_h] or similar
+            
+        Returns:
+            tuple: (hidden, hidden_mask) where:
+                - hidden: Concatenated hidden states [B, T_h_total, D]
+                - hidden_mask: Concatenated masks [B, 1, T_h_total]
+        """
+        time_lengths = [hidden_i.shape[1] for hidden_i in hidden_list]
+        max_time_length = max(time_lengths) if len(time_lengths) > 0 else 0
+        H_cat = []
+        M_cat = []
+        for sample_hidden, sample_mask in zip(hidden_list, mask_list):
+            if sample_hidden.shape[1] < max_time_length:
+                pad_len = max_time_length - sample_hidden.shape[1]
+                sample_hidden = torch.cat([sample_hidden, sample_hidden.new_zeros(sample_hidden.shape[0], pad_len, sample_hidden.shape[2])], dim=1)
+                sample_mask = torch.cat([sample_mask, torch.zeros(sample_mask.shape[0], sample_mask.shape[1], pad_len, dtype=torch.bool, device=sample_mask.device)], dim=-1)
+            H_cat.append(sample_hidden)
+            M_cat.append(sample_mask)
+        hidden = torch.cat(H_cat, dim=0) if len(H_cat) > 1 else H_cat[0]
+        hidden_mask = torch.cat(M_cat, dim=0) if len(M_cat) > 1 else M_cat[0]
+        return hidden, hidden_mask
+
+    def flow(self, batch: Dict, device: torch.device) -> Dict[str, Optional[torch.Tensor]]:
+        """Compute CosyVoice2 Causal Flow (CFM) training loss with explicit time alignment.
+        
+        This method supports both streaming and non-streaming training paths, selected randomly
+        based on _stream_train_prob. The training computation is delegated to private helper
+        methods for maintainability.
+        
+        Training Flow:
+            1. Infer device and prepare inputs (device, token embeddings, features, speaker embedding)
+            2. Decide training mode: streaming (per-sample chunked encoding) or non-streaming (full sequence)
+            3. Encode: 
+               - Streaming: Process each sample in chunks with optional text context
+               - Non-streaming: Single-pass encoding without context injection
+            4. Compute decoder loss with partial conditioning (<=30% prefix) aligned to encoder time
+            5. Log training metrics and advance step counter
+        
+        Args:
+            batch (Dict): Input batch containing:
+                - speech_token: [B, T_tok] Discrete speech tokens (WhisperVQ @12.5Hz)
+                - speech_token_len: [B] Valid token lengths per sample
+                - speech_feat: [B, 80, T_feat] or [B, T_feat, 80] Target mel spectrogram
+                - speech_feat_len: [B] Valid mel frame lengths
+                - embedding: [B, 192] Speaker embeddings (normalized and projected internally)
+                - text_tokens: [B, T_txt] (optional) Text tokens for cross-attention context
+                - text_token_len: [B] (optional) Valid text token lengths
+            device (torch.device): Target device for computation
+        
+        Key Configuration:
+            - _stream_train_prob: Probability of entering streaming training path
+            - _use_text_context_train: Whether to use text context in training
+            - _use_cross_text_attn: Enable cross-attention for text context (vs. simple prefix)
+            - token_mel_ratio: Tokens-to-mel-frames ratio (default: 4.0)
+            - upsample_factor: Token upsampling factor for encoder alignment (typically 2)
+            - static_chunk_size: Streaming chunk size in original token units
+        
+        Helper Methods (called internally):
+            Device & Input:
+                - _infer_device_from_batch(): Infer device from batch tensors
+                - _prepare_inputs_and_ensure_device(): Prepare and move inputs to device
+            
+            Non-streaming Path:
+                - _process_nonstreaming_path(): Single-pass encoding without context
+            
+            Streaming Path (per-sample processing):
+                - _extract_sample_tokens_and_text(): Extract single sample from batch
+                - _precompute_token_and_text_embeddings(): Upsample tokens and embed text
+                - _compute_first_chunk_length(): Compute (optionally randomized) first chunk length
+                - _build_chunk_boundaries(): Determine chunk start/end positions
+                - _slice_and_batch_token_embeddings(): Slice and batch token embeddings per chunk
+                - _build_text_context_for_chunks(): Build text context via cross-attn or prefix
+                - _reconstruct_sample_timeline(): Concatenate chunk outputs to sample timeline
+                - _pad_and_concatenate_batch(): Pad and stack samples into batch
+            
+            Loss & Debug:
+                - _build_condition_and_compute_loss(): Build conditioning and compute decoder loss
+                - _print_training_debug_info(): Log alignment metrics and loss
+                - _print_microbatch_debug_info(): Log streaming chunk statistics
+        
+        Returns:
+            Dict[str, torch.Tensor]: Dictionary containing:
+                - 'loss': Scalar tensor with decoder loss
+        
+        Logging:
+            - [cos2.train.mb]: Streaming per-sample chunk stats, memory usage, expected/actual steps
+            - [cos2.train]: Alignment ratios (T_h_valid / T_tok) vs token_mel_ratio and upsample_factor
+        """
+        
+        # ============================================================================
         # streaming_with_text_context prob from config
         streaming = torch.rand(()) < float(getattr(self, "_stream_train_prob", 0.5))
         
         # Infer actual device and prepare inputs
-        device = _infer_device_from_batch(batch, device)
-        token, token_len, feat, feat_len, embedding = _prepare_inputs_and_ensure_device(batch, device)
+        device = self._infer_device_from_batch(batch, device)
+        token, token_len, feat, feat_len, embedding = self._prepare_inputs_and_ensure_device(batch, device)
 
         # Keep original token ids for streaming-chunked path; compute upsample factor only
         num_tokens_original = token_len.clone()
@@ -1599,7 +1602,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             
             for batch_idx in range(batch_size):
                 # Extract sample tokens and text
-                sample_token_ids, sample_token_len, sample_text_token_ids, sample_text_token_len = _extract_sample_tokens_and_text(
+                sample_token_ids, sample_token_len, sample_text_token_ids, sample_text_token_len = self._extract_sample_tokens_and_text(
                     batch, batch_idx, text_tokens, num_tokens_original, batch_size, device
                 )
                 
@@ -1607,15 +1610,15 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 block_size = self._determine_chunk_block_size()
                 
                 # Precompute upsampled token and text embeddings
-                token_emb_full, num_tokens_upsampled, text_token_emb_full = _precompute_token_and_text_embeddings(
+                token_emb_full, num_tokens_upsampled, text_token_emb_full = self._precompute_token_and_text_embeddings(
                     sample_token_ids, sample_token_len, sample_text_token_ids, sample_text_token_len, upsample_factor
                 )
                 
                 # Compute first chunk length (possibly randomized)
-                token_first_chunk_len = _compute_first_chunk_length(block_size, sample_token_len, upsample_factor, batch_idx, device)
+                token_first_chunk_len = self._compute_first_chunk_length(block_size, sample_token_len, upsample_factor, batch_idx, device)
                 
                 # Build chunk boundaries
-                token_chunk_starts, token_chunk_ends, num_chunks = _build_chunk_boundaries(
+                token_chunk_starts, token_chunk_ends, num_chunks = self._build_chunk_boundaries(
                     sample_token_len, token_first_chunk_len, block_size
                 )
                 
@@ -1628,7 +1631,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     continue
                 
                 # Slice and batch token embeddings
-                token_batch, len_vec, max_len = _slice_and_batch_token_embeddings(
+                token_batch, len_vec, max_len = self._slice_and_batch_token_embeddings(
                     token_chunk_starts, token_chunk_ends, token_emb_full, upsample_factor, 
                     sample_token_len, block_size, device
                 )
@@ -1642,7 +1645,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     continue
                 
                 # Build text context for all chunks
-                text_ctx_batch = _build_text_context_for_chunks(
+                text_ctx_batch = self._build_text_context_for_chunks(
                     text_token_emb_full, sample_text_token_len, token_chunk_starts, token_chunk_ends, num_chunks,
                     sample_token_ids, sample_token_len, batch_idx, device
                 )
@@ -1654,29 +1657,29 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     hidden_chunks, hidden_chunks_mask = self.cos2_flow.encoder(token_batch, len_vec, streaming=True)
                 
                 # Reconstruct per-sample timeline
-                sample_hidden, sample_mask, chunk_lengths = _reconstruct_sample_timeline(hidden_chunks, hidden_chunks_mask, num_chunks, device)
+                sample_hidden, sample_mask, chunk_lengths = self._reconstruct_sample_timeline(hidden_chunks, hidden_chunks_mask, num_chunks, device)
                 
                 hidden_list.append(sample_hidden)
                 mask_list.append(sample_mask)
                 
                 # Print micro-batch debug info
-                _print_microbatch_debug_info(
+                self._print_microbatch_debug_info(
                     batch_idx, num_chunks, max_len, upsample_factor, block_size, 
                     text_token_emb_full.shape[1] if isinstance(text_token_emb_full, torch.Tensor) else 0,
                     num_tokens_upsampled, chunk_lengths, sample_token_len, device
                 )
             
             # Pad and concatenate across batch
-            hidden, hidden_mask = _pad_and_concatenate_batch(hidden_list, mask_list)
+            hidden, hidden_mask = self._pad_and_concatenate_batch(hidden_list, mask_list)
         else:
             # Non-streaming training: single pass with (global) text context prefix
-            hidden, hidden_mask = _process_nonstreaming_path(token, token_len, text_tokens, upsample_factor, streaming, device)
+            hidden, hidden_mask = self._process_nonstreaming_path(token, token_len, text_tokens, upsample_factor, streaming, device)
 
         # Build partial cond prefix and compute decoder loss
-        loss, lengths = _build_condition_and_compute_loss(hidden, hidden_mask, feat, feat_len, embedding, streaming)
+        loss, lengths = self._build_condition_and_compute_loss(hidden, hidden_mask, feat, feat_len, embedding, streaming)
 
         # Print periodic training-time debug information
-        _print_training_debug_info(loss, streaming, token_len, num_tokens_original, hidden, lengths, upsample_factor, token)
+        self._print_training_debug_info(loss, streaming, token_len, num_tokens_original, hidden, lengths, upsample_factor, token)
         
         # advance internal step counter after prints
         self._step += 1
