@@ -181,3 +181,6 @@ examples/neural_graphs/*.yml
 nemo_experiments/
 
 slurm*.out
+
+# Refactoring documentation (internal use only)
+REFACTORING_PLAN.md
