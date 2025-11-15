@@ -752,37 +752,18 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         
         return token, token_len, feat, feat_len, embedding
 
-    def _build_cross_attention_text_context(
-        self,
-        text_token_emb_full, token_chunk_starts, token_chunk_ends, sample_token_len,
-        token_emb_original, num_chunks, kv_hist_max, text_chunk_ends, device_target, b_idx
-    ):
-        """Build text context using cross-attention mechanism for streaming chunks.
+    def _build_speech_history_with_causal_attention(self, token_emb_original, token_chunk_ends, num_chunks, b_idx):
+        """Build speech history batch with causal self-attention and FFN.
         
         Args:
-            text_token_emb_full (torch.Tensor): Full text embeddings [1, T_text, D]
-            token_chunk_starts (list): Start indices for each chunk on token axis
-            token_chunk_ends (list): End indices for each chunk on token axis
-            sample_token_len (int): Effective token length for the current sample
             token_emb_original (torch.Tensor): Original token embeddings [1, T_tok, D]
+            token_chunk_ends (list): End indices for each chunk on token axis
             num_chunks (int): Number of chunks in the batch
-            kv_hist_max (int): Maximum visible text length for cross-attention
-            text_chunk_ends (list): End indices for each chunk on text axis
-            device_target (torch.device): Target device for computations
             b_idx (int): Batch index of the current sample
-
-        Variables:
-            context_len (int): Context length for text context (self._default_context_len)
-            KV (torch.Tensor): Text embeddings padded to kv_hist_max [num_chunks, kv_hist_max, D]
-            mask_kv (torch.Tensor): Mask for KV [num_chunks, 1, kv_hist_max]
-            token_history_max_len (int): Maximum length of speech history in original token units
-            speech_hist_batch (torch.Tensor): Speech history batch [num_chunks, token_history_max_len, D]
-            
+        
         Returns:
-            text_ctx_batch (torch.Tensor): Text context batch [num_chunks, context_len, D]
+            torch.Tensor: Processed speech history [num_chunks, token_history_max_len, D]
         """
-        from cosyvoice.utils.mask import make_pad_mask
-
         # Build speech histories per chunk on ORIGINAL token axis (pre-upsampling): use all past + current chunk tokens
         token_history_max_len = max(token_chunk_ends) if len(token_chunk_ends) > 0 else 1
         
@@ -811,38 +792,36 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             except Exception:
                 pass
         
-        # Extract current-chunk subrange per row [t_start:text_end_idx) as multi-query Q (original axis), pad to max_query_len
-        token_query_lens = [max(0, token_chunk_ends[i] - token_chunk_starts[i]) for i in range(num_chunks)]
-        max_query_len = max(token_query_lens) if len(token_query_lens) > 0 else 1
-        Dq = speech_hist.shape[-1]
-        speech_query = speech_hist.new_zeros((num_chunks, max_query_len, Dq))
-        mask_qkv = torch.zeros(num_chunks, 1, max_query_len, dtype=torch.bool, device=speech_query.device)
+        return speech_hist
+
+    def _build_text_kv_with_causal_attention(self, text_token_emb_full, text_chunk_ends, num_chunks, kv_hist_max, device_target, b_idx):
+        """Build text KV representations with causal self-attention and FFN.
         
-        for i in range(num_chunks):
-            query_len = int(token_query_lens[i])
-            if query_len > 0:
-                speech_query[i, :query_len] = speech_hist[i, token_chunk_starts[i]:token_chunk_ends[i]]
-                mask_qkv[i, 0, :query_len] = True
+        Args:
+            text_token_emb_full (torch.Tensor): Full text embeddings [1, T_text, D]
+            text_chunk_ends (list): End indices for each chunk on text axis
+            num_chunks (int): Number of chunks in the batch
+            kv_hist_max (int): Maximum visible text length for cross-attention
+            device_target (torch.device): Target device for computations
+            b_idx (int): Batch index of the current sample
         
-        #########################################################
-        # Scheme-1: text-side causal self-attn + FFN
-        context_len = self._default_context_len
+        Returns:
+            torch.Tensor: Processed text KV representations [num_chunks, kv_hist_max, D]
+        """
         # Prepare KV (text embeddings) and causal masks padded/truncated to kv_hist_max
         KV = text_token_emb_full[:, :kv_hist_max].repeat(num_chunks, 1, 1)  # [num_chunks, kv_hist_max, D]
-        mask_kv = torch.zeros(num_chunks, 1, kv_hist_max, dtype=torch.bool, device=device_target)
         mask_kv_causal = torch.zeros(num_chunks, kv_hist_max, kv_hist_max, dtype=torch.bool, device=device_target)
         
         for i, te in enumerate(text_chunk_ends):
             text_end_i = int(min(int(te), kv_hist_max))
             if text_end_i > 0:
                 KV[i, :text_end_i] = text_token_emb_full[0, :text_end_i]
-                mask_kv[i, 0, :text_end_i] = True
                 mask_kv_causal[i, :text_end_i, :text_end_i] = torch.tril(torch.ones((text_end_i, text_end_i), dtype=torch.bool, device=device_target))
         
         # Causal self-attn on text (only look-back w.r.t. each position and text_end_idx)
         kv_attn, _ = self.text_sa(query=KV, key=KV, value=KV, mask=mask_kv_causal)
         kv_ref = self.text_ln(kv_attn)
-        _kv_pre = kv_ref[0, :_t0] if _t0 > 0 else kv_ref[0:1, :0]
+        _kv_pre = kv_ref
         kv_ref = kv_ref + self.text_ffn(kv_ref)
         
         # Debug: stats before and after text FFN (use first chunk's visible length)
@@ -850,62 +829,165 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             try:
                 _t0 = int(min(int(text_chunk_ends[0]), kv_hist_max)) if isinstance(text_chunk_ends, (list, tuple)) and len(text_chunk_ends) > 0 else kv_hist_max
                 _t0 = max(0, _t0)
-                _m_pre = float(_kv_pre.mean().item()) if _t0 > 0 else 0.0
-                _sd_pre = float(_kv_pre.std(unbiased=False).item()) if _t0 > 0 else 0.0
-                _kv_post = kv_ref[0, :_t0] if '_t0' in locals() and _t0 > 0 else kv_ref[0:1, :0]
-                _m_post = float(_kv_post.mean().item()) if '_t0' in locals() and _t0 > 0 else 0.0
-                _sd_post = float(_kv_post.std(unbiased=False).item()) if '_t0' in locals() and _t0 > 0 else 0.0
+                _kv_pre_slice = _kv_pre[0, :_t0] if _t0 > 0 else _kv_pre[0:1, :0]
+                _m_pre = float(_kv_pre_slice.mean().item()) if _t0 > 0 else 0.0
+                _sd_pre = float(_kv_pre_slice.std(unbiased=False).item()) if _t0 > 0 else 0.0
+                _kv_post = kv_ref[0, :_t0] if _t0 > 0 else kv_ref[0:1, :0]
+                _m_post = float(_kv_post.mean().item()) if _t0 > 0 else 0.0
+                _sd_post = float(_kv_post.std(unbiased=False).item()) if _t0 > 0 else 0.0
                 logging.info(f"[cos2.train.block.text] b=0 K_max={int(kv_hist_max)} K_vis={int(_t0)} mean_pre={_m_pre:.4f} std_pre={_sd_pre:.4f} mean_post={_m_post:.4f} std_post={_sd_post:.4f}")
             except Exception:
                 pass
-
-        # Cross-attn: multi-query (aligned to chunk length). Then pool last valid to 1 vector per chunk
-        attn_out, attn_w = self.cross_text_attn(query=speech_query, key=kv_ref, value=kv_ref, mask=mask_kv)  # [num_chunks, Lmax, D]
         
-        # Optional debug: inspect attention on chunks spaced every K within the batch
-        if getattr(self, '_debug_xattn', False) and (b_idx == 0) and ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0):
-            try:
-                # attn_w expected shape [num_chunks, H, Q, K] or [num_chunks, Q, K]
-                if isinstance(attn_w, torch.Tensor):
-                    if attn_w.dim() == 4:
-                        attn_weights_debug = attn_w.mean(dim=1)  # [num_chunks, Q, K]
-                    elif attn_w.dim() == 3:
-                        attn_weights_debug = attn_w
-                    else:
-                        attn_weights_debug = None
+        return kv_ref
+
+    def _debug_cross_attention_weights(self, attn_w, num_chunks, token_query_lens, text_chunk_ends, 
+                                       kv_hist_max, token_chunk_starts, token_chunk_ends, b_idx):
+        """Debug cross-attention weights by inspecting top-k attention values for selected chunks.
+        
+        Args:
+            attn_w (torch.Tensor or None): Attention weights [num_chunks, H, Q, K] or [num_chunks, Q, K]
+            num_chunks (int): Number of chunks in the batch
+            token_query_lens (list): Query lengths for each chunk
+            text_chunk_ends (list): End indices for each chunk on text axis
+            kv_hist_max (int): Maximum visible text length for cross-attention
+            token_chunk_starts (list): Start indices for each chunk on token axis
+            token_chunk_ends (list): End indices for each chunk on token axis
+            b_idx (int): Batch index of the current sample
+        """
+        if not (getattr(self, '_debug_xattn', False) and (b_idx == 0) and 
+                ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0)):
+            return
+        
+        try:
+            # attn_w expected shape [num_chunks, H, Q, K] or [num_chunks, Q, K]
+            if isinstance(attn_w, torch.Tensor):
+                if attn_w.dim() == 4:
+                    attn_weights_debug = attn_w.mean(dim=1)  # [num_chunks, Q, K]
+                elif attn_w.dim() == 3:
+                    attn_weights_debug = attn_w
                 else:
                     attn_weights_debug = None
-                Kb = int(getattr(self, '_print_every_k_in_batch', 10))
-                for i in range(num_chunks):
-                    if (i % max(Kb,1) != 0) and (i != num_chunks - 1):
-                        continue
-                    query_len = int(token_query_lens[i])
-                    key_len = int(min(int(text_chunk_ends[i]), kv_hist_max))
-                    token_start_i = int(token_chunk_starts[i]) if 'token_chunk_starts' in locals() else 0
-                    token_end_i = int(token_chunk_ends[i]) if 'token_chunk_ends' in locals() else query_len
-                    if attn_weights_debug is not None and query_len > 0 and key_len > 0:
-                        qdim = int(attn_weights_debug.shape[1])
-                        kdim = int(attn_weights_debug.shape[2])
-                        query_idx = int(max(0, min(query_len - 1, qdim - 1)))
-                        k_use = int(max(1, min(key_len, kdim)))
-                        vec = attn_weights_debug[i, query_idx, :k_use]
-                        vec = torch.softmax(vec, dim=-1)
-                        k = int(min(3, k_use))
-                        vals, idxs = torch.topk(vec, k)
-                        idxs = idxs.tolist(); vals = [float(v) for v in vals.tolist()]
-                        if query_idx != query_len - 1 or k_use != key_len:
-                            logging.info(f"[cos2.train.xattn] chunk={i}/{num_chunks} Q_len={query_len} K_len={key_len} qidx={query_idx}/{qdim} kdim={kdim} topk_idx={idxs} topk_val={[round(v,4) for v in vals]} (token=[{token_start_i}:{token_end_i}))")
-                        else:
-                            logging.info(f"[cos2.train.xattn] chunk={i}/{num_chunks} Q_len={query_len} K_len={key_len} topk_idx={idxs} topk_val={[round(v,4) for v in vals]} (token=[{token_start_i}:{token_end_i}))")
+            else:
+                attn_weights_debug = None
+            
+            Kb = int(getattr(self, '_print_every_k_in_batch', 10))
+            for i in range(num_chunks):
+                if (i % max(Kb, 1) != 0) and (i != num_chunks - 1):
+                    continue
+                
+                query_len = int(token_query_lens[i])
+                key_len = int(min(int(text_chunk_ends[i]), kv_hist_max))
+                token_start_i = int(token_chunk_starts[i])
+                token_end_i = int(token_chunk_ends[i])
+                
+                if attn_weights_debug is not None and query_len > 0 and key_len > 0:
+                    qdim = int(attn_weights_debug.shape[1])
+                    kdim = int(attn_weights_debug.shape[2])
+                    query_idx = int(max(0, min(query_len - 1, qdim - 1)))
+                    k_use = int(max(1, min(key_len, kdim)))
+                    vec = attn_weights_debug[i, query_idx, :k_use]
+                    vec = torch.softmax(vec, dim=-1)
+                    k = int(min(3, k_use))
+                    vals, idxs = torch.topk(vec, k)
+                    idxs = idxs.tolist()
+                    vals = [float(v) for v in vals.tolist()]
+                    
+                    if query_idx != query_len - 1 or k_use != key_len:
+                        logging.info(f"[cos2.train.xattn] chunk={i}/{num_chunks} Q_len={query_len} K_len={key_len} "
+                                   f"qidx={query_idx}/{qdim} kdim={kdim} topk_idx={idxs} "
+                                   f"topk_val={[round(v,4) for v in vals]} (token=[{token_start_i}:{token_end_i}))")
                     else:
-                        logging.info(f"[cos2.train.xattn] chunk={i}/{num_chunks} Q_len={query_len} K_len={key_len} (no attn_w) (token=[{token_start_i}:{token_end_i}))")
-            except Exception as e:
-                logging.info(f"[cos2.train.xattn] warn: {e}")
+                        logging.info(f"[cos2.train.xattn] chunk={i}/{num_chunks} Q_len={query_len} K_len={key_len} "
+                                   f"topk_idx={idxs} topk_val={[round(v,4) for v in vals]} (token=[{token_start_i}:{token_end_i}))")
+                else:
+                    logging.info(f"[cos2.train.xattn] chunk={i}/{num_chunks} Q_len={query_len} K_len={key_len} "
+                               f"(no attn_w) (token=[{token_start_i}:{token_end_i}))")
+        except Exception as e:
+            logging.info(f"[cos2.train.xattn] warn: {e}")
+
+    def _build_cross_attention_text_context(
+        self,
+        text_token_emb_full, token_chunk_starts, token_chunk_ends, sample_token_len,
+        token_emb_original, num_chunks, kv_hist_max, text_chunk_ends, device_target, b_idx
+    ):
+        """Build text context using cross-attention mechanism for streaming chunks.
         
+        Args:
+            text_token_emb_full (torch.Tensor): Full text embeddings [1, T_text, D]
+            token_chunk_starts (list): Start indices for each chunk on token axis
+            token_chunk_ends (list): End indices for each chunk on token axis
+            sample_token_len (int): Effective token length for the current sample
+            token_emb_original (torch.Tensor): Original token embeddings [1, T_tok, D]
+            num_chunks (int): Number of chunks in the batch
+            kv_hist_max (int): Maximum visible text length for cross-attention
+            text_chunk_ends (list): End indices for each chunk on text axis
+            device_target (torch.device): Target device for computations
+            b_idx (int): Batch index of the current sample
+
+        Variables:
+            context_len (int): Context length for text context (self._default_context_len)
+            speech_hist (torch.Tensor): Processed speech history from _build_speech_history_with_attention
+            kv_ref (torch.Tensor): Processed text KV from _build_text_kv_with_causal_attention
+            mask_kv (torch.Tensor): Cross-attention mask for KV [num_chunks, 1, kv_hist_max]
+            
+        Returns:
+            text_ctx_batch (torch.Tensor): Text context batch [num_chunks, context_len, D]
+        """
+        from cosyvoice.utils.mask import make_pad_mask
+
+        #########################################################
+        # Scheme-0: speech-side causal self-attn + FFN
+        # Build speech history with self-attention and FFN
+        speech_hist = self._build_speech_history_with_causal_attention(
+            token_emb_original, token_chunk_ends, num_chunks, b_idx
+        )
+
+        #########################################################
+        # Scheme-1: text-side causal self-attn + FFN
+        kv_ref = self._build_text_kv_with_causal_attention(
+            text_token_emb_full, text_chunk_ends, num_chunks, kv_hist_max, device_target, b_idx
+        )
+
+        
+        #########################################################
+        # Scheme-2: Cross-attn: multi-query (aligned to chunk length). Then pool last valid to 1 vector per chunk
+        # Extract current-chunk subrange per row [token_start:token_end) as multi-query Q from speech history, pad to max_query_len
+        token_query_lens = [max(0, token_chunk_ends[i] - token_chunk_starts[i]) for i in range(num_chunks)]
+        max_query_len = max(token_query_lens) if len(token_query_lens) > 0 else 1
+        Dq = speech_hist.shape[-1]
+        speech_query = speech_hist.new_zeros((num_chunks, max_query_len, Dq))
+        for i in range(num_chunks):
+            query_len = int(token_query_lens[i])
+            if query_len > 0:
+                speech_query[i, :query_len] = speech_hist[i, token_chunk_starts[i]:token_chunk_ends[i]]
+        
+        mask_kv = torch.zeros(num_chunks, 1, kv_hist_max, dtype=torch.bool, device=device_target)
+        for i, te in enumerate(text_chunk_ends):
+            text_end_i = int(min(int(te), kv_hist_max))
+            if text_end_i > 0:
+                mask_kv[i, 0, :text_end_i] = True
+
+        attn_out, attn_w = self.cross_text_attn(query=speech_query, key=kv_ref, value=kv_ref, mask=mask_kv)  # [num_chunks, Lmax, D]
+        
+        # Debug cross-attention weights
+        self._debug_cross_attention_weights(
+            attn_w, num_chunks, token_query_lens, text_chunk_ends, 
+            kv_hist_max, token_chunk_starts, token_chunk_ends, b_idx
+        )
+        
+        #########################################################
         # Aggregate full-Q features to context_len via learned queries (no temporal pooling)
+        context_len = self._default_context_len
         q_ctx = self.ctx_queries.to(attn_out.device).unsqueeze(0).expand(num_chunks, -1, -1)  # [num_chunks, context_len, D]
-        # Key mask: valid Q positions only
-        key_mask = mask_qkv  # [num_chunks, 1, max_query_len] with True at valid positions
+        
+        # Key mask: valid Q positions only (mask for Q length)
+        key_mask = torch.zeros(num_chunks, 1, max_query_len, dtype=torch.bool, device=speech_query.device)
+        for i in range(num_chunks):
+            query_len = int(token_query_lens[i])
+            if query_len > 0:
+                key_mask[i, 0, :query_len] = True
+        
         ctx_raw, _ = self.q2ctx_attn(query=q_ctx, key=attn_out, value=attn_out, mask=key_mask)  # [num_chunks, context_len, D]
         text_ctx_processed = self.cross_ln(ctx_raw)
         text_ctx_processed = text_ctx_processed + self.cross_ffn(text_ctx_processed)
