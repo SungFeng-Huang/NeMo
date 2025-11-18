@@ -190,6 +190,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 is_debug=bool(self.cfg.get("is_debug", False)),
                 print_per_n_chunk=int(self.cfg.get("print_per_n_chunk", 50)),
                 stream_fixed_window_pad=bool(self.cfg.get("cos2_stream_fixed_window_pad", False)),
+                use_token_emb_sa=bool(self.cfg.get("cos2_use_token_emb_sa", False)),
             )
         else:
             use_pf = getattr(self.cfg, "use_pretrained_flow", True)

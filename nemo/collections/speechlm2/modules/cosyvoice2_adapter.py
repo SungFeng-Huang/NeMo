@@ -174,7 +174,8 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         print_per_n_chunk: Optional[int] = None,
         stream_stride: Optional[int] = None,
         stream_train_first_block_random: Optional[bool] = None,
-        stream_fixed_window_pad: Optional[bool] = None
+        stream_fixed_window_pad: Optional[bool] = None,
+        use_token_emb_sa: Optional[bool] = None,
     ):
         """
         Initialize CosyVoice2AudioDecoder with configuration and environment setup.
@@ -193,6 +194,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             stream_stride: Sliding window stride for streaming
             stream_train_first_block_random: Whether to randomize first chunk length
             stream_fixed_window_pad: Whether to pad last window to fixed chunk size
+            use_token_emb_sa: Whether to use token embedding self-attention
         """
         # Initialize base class
         super().__init__()
@@ -203,6 +205,12 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         self._use_text_context_train = bool(use_text_context_train) if use_text_context_train is not None else False
         self._token_overlap_len_cfg = 0 if token_overlap is None else int(token_overlap)
         self._fixed_window_pad = bool(stream_fixed_window_pad) if stream_fixed_window_pad is not None else False
+        # Token embedding self-attention config (for both training and inference)
+        self._use_token_emb_sa = bool(use_token_emb_sa) if use_token_emb_sa is not None else bool(int(os.environ.get("COS2_USE_TOKEN_EMB_SA", "0")))
+        if self._use_token_emb_sa:
+            logging.info("Using token embedding self-attention")
+        else:
+            logging.info("Not using token embedding self-attention")
 
         # debug control
         self._step = 0
@@ -1022,15 +1030,188 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         else:
             text_ctx_batch = None
         return text_ctx_batch
+
+    def _build_speech_hidden_with_non_causal_attention(self, token_emb_original, token_len_data, b_idx):
+        """Build speech hidden representations with non-causal self-attention and FFN.
+        
+        This method processes token embeddings using non-causal (bidirectional) self-attention
+        followed by layer normalization and feed-forward network. It's used to enhance
+        token representations by allowing each token to attend to all other tokens in the sequence.
+        
+        Args:
+            token_emb_original (torch.Tensor): Original token embeddings [B, T_tok, D] or [1, T_tok, D]
+            token_len_data (torch.Tensor): Token lengths for each sample in batch [B]
+            b_idx (int): Batch index of the current sample (for debug logging)
+        
+        Returns:
+            torch.Tensor: Processed speech hidden representations [B, T_tok, D] with enhanced
+                         contextual information from non-causal self-attention
+        """
+        # Build speech representations using non-causal self-attention on original token embeddings
+        token_hidden_max_len = max(token_len_data.tolist()) if len(token_len_data) > 0 else 1
+        batch_size = token_emb_original.shape[0]
+        
+        # Prepare input embeddings and create non-causal attention masks
+        speech_hidden_batch = token_emb_original
+        mask_speech_hidden = torch.zeros(batch_size, token_hidden_max_len, token_hidden_max_len, dtype=torch.bool, device=token_emb_original.device)
+        
+        # Create attention masks for each sample based on actual token lengths
+        for i in range(batch_size):
+            token_len = int(token_len_data[i])
+            mask_speech_hidden[i, :token_len, :token_len] = torch.ones((token_len, token_len), dtype=torch.bool, device=token_emb_original.device)
+        
+        # Apply non-causal self-attention followed by layer normalization and FFN
+        speech_hidden_attn, _ = self.speech_sa(query=speech_hidden_batch, key=speech_hidden_batch, value=speech_hidden_batch, mask=mask_speech_hidden)
+        speech_hidden = self.speech_ln(speech_hidden_attn)
+        _pre_speech_hidden = speech_hidden
+        speech_hidden = speech_hidden + self.speech_ffn(speech_hidden)
+
+        # Debug logging: statistics before and after FFN (first batch only, periodic)
+        if getattr(self, '_debug_blocks', False) and (b_idx == 0) and ((int(self._step) % max(self._print_per_n_chunk, 1)) == 0):
+            try:
+                _m_pre = float(_pre_speech_hidden.mean().item()); _sd_pre = float(_pre_speech_hidden.std(unbiased=False).item())
+                _m_post = float(speech_hidden.mean().item()); _sd_post = float(speech_hidden.std(unbiased=False).item())
+                logging.info(f"[cos2.train.block.speech] b=0 T_hidden_max={int(token_hidden_max_len)} mean_pre={_m_pre:.4f} std_pre={_sd_pre:.4f} mean_post={_m_post:.4f} std_post={_sd_post:.4f}")
+            except Exception:
+                pass
+        
+        return speech_hidden
     
-    def _process_nonstreaming_path(self, token_data, token_len_data, text_tokens_data, upsample_f, is_streaming, device_target):
-        """Process non-streaming training: single pass without text context injection.
+    class _InputEmbeddingWithSA(torch.nn.Module):
+        """Wrapper module for input_embedding that applies self-attention.
+        
+        This wrapper is used during inference to apply non-causal self-attention
+        on token embeddings. The token_len and prompt_token_len must be set
+        before each inference call via update_token_lengths().
+        """
+        def __init__(self, original_embedding, adapter_instance):
+            super().__init__()
+            self.original_embedding = original_embedding
+            self.adapter_instance = adapter_instance
+            # These will be updated before each flow.inference call
+            self.current_token_len = None
+            self.current_prompt_token_len = None
+        
+        def update_token_lengths(self, token_len, prompt_token_len):
+            """Update the current token lengths for the next forward call.
+            
+            Supports both scalar and batchwise length inputs for future compatibility.
+            
+            Args:
+                token_len: Length of current token sequence (without prompt)
+                           - int/scalar: single length for all batch elements
+                           - Tensor [B]: different length per batch element (future support)
+                prompt_token_len: Length of prompt token sequence
+                                  - int/scalar: single length for all batch elements
+                                  - Tensor [B]: different length per batch element (future support)
+            """
+            self.current_token_len = self._normalize_length(token_len)
+            self.current_prompt_token_len = self._normalize_length(prompt_token_len)
+        
+        @staticmethod
+        def _normalize_length(value):
+            """Normalize length input to int or tensor for batchwise compatibility.
+            
+            Returns:
+                int: if input is scalar
+                torch.Tensor: if input is 1-D tensor (batchwise lengths)
+            """
+            if isinstance(value, torch.Tensor):
+                # Keep tensor for batchwise processing
+                if value.ndim == 0:
+                    return int(value.item())  # 0-D tensor -> scalar
+                elif value.ndim == 1:
+                    return value  # 1-D tensor -> keep for batchwise
+                else:
+                    raise ValueError(f"Expected 0-D or 1-D tensor, got {value.ndim}-D")
+            elif hasattr(value, 'item'):
+                return int(value.item())  # numpy scalar or similar
+            else:
+                return int(value)  # Python int
+        
+        def forward(self, token):
+            from cosyvoice.utils.mask import make_pad_mask
+            
+            # In flow.inference, tokens are concatenated: [prompt_token, token]
+            # Use the stored token lengths (set via update_token_lengths before inference)
+            batch_size = token.shape[0]
+            
+            if self.current_token_len is not None and self.current_prompt_token_len is not None:
+                # Use stored token lengths (supports both scalar and batchwise)
+                token_len_is_tensor = isinstance(self.current_token_len, torch.Tensor)
+                prompt_len_is_tensor = isinstance(self.current_prompt_token_len, torch.Tensor)
+                
+                if token_len_is_tensor or prompt_len_is_tensor:
+                    # Batchwise processing: handle per-batch lengths
+                    token_lens = self.current_token_len if token_len_is_tensor else torch.full((batch_size,), self.current_token_len, dtype=torch.int32, device=token.device)
+                    prompt_lens = self.current_prompt_token_len if prompt_len_is_tensor else torch.full((batch_size,), self.current_prompt_token_len, dtype=torch.int32, device=token.device)
+                    token_len_tensor = (token_lens + prompt_lens).to(dtype=torch.int32, device=token.device)
+                else:
+                    # Scalar processing: same length for all batch elements (current default)
+                    total_len = self.current_prompt_token_len + self.current_token_len
+                    token_len_tensor = torch.full((batch_size,), total_len, dtype=torch.int32, device=token.device)
+            else:
+                # Fallback: count ending zeros for each batch element (should rarely happen)
+                # Find last non-zero position per batch using vectorized operations
+                seq_len = token.shape[1]
+                # Get rightmost True position per batch
+                token_len_list = []
+                for b in range(batch_size):
+                    trailing_zeros = 0
+                    for i in range(seq_len - 1, -1, -1):
+                        if token[b, i].item() == 0:
+                            trailing_zeros += 1
+                        else:
+                            break
+                    real_len = seq_len - trailing_zeros
+                    token_len_list.append(real_len)
+                
+                token_len_tensor = torch.tensor(token_len_list, dtype=torch.int32, device=token.device)
+            
+            # Call original embedding with mask
+            token_mask = (~make_pad_mask(token_len_tensor, token.shape[1])).float().unsqueeze(-1)
+            token_emb = self.original_embedding(torch.clamp(token, min=0)) * token_mask
+            
+            # Apply self-attention + FFN
+            token_emb_processed = self.adapter_instance._build_speech_hidden_with_non_causal_attention(token_emb, token_len_tensor, b_idx=0)
+            
+            return token_emb_processed
+    
+    def _apply_input_embedding_sa_monkey_patch(self):
+        """Apply token embedding self-attention monkey patch for inference.
+        
+        Returns:
+            tuple: (original_input_embedding, wrapped_embedding_module) if applied, 
+                   (None, None) if not applied
+        """
+        if not self._use_token_emb_sa:
+            return None, None
+        
+        original_input_embedding = self.cos2_flow.input_embedding
+        
+        # Create a Module wrapper instead of a function
+        wrapped_embedding_module = self._InputEmbeddingWithSA(
+            original_embedding=original_input_embedding,
+            adapter_instance=self
+        )
+        
+        # Move wrapper to same device as original embedding
+        if hasattr(original_input_embedding, 'weight'):
+            wrapped_embedding_module = wrapped_embedding_module.to(original_input_embedding.weight.device)
+        
+        self.cos2_flow.input_embedding = wrapped_embedding_module
+        
+        return original_input_embedding, wrapped_embedding_module
+    
+    def _process_non_text_path(self, token_data, token_len_data, text_tokens_data, upsample_f, is_token_emb_sa, is_streaming, device_target):
+        """Process non-text training: single pass without text context injection.
         
         Args:
             token_data (torch.Tensor): Token data for conditioning [B, T_tok]
             token_len_data (torch.Tensor): Token lengths for each sample in batch [B]
             text_tokens_data (torch.Tensor): Text tokens for conditioning [B, T_text] or None
             upsample_f (int): Upsampling factor used for token alignment
+            is_token_emb_sa (bool): Whether to use token embedding self-attention
             is_streaming (bool): Whether in streaming mode
             device_target (torch.device): Target device for computations
             
@@ -1050,6 +1231,10 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         token_mask = (~make_pad_mask(token_len_data)).float().unsqueeze(-1).to(device_target)
         token_data = torch.clamp(token_data, min=0)
         token_data = self.cos2_flow.input_embedding(token_data) * token_mask
+
+        if is_token_emb_sa:
+            # Use b_idx=0 for non-streaming path (batch-level processing)
+            token_data = self._build_speech_hidden_with_non_causal_attention(token_data, token_len_data, b_idx=0)
         
         # Non-streaming: strictly no context injection (pre_lookahead disabled in training)
         hidden, hidden_mask = self.cos2_flow.encoder(token_data, token_len_data, streaming=is_streaming)
@@ -1612,7 +1797,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 - _prepare_inputs_and_ensure_device(): Prepare and move inputs to device
             
             Non-streaming Path:
-                - _process_nonstreaming_path(): Single-pass encoding without context
+                - _process_non_text_path(): Single-pass encoding without context
             
             Streaming Path (per-sample processing):
                 - _extract_sample_tokens_and_text(): Extract single sample from batch
@@ -1735,7 +1920,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             hidden, hidden_mask = self._pad_and_concatenate_batch(hidden_list, mask_list)
         else:
             # Non-streaming training: single pass with (global) text context prefix
-            hidden, hidden_mask = self._process_nonstreaming_path(token, token_len, text_tokens, upsample_factor, streaming, device)
+            hidden, hidden_mask = self._process_non_text_path(token, token_len, text_tokens, upsample_factor, self._use_token_emb_sa, streaming, device)
 
         # Build partial cond prefix and compute decoder loss
         loss, lengths = self._build_condition_and_compute_loss(hidden, hidden_mask, feat, feat_len, embedding, streaming)
@@ -1819,17 +2004,37 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 token_len_upsampled = token_upsampled.shape[1]
                 prompt_token_len_upsampled = prompt_token_upsampled.shape[1] if (prompt_token_upsampled is not None and prompt_token_upsampled.numel() > 0) else 0
 
-            sample_mel, _ = self.cos2_flow.inference(
-                token=token_upsampled,
-                token_len=torch.tensor([token_len_upsampled], dtype=torch.int32, device=device),
-                prompt_token=prompt_token_upsampled,
-                prompt_token_len=torch.tensor([prompt_token_len_upsampled], dtype=torch.int32, device=device),
-                prompt_feat=sample_prompt_feat,
-                prompt_feat_len=torch.tensor([sample_prompt_feat.shape[1]], dtype=torch.int32, device=device),
-                embedding=sample_embedding,
-                streaming=False,
-                finalize=True,
-            )
+            # Apply token embedding self-attention if enabled (via temporary monkey-patch)
+            original_input_embedding, wrapped_embedding_module = self._apply_input_embedding_sa_monkey_patch()
+
+            try:
+                # Update token lengths in wrapped module before inference
+                if wrapped_embedding_module is not None:
+                    wrapped_embedding_module.update_token_lengths(
+                        token_len=token_len_upsampled,
+                        prompt_token_len=prompt_token_len_upsampled
+                    )
+                
+                sample_mel, _ = self.cos2_flow.inference(
+                    token=token_upsampled,
+                    token_len=torch.tensor([token_len_upsampled], dtype=torch.int32, device=device),
+                    prompt_token=prompt_token_upsampled,
+                    prompt_token_len=torch.tensor([prompt_token_len_upsampled], dtype=torch.int32, device=device),
+                    prompt_feat=sample_prompt_feat,
+                    prompt_feat_len=torch.tensor([sample_prompt_feat.shape[1]], dtype=torch.int32, device=device),
+                    embedding=sample_embedding,
+                    streaming=False,
+                    finalize=True,
+                )
+            finally:
+                # Restore original input_embedding if it was monkey-patched
+                if original_input_embedding is not None:
+                    self.cos2_flow.input_embedding = original_input_embedding
+                    # Explicitly clean up wrapped module to break circular reference
+                    if wrapped_embedding_module is not None:
+                        wrapped_embedding_module.adapter_instance = None
+                        wrapped_embedding_module.original_embedding = None
+                        del wrapped_embedding_module
             tts_mels.append(sample_mel)
         # [B, 80, T]
         tts_mel = torch.cat(tts_mels, dim=0)
@@ -1935,157 +2140,173 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         self._mel_total_len_dict[uuid] = init_total
         self._mel_model_total_dict[uuid] = 0
 
+        # Apply token embedding self-attention if enabled (via temporary monkey-patch)
+        original_input_embedding, wrapped_embedding_module = self._apply_input_embedding_sa_monkey_patch()
 
-        # iterate with sliding window: step by stream_stride tokens; window length = block_size
-        stride = int(self._stream_stride) if getattr(self, "_stream_stride", 0) and int(self._stream_stride) > 0 else block_size
-        T = token.size(1)
-        step_i = 0
-        for end in range(min(stride, T), T + 1, stride):
-            start = max(0, end - block_size)
-            # current window tokens [start:end]; no left-pad is passed to flow to keep token_len consistent
-            token_win = token[:, start:end]
-            real_len = token_win.shape[1]
-            prompt_token_hist = token[:, :start] if start > 0 else prompt_token
-            prompt_feat_hist = torch.cat([prompt_feat, prev_mel.transpose(1, 2)], dim=1) if (prev_mel is not None and prev_mel.numel() > 0) else prompt_feat
+        try:
+            # iterate with sliding window: step by stream_stride tokens; window length = block_size
+            stride = int(self._stream_stride) if getattr(self, "_stream_stride", 0) and int(self._stream_stride) > 0 else block_size
+            T = token.size(1)
+            step_i = 0
+            for end in range(min(stride, T), T + 1, stride):
+                start = max(0, end - block_size)
+                # current window tokens [start:end]; no left-pad is passed to flow to keep token_len consistent
+                token_win = token[:, start:end]
+                real_len = token_win.shape[1]
+                prompt_token_hist = token[:, :start] if start > 0 else prompt_token
+                prompt_feat_hist = torch.cat([prompt_feat, prev_mel.transpose(1, 2)], dim=1) if (prev_mel is not None and prev_mel.numel() > 0) else prompt_feat
 
-            # pre-upsample so that encoder x2 matches token_mel_ratio (~4 -> upsample_factor~2)
-            upsample_factor = self._compute_upsample_factor()
-            if upsample_factor > 1:
-                token_upsampled = token_win.repeat_interleave(upsample_factor, dim=1)
-                prompt_token_upsampled = prompt_token_hist.repeat_interleave(upsample_factor, dim=1) if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else prompt_token_hist
-                real_len_upsampled = real_len * upsample_factor
-                prompt_token_len_upsampled = (prompt_token_hist.shape[1] * upsample_factor) if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else 0
-            else:
-                token_upsampled = token_win
-                prompt_token_upsampled = prompt_token_hist
-                real_len_upsampled = real_len
-                prompt_token_len_upsampled = prompt_token_hist.shape[1] if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else 0
+                # pre-upsample so that encoder x2 matches token_mel_ratio (~4 -> upsample_factor~2)
+                upsample_factor = self._compute_upsample_factor()
+                if upsample_factor > 1:
+                    token_upsampled = token_win.repeat_interleave(upsample_factor, dim=1)
+                    prompt_token_upsampled = prompt_token_hist.repeat_interleave(upsample_factor, dim=1) if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else prompt_token_hist
+                    real_len_upsampled = real_len * upsample_factor
+                    prompt_token_len_upsampled = (prompt_token_hist.shape[1] * upsample_factor) if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else 0
+                else:
+                    token_upsampled = token_win
+                    prompt_token_upsampled = prompt_token_hist
+                    real_len_upsampled = real_len
+                    prompt_token_len_upsampled = prompt_token_hist.shape[1] if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else 0
 
-            # optional fixed window padding (right-pad ids); token_len stays real_len_upsampled
-            if self._fixed_window_pad:
-                block_size_upsampled = int(block_size * upsample_factor)
-                if token_upsampled.shape[1] < block_size_upsampled:
-                    pad_len = block_size_upsampled - token_upsampled.shape[1]
-                    pad_ids = token_upsampled[:, -1:].expand(-1, pad_len)
-                    token_upsampled = torch.cat([token_upsampled, pad_ids], dim=1)
+                # optional fixed window padding (right-pad ids); token_len stays real_len_upsampled
+                if self._fixed_window_pad:
+                    block_size_upsampled = int(block_size * upsample_factor)
+                    if token_upsampled.shape[1] < block_size_upsampled:
+                        pad_len = block_size_upsampled - token_upsampled.shape[1]
+                        pad_ids = token_upsampled[:, -1:].expand(-1, pad_len)
+                        token_upsampled = torch.cat([token_upsampled, pad_ids], dim=1)
 
-
-            finalize = end >= T
-            # sparse prints per N chunks
-            if (step_i % max(self._print_per_n_chunk, 1)) == 0:
-                logging.info(f"[cos2.stream] step={step_i} win=({start},{end}) stride={stride} token_real={real_len} up={upsample_factor} token_upsampled={token_upsampled.shape[1]} finalize={finalize}")
-
-            # 1) generate mel for this window via CosyVoice2 flow (streaming=True)
-            sample_mel, _ = self.cos2_flow.inference(
-                token=token_upsampled,
-                token_len=torch.tensor([real_len_upsampled], dtype=torch.int32, device=device),
-                prompt_token=prompt_token_upsampled,
-                prompt_token_len=torch.tensor([prompt_token_len_upsampled], dtype=torch.int32, device=device),
-                prompt_feat=prompt_feat_hist,
-                prompt_feat_len=torch.tensor([prompt_feat_hist.shape[1]], dtype=torch.int32, device=device),
-                embedding=embedding,
-                streaming=True,
-                finalize=finalize,
-            )
-            if (step_i % max(self._print_per_n_chunk, 1)) == 0:
-                logging.info(f"[cos2.stream] sample_mel_frames={sample_mel.shape[-1]}")
-            step_i += 1
-            # sample_mel: [B, 80, T_mel_new]
-
-            # Model returns per-step cumulative frames w.r.t. prompt_token (not prompt_feat).
-            # We must take the delta vs previous model cumulative to avoid duplication.
-            T_all = int(sample_mel.shape[-1])
-            prev_session = int(self._mel_model_total_dict.get(uuid, 0))
-            if T_all <= prev_session:
+                finalize = end >= T
+                # sparse prints per N chunks
                 if (step_i % max(self._print_per_n_chunk, 1)) == 0:
-                    logging.info(f"[cos2.stream] uuid={uuid} T_all={T_all} prev_session={prev_session} -> delta=0 (skip)")
-                continue
-            start = prev_session
-            delta = T_all - prev_session
-            self._mel_model_total_dict[uuid] = T_all
-            emitted_prev = int(self._mel_total_len_dict.get(uuid, 0))
-            self._mel_total_len_dict[uuid] = emitted_prev + delta
-            if (step_i % max(self._print_per_n_chunk, 1)) == 0:
-                logging.info(f"[cos2.stream] uuid={uuid} start={start} delta={delta} emitted_total(prev)={emitted_prev} emitted_total(now)={self._mel_total_len_dict[uuid]}")
-            new_mel = sample_mel[:, :, start:T_all]
+                    logging.info(f"[cos2.stream] step={step_i} win=({start},{end}) stride={stride} token_real={real_len} up={upsample_factor} token_upsampled={token_upsampled.shape[1]} finalize={finalize}")
 
-            # overlap-and-add on new frames and keep tail overlap for next chunk
-            if not finalize and self._mel_overlap_len > 0:
-                ol = int(self._mel_overlap_len)
-                prev_len = int(prev_mel.shape[-1]) if (prev_mel is not None and prev_mel.numel() > 0) else 0
-                new_len = int(new_mel.shape[-1])
-                overlap_effective = min(ol, prev_len, new_len)
-                if overlap_effective > 0:
-                    # use the first overlap_effective weights from the first half and the first overlap_effective from the second half
-                    w = torch.tensor(self._mel_window, device=new_mel.device, dtype=new_mel.dtype)
-                    w1 = w[:overlap_effective].view(1, 1, overlap_effective)
-                    w2 = w[ol:ol+overlap_effective].view(1, 1, overlap_effective)
-                    new_mel[:, :, :overlap_effective] = new_mel[:, :, :overlap_effective] * w1 + prev_mel[:, :, -overlap_effective:] * w2
-                # keep last min(ol, new_len) frames for next iteration
-                keep = min(ol, new_len)
-                self._mel_overlap_dict[uuid] = new_mel[:, :, -keep:]
-                prev_mel = self._mel_overlap_dict[uuid]
-                mel_for_vocoder = new_mel
-            else:
-                mel_for_vocoder = new_mel
-            if (step_i % max(self._print_per_n_chunk, 1)) == 0:
-                logging.info(f"[cos2.stream] mel_for_vocoder_frames={mel_for_vocoder.shape[-1]} ol={self._mel_overlap_len} total_mel={self._mel_total_len_dict[uuid]}")
+                # Update token lengths in wrapped module before inference
+                if wrapped_embedding_module is not None:
+                    wrapped_embedding_module.update_token_lengths(
+                        token_len=real_len_upsampled,
+                        prompt_token_len=prompt_token_len_upsampled
+                    )
+                
+                # 1) generate mel for this window via CosyVoice2 flow (streaming=True)
+                sample_mel, _ = self.cos2_flow.inference(
+                    token=token_upsampled,
+                    token_len=torch.tensor([real_len_upsampled], dtype=torch.int32, device=device),
+                    prompt_token=prompt_token_upsampled,
+                    prompt_token_len=torch.tensor([prompt_token_len_upsampled], dtype=torch.int32, device=device),
+                    prompt_feat=prompt_feat_hist,
+                    prompt_feat_len=torch.tensor([prompt_feat_hist.shape[1]], dtype=torch.int32, device=device),
+                    embedding=embedding,
+                    streaming=True,
+                    finalize=finalize,
+                )
+                if (step_i % max(self._print_per_n_chunk, 1)) == 0:
+                    logging.info(f"[cos2.stream] sample_mel_frames={sample_mel.shape[-1]}")
+                step_i += 1
+                # sample_mel: [B, 80, T_mel_new]
 
+                # Model returns per-step cumulative frames w.r.t. prompt_token (not prompt_feat).
+                # We must take the delta vs previous model cumulative to avoid duplication.
+                T_all = int(sample_mel.shape[-1])
+                prev_session = int(self._mel_model_total_dict.get(uuid, 0))
+                if T_all <= prev_session:
+                    if (step_i % max(self._print_per_n_chunk, 1)) == 0:
+                        logging.info(f"[cos2.stream] uuid={uuid} T_all={T_all} prev_session={prev_session} -> delta=0 (skip)")
+                    continue
+                start = prev_session
+                delta = T_all - prev_session
+                self._mel_model_total_dict[uuid] = T_all
+                emitted_prev = int(self._mel_total_len_dict.get(uuid, 0))
+                self._mel_total_len_dict[uuid] = emitted_prev + delta
+                if (step_i % max(self._print_per_n_chunk, 1)) == 0:
+                    logging.info(f"[cos2.stream] uuid={uuid} start={start} delta={delta} emitted_total(prev)={emitted_prev} emitted_total(now)={self._mel_total_len_dict[uuid]}")
+                new_mel = sample_mel[:, :, start:T_all]
 
-            # clear caches on finalize
-            if finalize:
-                total = int(self._mel_total_len_dict.get(uuid, 0))
-                # Build GT mel info and seconds if provided (GT mel is 22050Hz/hop256)
-                gt_info = ""
-                try:
-                    if gt_mel_len is not None:
-                        if isinstance(gt_mel_len, torch.Tensor):
-                            if gt_mel_len.numel() == 1:
-                                _v_list = [int(gt_mel_len.view(-1)[0].item())]
+                # overlap-and-add on new frames and keep tail overlap for next chunk
+                if not finalize and self._mel_overlap_len > 0:
+                    ol = int(self._mel_overlap_len)
+                    prev_len = int(prev_mel.shape[-1]) if (prev_mel is not None and prev_mel.numel() > 0) else 0
+                    new_len = int(new_mel.shape[-1])
+                    overlap_effective = min(ol, prev_len, new_len)
+                    if overlap_effective > 0:
+                        # use the first overlap_effective weights from the first half and the first overlap_effective from the second half
+                        w = torch.tensor(self._mel_window, device=new_mel.device, dtype=new_mel.dtype)
+                        w1 = w[:overlap_effective].view(1, 1, overlap_effective)
+                        w2 = w[ol:ol+overlap_effective].view(1, 1, overlap_effective)
+                        new_mel[:, :, :overlap_effective] = new_mel[:, :, :overlap_effective] * w1 + prev_mel[:, :, -overlap_effective:] * w2
+                    # keep last min(ol, new_len) frames for next iteration
+                    keep = min(ol, new_len)
+                    self._mel_overlap_dict[uuid] = new_mel[:, :, -keep:]
+                    prev_mel = self._mel_overlap_dict[uuid]
+                    mel_for_vocoder = new_mel
+                else:
+                    mel_for_vocoder = new_mel
+                if (step_i % max(self._print_per_n_chunk, 1)) == 0:
+                    logging.info(f"[cos2.stream] mel_for_vocoder_frames={mel_for_vocoder.shape[-1]} ol={self._mel_overlap_len} total_mel={self._mel_total_len_dict[uuid]}")
+
+                # clear caches on finalize
+                if finalize:
+                    total = int(self._mel_total_len_dict.get(uuid, 0))
+                    # Build GT mel info and seconds if provided (GT mel is 22050Hz/hop256)
+                    gt_info = ""
+                    try:
+                        if gt_mel_len is not None:
+                            if isinstance(gt_mel_len, torch.Tensor):
+                                if gt_mel_len.numel() == 1:
+                                    _v_list = [int(gt_mel_len.view(-1)[0].item())]
+                                else:
+                                    _v_list = [int(x) for x in gt_mel_len.view(-1).tolist()]
                             else:
-                                _v_list = [int(x) for x in gt_mel_len.view(-1).tolist()]
+                                _v_list = [int(gt_mel_len)]
+                            gt_sec_list = [round(v * 256.0 / float(self.OUTPUT_SAMPLE_RATE), 3) for v in _v_list]
+                            _v = _v_list[0] if len(_v_list) == 1 else _v_list
+                            _s = gt_sec_list[0] if len(gt_sec_list) == 1 else gt_sec_list
+                            gt_info = f" gt_mel_len={_v} gt_sec={_s}"
+                    except Exception:
+                        gt_info = " gt_mel_len=NA"
+                    # Emitted seconds at 24k/hop480 (=50 fps)
+                    emitted_sec = round(total * (self._mel_hop / float(self._cos2_sr)), 3)
+                    try:
+                        e = embedding.detach().float() if isinstance(embedding, torch.Tensor) else None
+                        if e is not None:
+                            l2 = torch.norm(e, dim=1).mean().item() if e.ndim == 2 and e.size(0) > 0 else float(torch.norm(e).item())
+                            head = e[0, :8].tolist() if e.ndim == 2 and e.size(0) > 0 else []
+                            logging.info(f"[cos2.stream] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk shape={list(e.shape)} mean={e.mean().item():.5f} std={e.std().item():.5f} l2_mean={l2:.5f} head8={head}")
                         else:
-                            _v_list = [int(gt_mel_len)]
-                        gt_sec_list = [round(v * 256.0 / float(self.OUTPUT_SAMPLE_RATE), 3) for v in _v_list]
-                        _v = _v_list[0] if len(_v_list) == 1 else _v_list
-                        _s = gt_sec_list[0] if len(gt_sec_list) == 1 else gt_sec_list
-                        gt_info = f" gt_mel_len={_v} gt_sec={_s}"
-                except Exception:
-                    gt_info = " gt_mel_len=NA"
-                # Emitted seconds at 24k/hop480 (=50 fps)
-                emitted_sec = round(total * (self._mel_hop / float(self._cos2_sr)), 3)
-                try:
-                    e = embedding.detach().float() if isinstance(embedding, torch.Tensor) else None
-                    if e is not None:
-                        l2 = torch.norm(e, dim=1).mean().item() if e.ndim == 2 and e.size(0) > 0 else float(torch.norm(e).item())
-                        head = e[0, :8].tolist() if e.ndim == 2 and e.size(0) > 0 else []
-                        logging.info(f"[cos2.stream] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk shape={list(e.shape)} mean={e.mean().item():.5f} std={e.std().item():.5f} l2_mean={l2:.5f} head8={head}")
-                    else:
-                        logging.info(f"[cos2.stream] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk=NA")
-                except Exception:
-                    logging.info(f"[cos2.stream] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk=ERR")
-                self._mel_overlap_dict.pop(uuid, None)
-                self._hift_cache_dict.pop(uuid, None)
-                self._mel_total_len_dict.pop(uuid, None)
+                            logging.info(f"[cos2.stream] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk=NA")
+                    except Exception:
+                        logging.info(f"[cos2.stream] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk=ERR")
+                    self._mel_overlap_dict.pop(uuid, None)
+                    self._hift_cache_dict.pop(uuid, None)
+                    self._mel_total_len_dict.pop(uuid, None)
 
+                # 3) HiFT vocoder with cache to avoid glitch
+                speech_24k, source = self._hift.inference(speech_feat=mel_for_vocoder, cache_source=cache_src)
 
-            # 3) HiFT vocoder with cache to avoid glitch
-            speech_24k, source = self._hift.inference(speech_feat=mel_for_vocoder, cache_source=cache_src)
+                # update source cache
+                if not finalize:
+                    cache_src = source[:, :, -self._source_cache_len:]
+                    self._hift_cache_dict[uuid] = {
+                        'source': cache_src,
+                    }
+                    # Do not drop tail samples; HiFT cache ensures continuity without duplication.
+                else:
+                    # clear cache
+                    cache_src = torch.zeros(batch_size, 1, 0, device=device)
 
-            # update source cache
-            if not finalize:
-                cache_src = source[:, :, -self._source_cache_len:]
-                self._hift_cache_dict[uuid] = {
-                    'source': cache_src,
-                }
-                # Do not drop tail samples; HiFT cache ensures continuity without duplication.
-            else:
-                # clear cache
-                cache_src = torch.zeros(batch_size, 1, 0, device=device)
+                # Accumulate 24k chunks; resample once at the end to avoid boundary artifacts
+                wav_chunks.append(speech_24k)
 
-            # Accumulate 24k chunks; resample once at the end to avoid boundary artifacts
-            wav_chunks.append(speech_24k)
-
+        finally:
+            # Restore original input_embedding if it was monkey-patched
+            if original_input_embedding is not None:
+                self.cos2_flow.input_embedding = original_input_embedding
+                # Explicitly clean up wrapped module to break circular reference
+                if wrapped_embedding_module is not None:
+                    wrapped_embedding_module.adapter_instance = None
+                    wrapped_embedding_module.original_embedding = None
+                    del wrapped_embedding_module
 
         # Concatenate all 24k chunks and resample once at the end (baseline non-overlap)
         if len(wav_chunks) == 0:
@@ -2182,194 +2403,230 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         self._mel_total_len_dict[uuid] = init_total
         self._mel_model_total_dict[uuid] = 0
 
-        # iterate with sliding window + text context
-        stride = int(self._stream_stride) if getattr(self, "_stream_stride", 0) and int(self._stream_stride) > 0 else block_size
-        T = token.size(1)
-        step_i = 0
-        for end in range(min(stride, T), T + 1, stride):
-            start = max(0, end - block_size)
-            token_win = token[:, start:end]
-            real_len = token_win.shape[1]
+        # Apply token embedding self-attention if enabled (via temporary monkey-patch)
+        original_input_embedding, wrapped_embedding_module = self._apply_input_embedding_sa_monkey_patch()
 
-            prompt_token_hist = token[:, :start] if start > 0 else prompt_token
-            prompt_feat_hist = torch.cat([prompt_feat, prev_mel.transpose(1, 2)], dim=1) if (prev_mel is not None and prev_mel.numel() > 0) else prompt_feat
+        try:
+            # iterate with sliding window + text context
+            stride = int(self._stream_stride) if getattr(self, "_stream_stride", 0) and int(self._stream_stride) > 0 else block_size
+            T = token.size(1)
+            step_i = 0
+            for end in range(min(stride, T), T + 1, stride):
+                start = max(0, end - block_size)
+                token_win = token[:, start:end]
+                real_len = token_win.shape[1]
 
-            # Cross-text attention (if enabled) else fallback to prefix window
-            # Align text visibility to current speech token progress: text_end_idx = min(T_text, end)
-            text_end_idx = min(int(text_tokens.shape[1]), int(end))
-            if self._use_cross_text_attn:
-                # KV from text up to text_end_idx, with per-batch mask
-                kv = self.text_context_emb(torch.clamp(text_tokens[:, :text_end_idx], min=0, max=self._text_vocab_size - 1))  # [B, Lt, D]
-                mask_kv = torch.ones(kv.shape[0], 1, kv.shape[1], dtype=torch.bool, device=kv.device)
-                # Q from speech histories: use all past + current chunk tokens as self-attn context, then slice current chunk as multi-query
-                token_hist = token[:, :end]
-                token_hist_emb = self.cos2_flow.input_embedding(token_hist)  # [B, Lhist, D]
-                Lhist = token_hist_emb.shape[1]
-                tril = torch.tril(torch.ones((Lhist, Lhist), dtype=torch.bool, device=token_hist_emb.device))
-                mask_speech_hist = tril.unsqueeze(0).expand(token_hist_emb.shape[0], -1, -1)
-                speech_hist_attn, _ = self.speech_sa(query=token_hist_emb, key=token_hist_emb, value=token_hist_emb, mask=mask_speech_hist)
-                speech_hist = self.speech_ln(speech_hist_attn)
-                speech_hist = speech_hist + self.speech_ffn(speech_hist)
-                # extract current chunk subrange [end-real_len:end]
-                start_q = max(0, end - real_len)
-                speech_query = speech_hist[:, start_q:end, :]  # [B, Lq, D]
-                # Text refinement (self-attn+FFN)
-                # Causal self-attn on text tokens up to text_end_idx
-                Lt = kv.shape[1]
-                tril = torch.tril(torch.ones((Lt, Lt), dtype=torch.bool, device=kv.device))
-                mask_kv_causal = tril.unsqueeze(0).expand(kv.shape[0], -1, -1)
-                kv_attn, _ = self.text_sa(query=kv, key=kv, value=kv, mask=mask_kv_causal)
-                kv_ref = self.text_ln(kv_attn)
-                kv_ref = kv_ref + self.text_ffn(kv_ref)
-                # Cross-attn with multi-query; then pool last valid step to single vector per batch
-                attn_out, attn_w = self.cross_text_attn(query=speech_query, key=kv_ref, value=kv_ref, mask=mask_kv)  # [B, Lq, D]
-                if getattr(self, '_debug_xattn', False) and ((step_i % max(self._print_per_n_chunk, 1)) == 0):
-                    try:
-                        # attn_w expected shape [B,H,Q,K] or [B,Q,K]
-                        if isinstance(attn_w, torch.Tensor):
-                            if attn_w.dim() == 4:
-                                attn_weights_debug = attn_w.mean(dim=1)
-                            elif attn_w.dim() == 3:
-                                attn_weights_debug = attn_w
+                prompt_token_hist = token[:, :start] if start > 0 else prompt_token
+                prompt_feat_hist = torch.cat([prompt_feat, prev_mel.transpose(1, 2)], dim=1) if (prev_mel is not None and prev_mel.numel() > 0) else prompt_feat
+
+                # Cross-text attention (if enabled) else fallback to prefix window
+                # Align text visibility to current speech token progress: text_end_idx = min(T_text, end)
+                text_end_idx = min(int(text_tokens.shape[1]), int(end))
+                if self._use_cross_text_attn:
+                    # KV from text up to text_end_idx, with per-batch mask
+                    kv = self.text_context_emb(torch.clamp(text_tokens[:, :text_end_idx], min=0, max=self._text_vocab_size - 1))  # [B, Lt, D]
+                    mask_kv = torch.ones(kv.shape[0], 1, kv.shape[1], dtype=torch.bool, device=kv.device)
+                    # Q from speech histories: use all past + current chunk tokens as self-attn context, then slice current chunk as multi-query
+                    token_hist = token[:, :end]
+                    # Use original embedding (not monkey-patched) for cross-attention query building
+                    # since we apply self-attention explicitly below
+                    input_emb_fn = original_input_embedding if original_input_embedding is not None else self.cos2_flow.input_embedding
+                    token_hist_emb = input_emb_fn(token_hist)  # [B, Lhist, D]
+                    Lhist = token_hist_emb.shape[1]
+                    tril = torch.tril(torch.ones((Lhist, Lhist), dtype=torch.bool, device=token_hist_emb.device))
+                    mask_speech_hist = tril.unsqueeze(0).expand(token_hist_emb.shape[0], -1, -1)
+                    speech_hist_attn, _ = self.speech_sa(query=token_hist_emb, key=token_hist_emb, value=token_hist_emb, mask=mask_speech_hist)
+                    speech_hist = self.speech_ln(speech_hist_attn)
+                    speech_hist = speech_hist + self.speech_ffn(speech_hist)
+                    # extract current chunk subrange [end-real_len:end]
+                    start_q = max(0, end - real_len)
+                    speech_query = speech_hist[:, start_q:end, :]  # [B, Lq, D]
+                    # Text refinement (self-attn+FFN)
+                    # Causal self-attn on text tokens up to text_end_idx
+                    Lt = kv.shape[1]
+                    tril = torch.tril(torch.ones((Lt, Lt), dtype=torch.bool, device=kv.device))
+                    mask_kv_causal = tril.unsqueeze(0).expand(kv.shape[0], -1, -1)
+                    kv_attn, _ = self.text_sa(query=kv, key=kv, value=kv, mask=mask_kv_causal)
+                    kv_ref = self.text_ln(kv_attn)
+                    kv_ref = kv_ref + self.text_ffn(kv_ref)
+                    # Cross-attn with multi-query; then pool last valid step to single vector per batch
+                    attn_out, attn_w = self.cross_text_attn(query=speech_query, key=kv_ref, value=kv_ref, mask=mask_kv)  # [B, Lq, D]
+                    if getattr(self, '_debug_xattn', False) and ((step_i % max(self._print_per_n_chunk, 1)) == 0):
+                        try:
+                            # attn_w expected shape [B,H,Q,K] or [B,Q,K]
+                            if isinstance(attn_w, torch.Tensor):
+                                if attn_w.dim() == 4:
+                                    attn_weights_debug = attn_w.mean(dim=1)
+                                elif attn_w.dim() == 3:
+                                    attn_weights_debug = attn_w
+                                else:
+                                    attn_weights_debug = None
                             else:
                                 attn_weights_debug = None
-                        else:
-                            attn_weights_debug = None
-                        Bq = int(speech_query.shape[1]); Kt = int(kv_ref.shape[1])
-                        if attn_weights_debug is not None and real_len > 0:
-                            vec = attn_weights_debug[0, real_len - 1, :Kt]
-                            k = int(min(3, Kt))
-                            vec = torch.softmax(vec, dim=-1)
-                            vals, idxs = torch.topk(vec, k)
-                            logging.info(f"[cos2.infer.xattn] step={step_i} Q_len={Bq} K_len={Kt} topk_idx={idxs.tolist()} topk_val={[round(float(v),4) for v in vals.tolist()]}")
-                        else:
-                            logging.info(f"[cos2.infer.xattn] step={step_i} Q_len={Bq} K_len={Kt} (no attn_w)")
-                    except Exception as e:
-                        logging.info(f"[cos2.infer.xattn] warn: {e}")
-                # Aggregate full-Q features to context_len via learned queries (no temporal pooling)
-                q_ctx = self.ctx_queries.to(attn_out.device).unsqueeze(0).expand(attn_out.shape[0], -1, -1)  # [B,context_len,D]
-                key_mask = torch.ones(attn_out.shape[0], 1, attn_out.shape[1], dtype=torch.bool, device=attn_out.device)
-                ctx_raw, _ = self.q2ctx_attn(query=q_ctx, key=attn_out, value=attn_out, mask=key_mask)  # [B,context_len,D]
-                text_ctx_processed = self.cross_ln(ctx_raw)
-                text_ctx_processed = text_ctx_processed + self.cross_ffn(text_ctx_processed)
-                context_len = int(getattr(self.cos2_flow.encoder.pre_lookahead_layer, 'pre_lookahead_len', 4))
-                text_ctx = text_ctx_processed  # already [B, context_len, D]
-            else:
-                emb = self.text_context_emb(torch.clamp(text_tokens[:, :text_end_idx], min=0, max=self._text_vocab_size - 1))
-                context_len = int(getattr(self.cos2_flow.encoder.pre_lookahead_layer, 'pre_lookahead_len', 4))
-                if emb.shape[1] < context_len:
-                    pad = torch.zeros(batch_size, context_len - emb.shape[1], emb.shape[2], device=emb.device, dtype=emb.dtype)
-                    emb_ctx = torch.cat([emb, pad], dim=1)
+                            Bq = int(speech_query.shape[1]); Kt = int(kv_ref.shape[1])
+                            if attn_weights_debug is not None and real_len > 0:
+                                vec = attn_weights_debug[0, real_len - 1, :Kt]
+                                k = int(min(3, Kt))
+                                vec = torch.softmax(vec, dim=-1)
+                                vals, idxs = torch.topk(vec, k)
+                                logging.info(f"[cos2.infer.xattn] step={step_i} Q_len={Bq} K_len={Kt} topk_idx={idxs.tolist()} topk_val={[round(float(v),4) for v in vals.tolist()]}")
+                            else:
+                                logging.info(f"[cos2.infer.xattn] step={step_i} Q_len={Bq} K_len={Kt} (no attn_w)")
+                        except Exception as e:
+                            logging.info(f"[cos2.infer.xattn] warn: {e}")
+                    # Aggregate full-Q features to context_len via learned queries (no temporal pooling)
+                    q_ctx = self.ctx_queries.to(attn_out.device).unsqueeze(0).expand(attn_out.shape[0], -1, -1)  # [B,context_len,D]
+                    key_mask = torch.ones(attn_out.shape[0], 1, attn_out.shape[1], dtype=torch.bool, device=attn_out.device)
+                    ctx_raw, _ = self.q2ctx_attn(query=q_ctx, key=attn_out, value=attn_out, mask=key_mask)  # [B,context_len,D]
+                    text_ctx_processed = self.cross_ln(ctx_raw)
+                    text_ctx_processed = text_ctx_processed + self.cross_ffn(text_ctx_processed)
+                    context_len = int(getattr(self.cos2_flow.encoder.pre_lookahead_layer, 'pre_lookahead_len', 4))
+                    text_ctx = text_ctx_processed  # already [B, context_len, D]
                 else:
-                    emb_ctx = emb[:, -context_len:]
-                text_ctx = emb_ctx
-
-            # upsample
-            upsample_factor = self._compute_upsample_factor()
-            if upsample_factor > 1:
-                token_upsampled = token_win.repeat_interleave(upsample_factor, dim=1)
-                prompt_token_upsampled = prompt_token_hist.repeat_interleave(upsample_factor, dim=1) if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else prompt_token_hist
-                real_len_upsampled = real_len * upsample_factor
-                prompt_token_len_upsampled = (prompt_token_hist.shape[1] * upsample_factor) if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else 0
-            else:
-                token_upsampled = token_win
-                prompt_token_upsampled = prompt_token_hist
-                real_len_upsampled = real_len
-                prompt_token_len_upsampled = prompt_token_hist.shape[1] if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else 0
-
-            # optional fixed window padding (right-pad ids) for text-conditioned streaming
-            if self._fixed_window_pad:
-                block_size_upsampled = int(block_size * upsample_factor)
-                if token_upsampled.shape[1] < block_size_upsampled:
-                    pad_len = block_size_upsampled - token_upsampled.shape[1]
-                    pad_ids = token_upsampled[:, -1:].expand(-1, pad_len)
-                    token_upsampled = torch.cat([token_upsampled, pad_ids], dim=1)
-
-            finalize = end >= T
-            if (step_i % max(self._print_per_n_chunk, 1)) == 0:
-                ctx_src = 'xattn' if self._use_cross_text_attn else 'prefix'
-                try:
-                    if self._fixed_window_pad:
-                        pad_tok = max(0, int(block_size - real_len))
-                        pad_upsampled = max(0, int(block_size * upsample_factor - real_len_upsampled))
+                    emb = self.text_context_emb(torch.clamp(text_tokens[:, :text_end_idx], min=0, max=self._text_vocab_size - 1))
+                    context_len = int(getattr(self.cos2_flow.encoder.pre_lookahead_layer, 'pre_lookahead_len', 4))
+                    if emb.shape[1] < context_len:
+                        pad = torch.zeros(batch_size, context_len - emb.shape[1], emb.shape[2], device=emb.device, dtype=emb.dtype)
+                        emb_ctx = torch.cat([emb, pad], dim=1)
                     else:
+                        emb_ctx = emb[:, -context_len:]
+                    text_ctx = emb_ctx
+
+                # upsample
+                upsample_factor = self._compute_upsample_factor()
+                if upsample_factor > 1:
+                    token_upsampled = token_win.repeat_interleave(upsample_factor, dim=1)
+                    prompt_token_upsampled = prompt_token_hist.repeat_interleave(upsample_factor, dim=1) if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else prompt_token_hist
+                    real_len_upsampled = real_len * upsample_factor
+                    prompt_token_len_upsampled = (prompt_token_hist.shape[1] * upsample_factor) if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else 0
+                else:
+                    token_upsampled = token_win
+                    prompt_token_upsampled = prompt_token_hist
+                    real_len_upsampled = real_len
+                    prompt_token_len_upsampled = prompt_token_hist.shape[1] if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else 0
+
+                # optional fixed window padding (right-pad ids) for text-conditioned streaming
+                if self._fixed_window_pad:
+                    block_size_upsampled = int(block_size * upsample_factor)
+                    if token_upsampled.shape[1] < block_size_upsampled:
+                        pad_len = block_size_upsampled - token_upsampled.shape[1]
+                        pad_ids = token_upsampled[:, -1:].expand(-1, pad_len)
+                        token_upsampled = torch.cat([token_upsampled, pad_ids], dim=1)
+
+                finalize = end >= T
+                if (step_i % max(self._print_per_n_chunk, 1)) == 0:
+                    ctx_src = 'xattn' if self._use_cross_text_attn else 'prefix'
+                    try:
+                        if self._fixed_window_pad:
+                            pad_tok = max(0, int(block_size - real_len))
+                            pad_upsampled = max(0, int(block_size * upsample_factor - real_len_upsampled))
+                        else:
+                            pad_tok = 0
+                            pad_upsampled = 0
+                    except Exception:
                         pad_tok = 0
                         pad_upsampled = 0
-                except Exception:
-                    pad_tok = 0
-                    pad_upsampled = 0
-                logging.info(
-                    f"[cos2.stream+text] step={step_i} win=({start},{end}) stride={stride} token_real={real_len} up={upsample_factor} token_upsampled={token_upsampled.shape[1]} "
-                    f"pad_tok={pad_tok} pad_upsampled={pad_upsampled} text_end_idx={text_end_idx} text=[0:{text_end_idx}) q_pool=multi_query:ctx_attn ctx={ctx_src} context_len={context_len} finalize={finalize}"
+                    logging.info(
+                        f"[cos2.stream+text] step={step_i} win=({start},{end}) stride={stride} token_real={real_len} up={upsample_factor} token_upsampled={token_upsampled.shape[1]} "
+                        f"pad_tok={pad_tok} pad_upsampled={pad_upsampled} text_end_idx={text_end_idx} text=[0:{text_end_idx}) q_pool=multi_query:ctx_attn ctx={ctx_src} context_len={context_len} finalize={finalize}"
+                    )
+
+                # Update token lengths in wrapped module before inference
+                if wrapped_embedding_module is not None:
+                    wrapped_embedding_module.update_token_lengths(
+                        token_len=real_len_upsampled,
+                        prompt_token_len=prompt_token_len_upsampled
+                    )
+
+                # Run CosyVoice2 flow with text context replacing semantic lookahead
+                sample_mel, _ = self.cos2_flow.inference(
+                    token=token_upsampled,
+                    token_len=torch.tensor([real_len_upsampled], dtype=torch.int32, device=device),
+                    prompt_token=prompt_token_upsampled,
+                    prompt_token_len=torch.tensor([prompt_token_len_upsampled], dtype=torch.int32, device=device),
+                    prompt_feat=prompt_feat_hist,
+                    prompt_feat_len=torch.tensor([prompt_feat_hist.shape[1]], dtype=torch.int32, device=device),
+                    embedding=embedding,
+                    streaming=True,
+                    finalize=finalize,
+                    use_text_context=True,
+                    text_context=text_ctx,
                 )
+                # step index for logging
+                step_i += 1
 
-
-
-            # Run CosyVoice2 flow with text context replacing semantic lookahead
-            sample_mel, _ = self.cos2_flow.inference(
-                token=token_upsampled,
-                token_len=torch.tensor([real_len_upsampled], dtype=torch.int32, device=device),
-                prompt_token=prompt_token_upsampled,
-                prompt_token_len=torch.tensor([prompt_token_len_upsampled], dtype=torch.int32, device=device),
-                prompt_feat=prompt_feat_hist,
-                prompt_feat_len=torch.tensor([prompt_feat_hist.shape[1]], dtype=torch.int32, device=device),
-                embedding=embedding,
-                streaming=True,
-                finalize=finalize,
-                use_text_context=True,
-                text_context=text_ctx,
-            )
-            # step index for logging
-            step_i += 1
-
-            # Same as non-text streaming: inference() returns cumulative frames w.r.t. prompt_token.
-            # Compute delta vs previous model cumulative frames.
-            T_all = int(sample_mel.shape[-1])
-            prev_session = int(self._mel_model_total_dict.get(uuid, 0))
-            if T_all <= prev_session:
+                # Same as non-text streaming: inference() returns cumulative frames w.r.t. prompt_token.
+                # Compute delta vs previous model cumulative frames.
+                T_all = int(sample_mel.shape[-1])
+                prev_session = int(self._mel_model_total_dict.get(uuid, 0))
+                if T_all <= prev_session:
+                    # try:
+                    #     logging.info(f"[cos2.stream+text] uuid={uuid} T_all={T_all} prev_session={prev_session} -> delta=0 (skip)")
+                    # except Exception:
+                    #     pass
+                    continue
+                start = prev_session
+                delta = T_all - prev_session
+                self._mel_model_total_dict[uuid] = T_all
+                emitted_prev = int(self._mel_total_len_dict.get(uuid, 0))
+                self._mel_total_len_dict[uuid] = emitted_prev + delta
                 # try:
-                #     logging.info(f"[cos2.stream+text] uuid={uuid} T_all={T_all} prev_session={prev_session} -> delta=0 (skip)")
+                #     logging.info(f"[cos2.stream+text] uuid={uuid} start={start} delta={delta} emitted_total(prev)={emitted_prev} emitted_total(now)={self._mel_total_len_dict[uuid]}")
                 # except Exception:
                 #     pass
-                continue
-            start = prev_session
-            delta = T_all - prev_session
-            self._mel_model_total_dict[uuid] = T_all
-            emitted_prev = int(self._mel_total_len_dict.get(uuid, 0))
-            self._mel_total_len_dict[uuid] = emitted_prev + delta
-            # try:
-            #     logging.info(f"[cos2.stream+text] uuid={uuid} start={start} delta={delta} emitted_total(prev)={emitted_prev} emitted_total(now)={self._mel_total_len_dict[uuid]}")
-            # except Exception:
-            #     pass
-            new_mel = sample_mel[:, :, start:T_all]
+                new_mel = sample_mel[:, :, start:T_all]
 
-            # overlap-and-add as usual
-            if not finalize and self._mel_overlap_len > 0:
-                ol = int(self._mel_overlap_len)
-                prev_len = int(prev_mel.shape[-1]) if (prev_mel is not None and prev_mel.numel() > 0) else 0
-                new_len = int(new_mel.shape[-1])
-                overlap_effective = min(ol, prev_len, new_len)
-                if overlap_effective > 0:
-                    w = torch.tensor(self._mel_window, device=new_mel.device, dtype=new_mel.dtype)
-                    w1 = w[:overlap_effective].view(1, 1, overlap_effective)
-                    w2 = w[ol:ol+overlap_effective].view(1, 1, overlap_effective)
-                    new_mel[:, :, :overlap_effective] = new_mel[:, :, :overlap_effective] * w1 + prev_mel[:, :, -overlap_effective:] * w2
-                keep = min(ol, new_len)
-                self._mel_overlap_dict[uuid] = new_mel[:, :, -keep:]
-                prev_mel = self._mel_overlap_dict[uuid]
-                mel_for_vocoder = new_mel
-            else:
-                mel_for_vocoder = new_mel
+                # overlap-and-add as usual
+                if not finalize and self._mel_overlap_len > 0:
+                    ol = int(self._mel_overlap_len)
+                    prev_len = int(prev_mel.shape[-1]) if (prev_mel is not None and prev_mel.numel() > 0) else 0
+                    new_len = int(new_mel.shape[-1])
+                    overlap_effective = min(ol, prev_len, new_len)
+                    if overlap_effective > 0:
+                        w = torch.tensor(self._mel_window, device=new_mel.device, dtype=new_mel.dtype)
+                        w1 = w[:overlap_effective].view(1, 1, overlap_effective)
+                        w2 = w[ol:ol+overlap_effective].view(1, 1, overlap_effective)
+                        new_mel[:, :, :overlap_effective] = new_mel[:, :, :overlap_effective] * w1 + prev_mel[:, :, -overlap_effective:] * w2
+                    keep = min(ol, new_len)
+                    self._mel_overlap_dict[uuid] = new_mel[:, :, -keep:]
+                    prev_mel = self._mel_overlap_dict[uuid]
+                    mel_for_vocoder = new_mel
+                else:
+                    mel_for_vocoder = new_mel
 
-            # clear caches on finalize
-            if finalize:
-                total = int(self._mel_total_len_dict.get(uuid, 0))
-                try:
-                    e = embedding.detach().float() if isinstance(embedding, torch.Tensor) else None
-                    if e is not None:
-                        l2 = torch.norm(e, dim=1).mean().item() if e.ndim == 2 and e.size(0) > 0 else float(torch.norm(e).item())
-                        head = e[0, :8].tolist() if e.ndim == 2 and e.size(0) > 0 else []
-                        # Build GT mel info and seconds if provided (GT mel is 22050Hz/hop256)
+                # clear caches on finalize
+                if finalize:
+                    total = int(self._mel_total_len_dict.get(uuid, 0))
+                    try:
+                        e = embedding.detach().float() if isinstance(embedding, torch.Tensor) else None
+                        if e is not None:
+                            l2 = torch.norm(e, dim=1).mean().item() if e.ndim == 2 and e.size(0) > 0 else float(torch.norm(e).item())
+                            head = e[0, :8].tolist() if e.ndim == 2 and e.size(0) > 0 else []
+                            # Build GT mel info and seconds if provided (GT mel is 22050Hz/hop256)
+                            gt_info = ""
+                            try:
+                                if gt_mel_len is not None:
+                                    if isinstance(gt_mel_len, torch.Tensor):
+                                        if gt_mel_len.numel() == 1:
+                                            _v_list = [int(gt_mel_len.view(-1)[0].item())]
+                                        else:
+                                            _v_list = [int(x) for x in gt_mel_len.view(-1).tolist()]
+                                    else:
+                                        _v_list = [int(gt_mel_len)]
+                                    gt_sec_list = [round(v * 256.0 / float(self.OUTPUT_SAMPLE_RATE), 3) for v in _v_list]
+                                    _v = _v_list[0] if len(_v_list) == 1 else _v_list
+                                    _s = gt_sec_list[0] if len(gt_sec_list) == 1 else gt_sec_list
+                                    gt_info = f" gt_mel_len={_v} gt_sec={_s}"
+                            except Exception:
+                                gt_info = " gt_mel_len=NA"
+                            # Emitted seconds at 24k/hop480 (=50 fps)
+                            emitted_sec = round(total * (self._mel_hop / float(self._cos2_sr)), 3)
+                            logging.info(f"[cos2.stream+text] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk shape={list(e.shape)} mean={e.mean().item():.5f} std={e.std().item():.5f} l2_mean={l2:.5f} head8={head}")
+                        else:
+                            emitted_sec = round(total * (self._mel_hop / float(self._cos2_sr)), 3)
+                            logging.info(f"[cos2.stream+text] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec} | spk=NA")
+                    except Exception:
+                        # try to still include gt_info if available
                         gt_info = ""
                         try:
                             if gt_mel_len is not None:
@@ -2385,49 +2642,35 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                                 _s = gt_sec_list[0] if len(gt_sec_list) == 1 else gt_sec_list
                                 gt_info = f" gt_mel_len={_v} gt_sec={_s}"
                         except Exception:
-                            gt_info = " gt_mel_len=NA"
-                        # Emitted seconds at 24k/hop480 (=50 fps)
+                            pass
                         emitted_sec = round(total * (self._mel_hop / float(self._cos2_sr)), 3)
-                        logging.info(f"[cos2.stream+text] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk shape={list(e.shape)} mean={e.mean().item():.5f} std={e.std().item():.5f} l2_mean={l2:.5f} head8={head}")
-                    else:
-                        emitted_sec = round(total * (self._mel_hop / float(self._cos2_sr)), 3)
-                        logging.info(f"[cos2.stream+text] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec} | spk=NA")
-                except Exception:
-                    # try to still include gt_info if available
-                    gt_info = ""
-                    try:
-                        if gt_mel_len is not None:
-                            if isinstance(gt_mel_len, torch.Tensor):
-                                if gt_mel_len.numel() == 1:
-                                    _v_list = [int(gt_mel_len.view(-1)[0].item())]
-                                else:
-                                    _v_list = [int(x) for x in gt_mel_len.view(-1).tolist()]
-                            else:
-                                _v_list = [int(gt_mel_len)]
-                            gt_sec_list = [round(v * 256.0 / float(self.OUTPUT_SAMPLE_RATE), 3) for v in _v_list]
-                            _v = _v_list[0] if len(_v_list) == 1 else _v_list
-                            _s = gt_sec_list[0] if len(gt_sec_list) == 1 else gt_sec_list
-                            gt_info = f" gt_mel_len={_v} gt_sec={_s}"
-                    except Exception:
-                        pass
-                    emitted_sec = round(total * (self._mel_hop / float(self._cos2_sr)), 3)
-                    logging.info(f"[cos2.stream+text] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk=ERR")
-                self._mel_overlap_dict.pop(uuid, None)
-                self._hift_cache_dict.pop(uuid, None)
-                self._mel_total_len_dict.pop(uuid, None)
+                        logging.info(f"[cos2.stream+text] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk=ERR")
+                    self._mel_overlap_dict.pop(uuid, None)
+                    self._hift_cache_dict.pop(uuid, None)
+                    self._mel_total_len_dict.pop(uuid, None)
 
-            # Vocoder with cache
-            speech_24k, source = self._hift.inference(speech_feat=mel_for_vocoder, cache_source=cache_src)
-            if not finalize:
-                cache_src = source[:, :, -self._source_cache_len:]
-                self._hift_cache_dict[uuid] = {
-                    'source': cache_src,
-                }
-                # Do not drop tail samples; HiFT cache ensures continuity without duplication.
-            else:
-                cache_src = torch.zeros(batch_size, 1, 0, device=device)
+                # Vocoder with cache
+                speech_24k, source = self._hift.inference(speech_feat=mel_for_vocoder, cache_source=cache_src)
+                if not finalize:
+                    cache_src = source[:, :, -self._source_cache_len:]
+                    self._hift_cache_dict[uuid] = {
+                        'source': cache_src,
+                    }
+                    # Do not drop tail samples; HiFT cache ensures continuity without duplication.
+                else:
+                    cache_src = torch.zeros(batch_size, 1, 0, device=device)
 
-            wav_chunks.append(speech_24k)
+                wav_chunks.append(speech_24k)
+
+        finally:
+            # Restore original input_embedding if it was monkey-patched
+            if original_input_embedding is not None:
+                self.cos2_flow.input_embedding = original_input_embedding
+                # Explicitly clean up wrapped module to break circular reference
+                if wrapped_embedding_module is not None:
+                    wrapped_embedding_module.adapter_instance = None
+                    wrapped_embedding_module.original_embedding = None
+                    del wrapped_embedding_module
 
         wav_24k = torch.cat(wav_chunks, dim=-1)
         out_sr = self.OUTPUT_SAMPLE_RATE
@@ -2482,8 +2725,19 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 sample_token = sample_token.repeat_interleave(upsample_factor, dim=1)
                 sample_prompt_token = sample_prompt_token.repeat_interleave(upsample_factor, dim=1) if (sample_prompt_token is not None and sample_prompt_token.numel() > 0) else sample_prompt_token
 
-            # run flow once finalize=True to get full mel
-            sample_mel, _ = self.cos2_flow.inference(
+            # Apply token embedding self-attention if enabled (via temporary monkey-patch)
+            original_input_embedding, wrapped_embedding_module = self._apply_input_embedding_sa_monkey_patch()
+
+            try:
+                # Update token lengths in wrapped module before inference
+                if wrapped_embedding_module is not None:
+                    wrapped_embedding_module.update_token_lengths(
+                        token_len=sample_token.shape[1],
+                        prompt_token_len=sample_prompt_token.shape[1] if (sample_prompt_token is not None and sample_prompt_token.numel() > 0) else 0
+                    )
+                
+                # run flow once finalize=True to get full mel
+                sample_mel, _ = self.cos2_flow.inference(
                 token=sample_token,
                 token_len=torch.tensor([sample_token.shape[1]], dtype=torch.int32, device=device),
                 prompt_token=sample_prompt_token,
@@ -2491,9 +2745,18 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 prompt_feat=sample_prompt_feat,
                 prompt_feat_len=torch.tensor([sample_prompt_feat.shape[1]], dtype=torch.int32, device=device),
                 embedding=sample_embedding,
-                streaming=False,
-                finalize=True,
-            )
+                    streaming=False,
+                    finalize=True,
+                )
+            finally:
+                # Restore original input_embedding if it was monkey-patched
+                if original_input_embedding is not None:
+                    self.cos2_flow.input_embedding = original_input_embedding
+                    # Explicitly clean up wrapped module to break circular reference
+                    if wrapped_embedding_module is not None:
+                        wrapped_embedding_module.adapter_instance = None
+                        wrapped_embedding_module.original_embedding = None
+                        del wrapped_embedding_module
             # one-shot vocoder to avoid boundary artifacts
             speech_24k, _ = self._hift.inference(speech_feat=sample_mel)
             # resample once at the end
