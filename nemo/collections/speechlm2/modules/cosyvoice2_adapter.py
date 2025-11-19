@@ -102,10 +102,74 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
     """
     Minimal adapter to use CosyVoice2 Causal Streaming Flow in NeMo training.
 
-    - .flow(batch, device): compute CFM training loss
-    - .token2wav(...): decode tokens -> mel via CosyVoice2 flow -> waveform via HiFT (HiFi-GAN)
-      Note: We resample 24k output to 22.05k to match existing downstream code.
-    - .stream_inference(...): streaming decode with overlap-fade and HiFT cache (24k -> 22.05k)
+    Public Methods:
+    ---------------
+    Training:
+        - flow(batch, device): Compute CFM training loss with streaming/non-streaming paths
+    
+    Inference:
+        - token2wav(...): Batch offline decode (tokens -> mel -> wav @ 22.05kHz)
+        - offline_inference(...): Simplified batch offline decode (tokens -> wav @ 22.05kHz)
+        - stream_inference(...): Streaming decode with overlap-fade & HiFT cache
+        - stream_inference_with_text(...): Streaming decode with text context injection
+    
+    Private Method Usage Map:
+    -------------------------
+    [All Methods - Core Utilities]
+        _compute_upsample_factor()      : Training + All inference
+        _ensure_device()                : Training + All inference
+        _determine_chunk_block_size()   : Training + Streaming inference
+    
+    [Training Only - flow()]
+        _infer_device_from_batch()
+        _prepare_inputs_and_ensure_device()
+        _process_non_text_path()        : Non-streaming path without text context
+        _build_condition_and_compute_loss()
+        _print_training_debug_info()
+        _pad_and_concatenate_batch()    : Pad samples to max length in batch
+        
+        # Streaming training (per-sample chunking)
+        _extract_sample_tokens_and_text()
+        _precompute_token_and_text_embeddings()
+        _compute_first_chunk_length()
+        _build_chunk_boundaries()
+        _slice_and_batch_token_embeddings()
+        _build_text_context_for_chunks()
+        _reconstruct_sample_timeline()
+        _print_microbatch_debug_info()
+        
+        # Text context building (training)
+        _build_cross_attention_text_context()    : Used by flow() streaming path
+        _build_fallback_text_context()           : Used by flow() when cross-attn disabled
+        _build_speech_history_with_causal_attention()   : Helper for cross-attn
+        _build_text_kv_with_causal_attention()          : Helper for cross-attn
+        _debug_cross_attention_weights()                : Debug helper for cross-attn
+        _build_speech_hidden_with_non_causal_attention(): Non-streaming + token emb SA
+    
+    [All Inference - Shared]
+        _lazy_init_hift()               : token2wav + offline_inference + streaming
+        _resample_to_output()           : token2wav + offline_inference + streaming
+        _upsample_tokens()              : token2wav + offline_inference + streaming
+    
+    [Batch Offline Inference - token2wav + offline_inference]
+        _extract_batch_sample()         : Extract single sample from batch
+        _run_flow_inference_with_sa()   : Unified flow.inference() call with SA wrapper
+        _fix_zero_embedding()           : Only in token2wav (avoid NaN in normalize)
+    
+    [Streaming Inference - stream_inference + stream_inference_with_text]
+        _process_batch_split()          : Recursively handle batch > 1
+        _apply_fixed_window_padding()   : Pad to fixed block size if enabled
+        _initialize_streaming_cache()   : Initialize mel overlap & HiFT cache
+        _compute_mel_delta()            : Extract new frames from cumulative output
+        _apply_mel_overlap()            : Overlap-and-add for smooth transitions
+        _finalize_streaming_session()   : Clear caches and log final stats
+    
+    [Text-Conditioned Streaming - stream_inference_with_text only]
+        _build_streaming_text_context() : Build cross-attn or prefix text context
+    
+    [Token Embedding Self-Attention - Inference Optional Feature]
+        _apply_input_embedding_sa_monkey_patch()  : Wrap input_embedding with SA
+        _InputEmbeddingWithSA (inner class)       : SA wrapper for token embeddings
     
     Naming Conventions:
     -------------------
@@ -839,9 +903,9 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         Returns:
             upsample_factor (int): Upsampling factor (typically 2)
         """
-        tmr = float(getattr(self.cos2_flow, 'token_mel_ratio', self.DEFAULT_TOKEN_MEL_RATIO))
+        token_mel_ratio = float(getattr(self.cos2_flow, 'token_mel_ratio', self.DEFAULT_TOKEN_MEL_RATIO))
         enc_up = self.ENCODER_UPSAMPLE_FACTOR
-        upsample_factor = max(1, int(round(tmr / enc_up)))
+        upsample_factor = max(1, int(round(token_mel_ratio / enc_up)))
         return upsample_factor
 
     def _infer_device_from_batch(self, batch_dict, fallback_device):
@@ -1488,13 +1552,13 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 ratio_upsampled = (num_hidden_frames_valid / max(num_tokens_upsampled_current, 1)) if num_tokens_upsampled_current > 0 else 0.0
                 ratio_original = (num_hidden_frames_valid / max(num_tokens_original0, 1)) if num_tokens_original0 > 0 else 0.0
                 token_fps = getattr(self.cos2_flow, 'input_frame_rate', 'NA')
-                tmr = getattr(self.cos2_flow, 'token_mel_ratio', 'NA')
+                token_mel_ratio = getattr(self.cos2_flow, 'token_mel_ratio', 'NA')
                 try:
                     _loss_val = float(loss_val.detach().item())
                 except Exception:
                     _loss_val = float('nan')
                 logging.info(
-                    f"[cos2.train] step={int(self._step)} streaming={bool(is_streaming)} num_tokens_original={num_tokens_original0} num_tokens_upsampled={num_tokens_upsampled_current} num_hidden_raw={num_hidden_frames_raw} num_hidden_valid={num_hidden_frames_valid} num_feat={num_feat_frames} valid/original={ratio_original:.3f} valid/upsampled={ratio_upsampled:.3f} loss={_loss_val:.6f} cfg: token_fps={token_fps} token_mel_ratio={tmr} up_factor={upsample_f}"
+                    f"[cos2.train] step={int(self._step)} streaming={bool(is_streaming)} num_tokens_original={num_tokens_original0} num_tokens_upsampled={num_tokens_upsampled_current} num_hidden_raw={num_hidden_frames_raw} num_hidden_valid={num_hidden_frames_valid} num_feat={num_feat_frames} valid/original={ratio_original:.3f} valid/upsampled={ratio_upsampled:.3f} loss={_loss_val:.6f} cfg: token_fps={token_fps} token_mel_ratio={token_mel_ratio} up_factor={upsample_f}"
                 )
             except Exception:
                 pass
@@ -1843,9 +1907,9 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             mem_alloc, mem_reserved = 0, 0
         
         try:
-            tmr_dbg = float(getattr(self.cos2_flow, 'token_mel_ratio', 4.0))
+            token_mel_ratio_dbg = float(getattr(self.cos2_flow, 'token_mel_ratio', 4.0))
         except Exception:
-            tmr_dbg = 4.0
+            token_mel_ratio_dbg = 4.0
         
         try:
             sum_lens = int(sum(chunk_lengths)) if chunk_lengths and len(chunk_lengths) > 0 else 0
@@ -1855,7 +1919,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         except Exception:
             sum_lens, min_chunk_len, max_chunk_len, avg_chunk_len = 0, 0, 0, 0
         
-        expected_len = int(round(sample_token_len * tmr_dbg))
+        expected_len = int(round(sample_token_len * token_mel_ratio_dbg))
         
         try:
             logging.info(
@@ -1890,6 +1954,481 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         hidden = torch.cat(H_cat, dim=0) if len(H_cat) > 1 else H_cat[0]
         hidden_mask = torch.cat(M_cat, dim=0) if len(M_cat) > 1 else M_cat[0]
         return hidden, hidden_mask
+    
+    def _upsample_tokens(self, token_win, prompt_token_hist, upsample_factor):
+        """Upsample tokens by repeating interleave.
+        
+        Args:
+            token_win (torch.Tensor): Current window tokens [B, T_tok]
+            prompt_token_hist (torch.Tensor): Historical prompt tokens [B, Tp] or None
+            upsample_factor (int): Upsampling factor
+            
+        Returns:
+            tuple: (token_upsampled, prompt_token_upsampled, real_len_upsampled, prompt_token_len_upsampled)
+        """
+        if upsample_factor > 1:
+            token_upsampled = token_win.repeat_interleave(upsample_factor, dim=1)
+            prompt_token_upsampled = (
+                prompt_token_hist.repeat_interleave(upsample_factor, dim=1)
+                if (prompt_token_hist is not None and prompt_token_hist.numel() > 0)
+                else prompt_token_hist
+            )
+            real_len_upsampled = token_win.shape[1] * upsample_factor
+            prompt_token_len_upsampled = (
+                (prompt_token_hist.shape[1] * upsample_factor)
+                if (prompt_token_hist is not None and prompt_token_hist.numel() > 0)
+                else 0
+            )
+        else:
+            token_upsampled = token_win
+            prompt_token_upsampled = prompt_token_hist
+            real_len_upsampled = token_win.shape[1]
+            prompt_token_len_upsampled = (
+                prompt_token_hist.shape[1]
+                if (prompt_token_hist is not None and prompt_token_hist.numel() > 0)
+                else 0
+            )
+        return token_upsampled, prompt_token_upsampled, real_len_upsampled, prompt_token_len_upsampled
+    
+    def _apply_fixed_window_padding(self, token_upsampled, block_size, upsample_factor):
+        """Apply fixed window padding to token sequence if enabled.
+        
+        Args:
+            token_upsampled (torch.Tensor): Upsampled tokens [B, T_upsampled]
+            block_size (int): Block size in original token units
+            upsample_factor (int): Upsampling factor
+            
+        Returns:
+            torch.Tensor: Padded token sequence [B, block_size * upsample_factor]
+        """
+        if not self._fixed_window_pad:
+            return token_upsampled
+        
+        block_size_upsampled = int(block_size * upsample_factor)
+        if token_upsampled.shape[1] < block_size_upsampled:
+            pad_len = block_size_upsampled - token_upsampled.shape[1]
+            pad_ids = token_upsampled[:, -1:].expand(-1, pad_len)
+            token_upsampled = torch.cat([token_upsampled, pad_ids], dim=1)
+        return token_upsampled
+    
+    def _initialize_streaming_cache(self, uuid, prompt_feat, device):
+        """Initialize streaming session cache and overlap buffers.
+        
+        Args:
+            uuid (str): Session UUID
+            prompt_feat (torch.Tensor): Prompt features [B, Tp_mel, 80]
+            device (torch.device): Target device
+            
+        Returns:
+            tuple: (prev_mel, cache_src, batch_size) where:
+                - prev_mel: Previous mel overlap buffer
+                - cache_src: HiFT source cache
+                - batch_size: Batch size
+        """
+        batch_size = 1  # Will be updated by caller
+        prev_mel = self._mel_overlap_dict[uuid]
+        hift_cache = self._hift_cache_dict[uuid]
+        
+        if hift_cache is not None:
+            cache_src = hift_cache['source']
+        else:
+            cache_src = torch.zeros(batch_size, 1, 0, device=device)
+        
+        # Reset mel frame counters
+        try:
+            init_total = int(prompt_feat.shape[1]) if (prompt_feat is not None and prompt_feat.numel() > 0) else 0
+        except Exception:
+            init_total = 0
+        self._mel_total_len_dict[uuid] = init_total
+        self._mel_model_total_dict[uuid] = 0
+        
+        return prev_mel, cache_src
+    
+    def _compute_mel_delta(self, sample_mel, uuid, step_i):
+        """Compute mel delta (new frames) from cumulative model output.
+        
+        Args:
+            sample_mel (torch.Tensor): Model output mel [B, 80, T_all]
+            uuid (str): Session UUID
+            step_i (int): Current step index (for logging)
+            
+        Returns:
+            torch.Tensor: New mel frames [B, 80, delta] or None if no new frames
+        """
+        T_all = int(sample_mel.shape[-1])
+        prev_session = int(self._mel_model_total_dict.get(uuid, 0))
+        
+        if T_all <= prev_session:
+            if (step_i % max(self._print_per_n_chunk, 1)) == 0:
+                logging.info(f"[cos2.stream] uuid={uuid} T_all={T_all} prev_session={prev_session} -> delta=0 (skip)")
+            return None
+        
+        start = prev_session
+        delta = T_all - prev_session
+        self._mel_model_total_dict[uuid] = T_all
+        emitted_prev = int(self._mel_total_len_dict.get(uuid, 0))
+        self._mel_total_len_dict[uuid] = emitted_prev + delta
+        
+        if (step_i % max(self._print_per_n_chunk, 1)) == 0:
+            logging.info(f"[cos2.stream] uuid={uuid} start={start} delta={delta} emitted_total(prev)={emitted_prev} emitted_total(now)={self._mel_total_len_dict[uuid]}")
+        
+        return sample_mel[:, :, start:T_all]
+    
+    def _apply_mel_overlap(self, new_mel, prev_mel, finalize, uuid):
+        """Apply mel overlap-and-add for smooth transitions.
+        
+        Args:
+            new_mel (torch.Tensor): New mel frames [B, 80, T_new]
+            prev_mel (torch.Tensor): Previous mel overlap buffer [B, 80, T_prev] or None
+            finalize (bool): Whether this is the final chunk
+            uuid (str): Session UUID for cache updates
+            
+        Returns:
+            tuple: (mel_for_vocoder, updated_prev_mel) where:
+                - mel_for_vocoder: Mel ready for vocoder [B, 80, T]
+                - updated_prev_mel: Updated overlap buffer for next iteration
+        """
+        if not finalize and self._mel_overlap_len > 0:
+            ol = int(self._mel_overlap_len)
+            prev_len = int(prev_mel.shape[-1]) if (prev_mel is not None and prev_mel.numel() > 0) else 0
+            new_len = int(new_mel.shape[-1])
+            overlap_effective = min(ol, prev_len, new_len)
+            
+            if overlap_effective > 0:
+                w = torch.tensor(self._mel_window, device=new_mel.device, dtype=new_mel.dtype)
+                w1 = w[:overlap_effective].view(1, 1, overlap_effective)
+                w2 = w[ol:ol+overlap_effective].view(1, 1, overlap_effective)
+                new_mel[:, :, :overlap_effective] = (
+                    new_mel[:, :, :overlap_effective] * w1 + prev_mel[:, :, -overlap_effective:] * w2
+                )
+            
+            # Keep last overlap_effective frames for next iteration
+            keep = min(ol, new_len)
+            updated_prev_mel = new_mel[:, :, -keep:]
+            self._mel_overlap_dict[uuid] = updated_prev_mel
+            return new_mel, updated_prev_mel
+        else:
+            return new_mel, prev_mel
+    
+    def _finalize_streaming_session(self, uuid, embedding, gt_mel_len):
+        """Clean up streaming session cache and log final statistics.
+        
+        Args:
+            uuid (str): Session UUID
+            embedding (torch.Tensor): Speaker embedding for logging
+            gt_mel_len (torch.Tensor or None): Ground truth mel length for comparison
+        """
+        total = int(self._mel_total_len_dict.get(uuid, 0))
+        
+        # Build GT mel info if provided
+        gt_info = ""
+        try:
+            if gt_mel_len is not None:
+                if isinstance(gt_mel_len, torch.Tensor):
+                    if gt_mel_len.numel() == 1:
+                        _v_list = [int(gt_mel_len.view(-1)[0].item())]
+                    else:
+                        _v_list = [int(x) for x in gt_mel_len.view(-1).tolist()]
+                else:
+                    _v_list = [int(gt_mel_len)]
+                gt_sec_list = [round(v * 256.0 / float(self.OUTPUT_SAMPLE_RATE), 3) for v in _v_list]
+                _v = _v_list[0] if len(_v_list) == 1 else _v_list
+                _s = gt_sec_list[0] if len(gt_sec_list) == 1 else gt_sec_list
+                gt_info = f" gt_mel_len={_v} gt_sec={_s}"
+        except Exception:
+            gt_info = " gt_mel_len=NA"
+        
+        # Emitted seconds at 24k/hop480 (=50 fps)
+        emitted_sec = round(total * (self._mel_hop / float(self._cos2_sr)), 3)
+        
+        # Log speaker embedding stats
+        try:
+            e = embedding.detach().float() if isinstance(embedding, torch.Tensor) else None
+            if e is not None:
+                l2 = torch.norm(e, dim=1).mean().item() if e.ndim == 2 and e.size(0) > 0 else float(torch.norm(e).item())
+                head = e[0, :8].tolist() if e.ndim == 2 and e.size(0) > 0 else []
+                logging.info(f"[cos2.stream] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk shape={list(e.shape)} mean={e.mean().item():.5f} std={e.std().item():.5f} l2_mean={l2:.5f} head8={head}")
+            else:
+                logging.info(f"[cos2.stream] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk=NA")
+        except Exception:
+            logging.info(f"[cos2.stream] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk=ERR")
+        
+        # Clear caches
+        self._mel_overlap_dict.pop(uuid, None)
+        self._hift_cache_dict.pop(uuid, None)
+        self._mel_total_len_dict.pop(uuid, None)
+    
+    def _resample_to_output(self, wav_24k):
+        """Resample waveform from CosyVoice2 sample rate to output sample rate.
+        
+        Args:
+            wav_24k (torch.Tensor): Waveform at CosyVoice2 sample rate [B, T]
+            
+        Returns:
+            torch.Tensor: Waveform at output sample rate (22050 Hz) [B, T']
+        """
+        out_sr = self.OUTPUT_SAMPLE_RATE
+        if self._cos2_sr != out_sr:
+            return nemo_resample(wav_24k, self._cos2_sr, out_sr)
+        else:
+            return wav_24k
+    
+    def _build_streaming_text_context(self, text_tokens, text_end_idx, token_hist, end, real_len, original_input_embedding, device):
+        """Build text context for streaming inference (cross-attention or fallback prefix).
+        
+        Args:
+            text_tokens (torch.Tensor): Text tokens [B, T_text]
+            text_end_idx (int): End index for visible text tokens
+            token_hist (torch.Tensor): Token history [B, Lhist]
+            end (int): Current end position in token sequence
+            real_len (int): Real length of current window
+            original_input_embedding (nn.Module): Original input embedding (before monkey-patch)
+            device (torch.device): Target device
+            
+        Returns:
+            torch.Tensor: Text context [B, context_len, D]
+        """
+        batch_size = text_tokens.shape[0]
+        context_len = int(getattr(self.cos2_flow.encoder.pre_lookahead_layer, 'pre_lookahead_len', 4))
+        
+        if self._use_cross_text_attn:
+            # Cross-attention path: KV from text, Q from speech history
+            kv = self.text_context_emb(torch.clamp(text_tokens[:, :text_end_idx], min=0, max=self._text_vocab_size - 1))  # [B, Lt, D]
+            mask_kv = torch.ones(kv.shape[0], 1, kv.shape[1], dtype=torch.bool, device=kv.device)
+            
+            # Build Q from speech history with self-attention
+            input_emb_fn = original_input_embedding if original_input_embedding is not None else self.cos2_flow.input_embedding
+            token_hist_emb = input_emb_fn(token_hist)  # [B, Lhist, D]
+            Lhist = token_hist_emb.shape[1]
+            tril = torch.tril(torch.ones((Lhist, Lhist), dtype=torch.bool, device=token_hist_emb.device))
+            mask_speech_hist = tril.unsqueeze(0).expand(token_hist_emb.shape[0], -1, -1)
+            
+            # Speech self-attention + FFN
+            speech_hist_attn, _ = self.speech_sa(query=token_hist_emb, key=token_hist_emb, value=token_hist_emb, mask=mask_speech_hist)
+            speech_hist = self.speech_ln(speech_hist_attn)
+            speech_hist = speech_hist + self.speech_ffn(speech_hist)
+            
+            # Extract current chunk query
+            start_q = max(0, end - real_len)
+            speech_query = speech_hist[:, start_q:end, :]  # [B, Lq, D]
+            
+            # Text self-attention + FFN (causal)
+            Lt = kv.shape[1]
+            tril = torch.tril(torch.ones((Lt, Lt), dtype=torch.bool, device=kv.device))
+            mask_kv_causal = tril.unsqueeze(0).expand(kv.shape[0], -1, -1)
+            kv_attn, _ = self.text_sa(query=kv, key=kv, value=kv, mask=mask_kv_causal)
+            kv_ref = self.text_ln(kv_attn)
+            kv_ref = kv_ref + self.text_ffn(kv_ref)
+            
+            # Cross-attention: speech Q x text KV
+            attn_out, _ = self.cross_text_attn(query=speech_query, key=kv_ref, value=kv_ref, mask=mask_kv)  # [B, Lq, D]
+            
+            # Aggregate to context_len via learned queries
+            q_ctx = self.ctx_queries.to(attn_out.device).unsqueeze(0).expand(attn_out.shape[0], -1, -1)  # [B, context_len, D]
+            key_mask = torch.ones(attn_out.shape[0], 1, attn_out.shape[1], dtype=torch.bool, device=attn_out.device)
+            ctx_raw, _ = self.q2ctx_attn(query=q_ctx, key=attn_out, value=attn_out, mask=key_mask)  # [B, context_len, D]
+            text_ctx_processed = self.cross_ln(ctx_raw)
+            text_ctx = text_ctx_processed + self.cross_ffn(text_ctx_processed)
+        else:
+            # Fallback: simple right-aligned prefix window
+            emb = self.text_context_emb(torch.clamp(text_tokens[:, :text_end_idx], min=0, max=self._text_vocab_size - 1))
+            if emb.shape[1] < context_len:
+                pad = torch.zeros(batch_size, context_len - emb.shape[1], emb.shape[2], device=emb.device, dtype=emb.dtype)
+                text_ctx = torch.cat([emb, pad], dim=1)
+            else:
+                text_ctx = emb[:, -context_len:]
+        
+        return text_ctx
+    
+    def _process_batch_split(self, token, uuid, args_dict, method_name):
+        """Process batch>1 by splitting into individual samples and recursing.
+        
+        Args:
+            token (torch.Tensor): Token batch [B, T_tok]
+            uuid (str): Base session UUID
+            args_dict (dict): Dictionary of all method arguments
+            method_name (str): Name of the calling method ('stream_inference' or 'stream_inference_with_text')
+            
+        Returns:
+            torch.Tensor: Concatenated waveform [B, T_wav]
+        """
+        batch_size = token.shape[0]
+        wav_list = []
+        max_len = 0
+        
+        for batch_idx in range(batch_size):
+            sample_uid = f"{uuid}#{batch_idx}"
+            sample_token = token[batch_idx : batch_idx + 1]
+            
+            # Extract sample-specific arguments
+            sample_args = {'token': sample_token, 'uuid': sample_uid}
+            
+            # Helper to extract batch element or use shared value
+            def _extract_batch_element(key, value):
+                if value is None:
+                    return None
+                if isinstance(value, torch.Tensor) and hasattr(value, 'size') and value.size(0) == batch_size:
+                    return value[batch_idx : batch_idx + 1]
+                else:
+                    return value
+            
+            # Extract all other arguments
+            for key in ['text_tokens', 'prompt_token', 'prompt_feat', 'embedding', 'gt_mel_len']:
+                if key in args_dict:
+                    sample_args[key] = _extract_batch_element(key, args_dict[key])
+            
+            # Recursive call to the same method
+            if method_name == 'stream_inference':
+                sample_wav = self.stream_inference(**sample_args)
+            elif method_name == 'stream_inference_with_text':
+                sample_wav = self.stream_inference_with_text(**sample_args)
+            else:
+                raise ValueError(f"Unknown method: {method_name}")
+            
+            wav_list.append(sample_wav)
+            max_len = max(max_len, sample_wav.shape[1])
+        
+        # Right-pad and stack
+        padded = []
+        for w in wav_list:
+            if w.shape[1] < max_len:
+                pad = torch.zeros(w.shape[0], max_len - w.shape[1], device=w.device, dtype=w.dtype)
+                w = torch.cat([w, pad], dim=1)
+            padded.append(w)
+        return torch.cat(padded, dim=0)
+    
+    def _extract_batch_sample(self, batch_idx, batch_size, token, prompt_token, prompt_feat, embedding, device):
+        """Extract a single sample from batch tensors.
+        
+        Args:
+            batch_idx (int): Index of the sample to extract
+            batch_size (int): Total batch size
+            token (torch.Tensor): Token batch [B, T_tok]
+            prompt_token (torch.Tensor): Prompt token batch [B, Tp] or None
+            prompt_feat (torch.Tensor): Prompt feature batch [B, Tp_mel, D] or None
+            embedding (torch.Tensor): Embedding batch [B, D] or None
+            device (torch.device): Target device
+            
+        Returns:
+            tuple: (sample_token, sample_prompt_token, sample_prompt_feat, sample_embedding)
+        """
+        sample_token = token[batch_idx : batch_idx + 1].to(device)
+        
+        # Extract prompt_token
+        if prompt_token is not None and prompt_token.numel() > 0:
+            if prompt_token.size(0) == batch_size:
+                sample_prompt_token = prompt_token[batch_idx : batch_idx + 1].to(device)
+            else:
+                sample_prompt_token = prompt_token.to(device)
+        else:
+            sample_prompt_token = torch.zeros(1, 0, dtype=torch.int64, device=device)
+        
+        # Extract prompt_feat
+        if prompt_feat is not None and prompt_feat.numel() > 0:
+            if prompt_feat.size(0) == batch_size:
+                sample_prompt_feat = prompt_feat[batch_idx : batch_idx + 1].to(device)
+            else:
+                sample_prompt_feat = prompt_feat.to(device)
+        else:
+            sample_prompt_feat = torch.zeros(1, 0, self.MEL_DIM, device=device)
+        
+        # Extract embedding
+        if embedding is not None:
+            if embedding.size(0) == batch_size:
+                sample_embedding = embedding[batch_idx : batch_idx + 1].to(device)
+            else:
+                sample_embedding = embedding.to(device)
+        else:
+            sample_embedding = torch.zeros(1, self.SPEAKER_EMBEDDING_DIM, device=device)
+        
+        return sample_token, sample_prompt_token, sample_prompt_feat, sample_embedding
+    
+    def _fix_zero_embedding(self, embedding):
+        """Fix zero embedding to avoid NaN in F.normalize.
+        
+        Args:
+            embedding (torch.Tensor): Speaker embedding [B, D]
+            
+        Returns:
+            torch.Tensor: Fixed embedding (cloned if modified)
+        """
+        if torch.all(embedding == 0):
+            embedding = embedding.clone()
+            embedding[:, 0] = 1e-6
+        return embedding
+    
+    def _run_flow_inference_with_sa(self, token, prompt_token, prompt_feat, embedding, device, 
+                                    streaming=False, finalize=True, text_context=None):
+        """Run CosyVoice2 flow inference with optional token embedding self-attention.
+        
+        NOTE: This method is designed for SINGLE-SHOT inference (offline/batch).
+            For STREAMING inference with multiple chunks, manage monkey-patch 
+            lifecycle manually outside the loop to avoid N× overhead.
+        
+        Used by:
+            - token2wav(): Batch offline inference
+            - offline_inference(): Simplified offline inference
+        
+        NOT used by streaming methods due to performance considerations.
+        
+        Args:
+            token (torch.Tensor): Token sequence [B, T_tok]
+            prompt_token (torch.Tensor): Prompt tokens [B, Tp]
+            prompt_feat (torch.Tensor): Prompt features [B, Tp_mel, D]
+            embedding (torch.Tensor): Speaker embedding [B, D]
+            device (torch.device): Target device
+            streaming (bool): Streaming mode flag
+            finalize (bool): Finalize flag for streaming
+            text_context (torch.Tensor or None): Text context for encoder [B, context_len, D]
+            
+        Returns:
+            torch.Tensor: Generated mel spectrogram [B, 80, T_mel]
+        """
+        # Compute lengths
+        token_len = token.shape[1]
+        prompt_token_len = prompt_token.shape[1] if (prompt_token is not None and prompt_token.numel() > 0) else 0
+        prompt_feat_len = prompt_feat.shape[1] if (prompt_feat is not None and prompt_feat.numel() > 0) else 0
+        
+        # Apply monkey-patch for token embedding self-attention
+        original_input_embedding, wrapped_embedding_module = self._apply_input_embedding_sa_monkey_patch()
+        
+        try:
+            # Update token lengths in wrapped module
+            if wrapped_embedding_module is not None:
+                wrapped_embedding_module.update_token_lengths(
+                    token_len=token_len,
+                    prompt_token_len=prompt_token_len
+                )
+            
+            # Run flow inference
+            inference_kwargs = {
+                'token': token,
+                'token_len': torch.tensor([token_len], dtype=torch.int32, device=device),
+                'prompt_token': prompt_token,
+                'prompt_token_len': torch.tensor([prompt_token_len], dtype=torch.int32, device=device),
+                'prompt_feat': prompt_feat,
+                'prompt_feat_len': torch.tensor([prompt_feat_len], dtype=torch.int32, device=device),
+                'embedding': embedding,
+                'streaming': streaming,
+                'finalize': finalize,
+            }
+            
+            # Add text context if provided
+            if text_context is not None:
+                inference_kwargs['use_text_context'] = True
+                inference_kwargs['text_context'] = text_context
+            
+            sample_mel, _ = self.cos2_flow.inference(**inference_kwargs)
+            return sample_mel
+        
+        finally:
+            # Restore original input_embedding
+            if original_input_embedding is not None:
+                self.cos2_flow.input_embedding = original_input_embedding
+                if wrapped_embedding_module is not None:
+                    wrapped_embedding_module.adapter_instance = None
+                    wrapped_embedding_module.original_embedding = None
+                    del wrapped_embedding_module
 
     def flow(self, batch: Dict, device: torch.device) -> Dict[str, Optional[torch.Tensor]]:
         """Compute CosyVoice2 Causal Flow (CFM) training loss with explicit time alignment.
@@ -2091,110 +2630,73 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             tts_speech_22k: [B, T_wav] waveform at 22050 Hz for compatibility
             tts_mel: [B, 80, T_mel] generated mel
         """
-        # Infer device from inputs to avoid cross-device ops under DDP
         device = token.device
-
-        # Ensure cos2_flow on correct device for inference
+        batch_size = token.shape[0]
+        
+        # Ensure modules on correct device
         self._ensure_device(device)
-
-        # Lazy init HiFT on first use (move to correct device if needed)
         self._lazy_init_hift()
         hift_dev = next(self._hift.parameters()).device
         if hift_dev != device:
             self._hift.to(device)
-
-        batch_size = token.shape[0]
-
-        # CosyVoice2 flow.inference 目前断言 batch=1，这里逐样本推理再拼回 batch。
+        
+        # Process each sample in batch (flow.inference requires batch=1)
         tts_mels = []
-        vocab_max = None  # WhisperVQ 16384; keep None unless you need clamp
-        # determine pre-upsample factor to align token->encoder time
         upsample_factor = self._compute_upsample_factor()
-
+        
         for batch_idx in range(batch_size):
-            sample_token = torch.clamp(token[batch_idx : batch_idx + 1].to(device), min=0)
-            sample_prompt_token = prompt_token[batch_idx : batch_idx + 1].to(device) if (prompt_token is not None and prompt_token.numel() > 0 and prompt_token.size(0) == batch_size) else (prompt_token.to(device) if (prompt_token is not None and prompt_token.numel() > 0) else torch.zeros(1, 0, dtype=torch.int64, device=device))
-            sample_prompt_feat = prompt_feat[batch_idx : batch_idx + 1].to(device) if (prompt_feat is not None and prompt_feat.numel() > 0 and prompt_feat.size(0) == batch_size) else (prompt_feat.to(device) if (prompt_feat is not None and prompt_feat.numel() > 0) else torch.zeros(1, 0, self.MEL_DIM, device=device))
-            sample_embedding = (embedding[batch_idx : batch_idx + 1].to(device) if (embedding is not None and embedding.size(0) == batch_size) else (embedding.to(device) if embedding is not None else torch.zeros(1, self.SPEAKER_EMBEDDING_DIM, device=device)))
-
-            if vocab_max is not None and vocab_max >= 0:
-                sample_token = torch.clamp(sample_token, min=0, max=vocab_max)
-                if sample_prompt_token.numel() > 0:
-                    sample_prompt_token = torch.clamp(sample_prompt_token, min=0, max=vocab_max)
-
-            # Avoid NaNs from F.normalize on zero vector inside CosyVoice2 flow
-            if torch.all(sample_embedding == 0):
-                sample_embedding = sample_embedding.clone()
-                sample_embedding[:, 0] = 1e-6
-
-            # Pre-upsample tokens so that encoder x2 matches token_mel_ratio (~4 -> x2)
-            if upsample_factor > 1:
-                token_upsampled = sample_token.repeat_interleave(upsample_factor, dim=1)
-                prompt_token_upsampled = sample_prompt_token.repeat_interleave(upsample_factor, dim=1) if (sample_prompt_token is not None and sample_prompt_token.numel() > 0) else sample_prompt_token
-                token_len_upsampled = token_upsampled.shape[1]
-                prompt_token_len_upsampled = prompt_token_upsampled.shape[1] if (prompt_token_upsampled is not None and prompt_token_upsampled.numel() > 0) else 0
-            else:
-                token_upsampled = sample_token
-                prompt_token_upsampled = sample_prompt_token
-                token_len_upsampled = token_upsampled.shape[1]
-                prompt_token_len_upsampled = prompt_token_upsampled.shape[1] if (prompt_token_upsampled is not None and prompt_token_upsampled.numel() > 0) else 0
-
-            # Apply token embedding self-attention if enabled (via temporary monkey-patch)
-            original_input_embedding, wrapped_embedding_module = self._apply_input_embedding_sa_monkey_patch()
-
-            try:
-                # Update token lengths in wrapped module before inference
-                if wrapped_embedding_module is not None:
-                    wrapped_embedding_module.update_token_lengths(
-                        token_len=token_len_upsampled,
-                        prompt_token_len=prompt_token_len_upsampled
-                    )
-                
-                sample_mel, _ = self.cos2_flow.inference(
-                    token=token_upsampled,
-                    token_len=torch.tensor([token_len_upsampled], dtype=torch.int32, device=device),
-                    prompt_token=prompt_token_upsampled,
-                    prompt_token_len=torch.tensor([prompt_token_len_upsampled], dtype=torch.int32, device=device),
-                    prompt_feat=sample_prompt_feat,
-                    prompt_feat_len=torch.tensor([sample_prompt_feat.shape[1]], dtype=torch.int32, device=device),
-                    embedding=sample_embedding,
-                    streaming=False,
-                    finalize=True,
-                )
-            finally:
-                # Restore original input_embedding if it was monkey-patched
-                if original_input_embedding is not None:
-                    self.cos2_flow.input_embedding = original_input_embedding
-                    # Explicitly clean up wrapped module to break circular reference
-                    if wrapped_embedding_module is not None:
-                        wrapped_embedding_module.adapter_instance = None
-                        wrapped_embedding_module.original_embedding = None
-                        del wrapped_embedding_module
+            # Extract sample from batch
+            sample_token, sample_prompt_token, sample_prompt_feat, sample_embedding = self._extract_batch_sample(
+                batch_idx, batch_size, token, prompt_token, prompt_feat, embedding, device
+            )
+            
+            # Clamp token IDs to valid range
+            sample_token = torch.clamp(sample_token, min=0)
+            
+            # Fix zero embedding to avoid NaN in normalization
+            sample_embedding = self._fix_zero_embedding(sample_embedding)
+            
+            # Upsample tokens for alignment
+            token_upsampled, prompt_token_upsampled, _, _ = self._upsample_tokens(
+                sample_token, sample_prompt_token, upsample_factor
+            )
+            
+            # Run flow inference with self-attention wrapper
+            sample_mel = self._run_flow_inference_with_sa(
+                token_upsampled, prompt_token_upsampled, sample_prompt_feat, 
+                sample_embedding, device, streaming=False, finalize=True
+            )
+            
             tts_mels.append(sample_mel)
-        # [B, 80, T]
+        
+        # Concatenate batch results
         tts_mel = torch.cat(tts_mels, dim=0)
-
-        # Optional debug prints during validation only
+        
+        # Debug logging
         if self._val_debug:
             with torch.no_grad():
-                logging.info(f"[cos2.val] device={device} B={batch_size} token_min={token.min().item()} token_max={token.max().item()} ")
-                logging.info(f"[cos2.val] mel shape={tts_mel.shape} mel mean/std={tts_mel.mean().item():.4f}/{tts_mel.std().item():.4f}")
-
-        # HiFT vocoder: mel->wav (CosyVoice2 uses 24kHz by default)
+                logging.info(
+                    f"[cos2.val] device={device} B={batch_size} "
+                    f"token_min={token.min().item()} token_max={token.max().item()}"
+                )
+                logging.info(
+                    f"[cos2.val] mel shape={tts_mel.shape} "
+                    f"mel mean/std={tts_mel.mean().item():.4f}/{tts_mel.std().item():.4f}"
+                )
+        
+        # HiFT vocoder and resampling
         tts_speech_24k, _ = self._hift.inference(speech_feat=tts_mel)
-        # Keep downstream unchanged: resample 24k -> 22.05k to match existing code paths
-        out_sr = self.OUTPUT_SAMPLE_RATE
-        if self._cos2_sr != out_sr:
-            tts_speech = nemo_resample(tts_speech_24k, self._cos2_sr, out_sr)
-        else:
-            tts_speech = tts_speech_24k
-
+        tts_speech = self._resample_to_output(tts_speech_24k)
+        
         if self._val_debug:
             try:
-                logging.info(f"[cos2.val] wav22050 shape={tts_speech.shape} mean/std={tts_speech.mean().item():.4f}/{tts_speech.std().item():.4f}")
+                logging.info(
+                    f"[cos2.val] wav22050 shape={tts_speech.shape} "
+                    f"mean/std={tts_speech.mean().item():.4f}/{tts_speech.std().item():.4f}"
+                )
             except Exception:
                 pass
-
+        
         return tts_speech, tts_mel
 
     @torch.inference_mode()
@@ -2215,18 +2717,25 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             prompt_token: [B, Tp]
             prompt_feat: [B, Tp_mel, 80]
             embedding: [B, 192]
+            gt_mel_len: [B] or scalar, ground truth mel length for logging
         Returns:
             wav22050: [B, T_wav] at 22050 Hz
         """
         device = token.device
-        # resolve block_size/token_fps robustly
+        batch_size = token.shape[0]
+        
+        # Batch split: process each sample independently if batch > 1
+        if batch_size > 1:
+            args_dict = {
+                'prompt_token': prompt_token,
+                'prompt_feat': prompt_feat,
+                'embedding': embedding,
+                'gt_mel_len': gt_mel_len,
+            }
+            return self._process_batch_split(token, uuid, args_dict, 'stream_inference')
+        
+        # Single-sample processing: prepare device and modules
         block_size = self._determine_chunk_block_size()
-        try:
-            token_fps = float(getattr(self.cos2_flow, 'input_frame_rate', 25.0))
-        except Exception:
-            token_fps = 25.0
-
-        # Ensure modules on correct device
         self._ensure_device(device)
         self._lazy_init_hift()
         try:
@@ -2235,97 +2744,60 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             hift_dev = device
         if hift_dev != device:
             self._hift.to(device)
-
-        batch_size = token.shape[0]
-        # If batch>1, process each sample independently (flow streaming is batch-1 safe)
-        if batch_size > 1:
-            wav_list = []
-            max_len = 0
-            for batch_idx in range(batch_size):
-                sample_uid = f"{uuid}#{batch_idx}"
-                sample_token = token[batch_idx : batch_idx + 1]
-                sample_prompt_token = prompt_token[batch_idx : batch_idx + 1] if prompt_token is not None and hasattr(prompt_token, 'size') and prompt_token.size(0) == batch_size else prompt_token
-                sample_prompt_feat = prompt_feat[batch_idx : batch_idx + 1] if prompt_feat is not None and hasattr(prompt_feat, 'size') and prompt_feat.size(0) == batch_size else prompt_feat
-                sample_embedding = embedding[batch_idx : batch_idx + 1] if embedding is not None and hasattr(embedding, 'size') and embedding.size(0) == batch_size else embedding
-                sample_gt = gt_mel_len[batch_idx : batch_idx + 1] if (gt_mel_len is not None and isinstance(gt_mel_len, torch.Tensor) and gt_mel_len.size(0) == batch_size) else gt_mel_len
-                sample_wav = self.stream_inference(sample_token, sample_uid, sample_prompt_token, sample_prompt_feat, sample_embedding, sample_gt)
-                wav_list.append(sample_wav)
-                max_len = max(max_len, sample_wav.shape[1])
-            # right-pad to same length and stack
-            padded = []
-            for w in wav_list:
-                if w.shape[1] < max_len:
-                    pad = torch.zeros(w.shape[0], max_len - w.shape[1], device=w.device, dtype=w.dtype)
-                    w = torch.cat([w, pad], dim=1)
-                padded.append(w)
-            return torch.cat(padded, dim=0)
-
+        
+        # Initialize streaming cache and overlap buffers
+        prev_mel, cache_src = self._initialize_streaming_cache(uuid, prompt_feat, device)
+        cache_src = cache_src if cache_src.numel() > 0 else torch.zeros(batch_size, 1, 0, device=device)
+        
         wav_chunks = []
-        prev_mel = self._mel_overlap_dict[uuid]
-        hift_cache = self._hift_cache_dict[uuid]
-        if hift_cache is not None:
-            cache_src = hift_cache['source']
-        else:
-            cache_src = torch.zeros(batch_size, 1, 0, device=device)
-        # reset total mel frame counter for this streaming session (start from prompt_feat length if provided)
-        try:
-            init_total = int(prompt_feat.shape[1]) if (prompt_feat is not None and prompt_feat.numel() > 0) else 0
-        except Exception:
-            init_total = 0
-        self._mel_total_len_dict[uuid] = init_total
-        self._mel_model_total_dict[uuid] = 0
-
-        # Apply token embedding self-attention if enabled (via temporary monkey-patch)
         original_input_embedding, wrapped_embedding_module = self._apply_input_embedding_sa_monkey_patch()
 
         try:
-            # iterate with sliding window: step by stream_stride tokens; window length = block_size
+            # Sliding window iteration
             stride = int(self._stream_stride) if getattr(self, "_stream_stride", 0) and int(self._stream_stride) > 0 else block_size
             assert stride <= block_size, f"stride ({stride}) must be <= block_size ({block_size})"
+            
             T = token.size(1)
             step_i = 0
             for end in range(min(stride, T), T + 1, stride):
                 start = max(0, end - block_size)
-                # current window tokens [start:end]; no left-pad is passed to flow to keep token_len consistent
                 token_win = token[:, start:end]
                 real_len = token_win.shape[1]
+                
+                # Build prompt history from past tokens and previous mel
                 prompt_token_hist = token[:, :start] if start > 0 else prompt_token
-                prompt_feat_hist = torch.cat([prompt_feat, prev_mel.transpose(1, 2)], dim=1) if (prev_mel is not None and prev_mel.numel() > 0) else prompt_feat
-
-                # pre-upsample so that encoder x2 matches token_mel_ratio (~4 -> upsample_factor~2)
+                prompt_feat_hist = (
+                    torch.cat([prompt_feat, prev_mel.transpose(1, 2)], dim=1)
+                    if (prev_mel is not None and prev_mel.numel() > 0)
+                    else prompt_feat
+                )
+                
+                # Upsample tokens
                 upsample_factor = self._compute_upsample_factor()
-                if upsample_factor > 1:
-                    token_upsampled = token_win.repeat_interleave(upsample_factor, dim=1)
-                    prompt_token_upsampled = prompt_token_hist.repeat_interleave(upsample_factor, dim=1) if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else prompt_token_hist
-                    real_len_upsampled = real_len * upsample_factor
-                    prompt_token_len_upsampled = (prompt_token_hist.shape[1] * upsample_factor) if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else 0
-                else:
-                    token_upsampled = token_win
-                    prompt_token_upsampled = prompt_token_hist
-                    real_len_upsampled = real_len
-                    prompt_token_len_upsampled = prompt_token_hist.shape[1] if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else 0
-
-                # optional fixed window padding (right-pad ids); token_len stays real_len_upsampled
-                if self._fixed_window_pad:
-                    block_size_upsampled = int(block_size * upsample_factor)
-                    if token_upsampled.shape[1] < block_size_upsampled:
-                        pad_len = block_size_upsampled - token_upsampled.shape[1]
-                        pad_ids = token_upsampled[:, -1:].expand(-1, pad_len)
-                        token_upsampled = torch.cat([token_upsampled, pad_ids], dim=1)
-
+                token_upsampled, prompt_token_upsampled, real_len_upsampled, prompt_token_len_upsampled = self._upsample_tokens(
+                    token_win, prompt_token_hist, upsample_factor
+                )
+                
+                # Apply fixed window padding if needed
+                token_upsampled = self._apply_fixed_window_padding(token_upsampled, block_size, upsample_factor)
+                
                 finalize = end >= T
-                # sparse prints per N chunks
+                
+                # Periodic logging
                 if (step_i % max(self._print_per_n_chunk, 1)) == 0:
-                    logging.info(f"[cos2.stream] step={step_i} win=({start},{end}) stride={stride} token_real={real_len} up={upsample_factor} token_upsampled={token_upsampled.shape[1]} finalize={finalize}")
-
-                # Update token lengths in wrapped module before inference
+                    logging.info(
+                        f"[cos2.stream] step={step_i} win=({start},{end}) stride={stride} "
+                        f"token_real={real_len} up={upsample_factor} token_upsampled={token_upsampled.shape[1]} finalize={finalize}"
+                    )
+                
+                # Update token lengths for self-attention wrapper
                 if wrapped_embedding_module is not None:
                     wrapped_embedding_module.update_token_lengths(
                         token_len=real_len_upsampled,
                         prompt_token_len=prompt_token_len_upsampled
                     )
                 
-                # 1) generate mel for this window via CosyVoice2 flow (streaming=True)
+                # Generate mel via CosyVoice2 flow
                 sample_mel, _ = self.cos2_flow.inference(
                     token=token_upsampled,
                     token_len=torch.tensor([real_len_upsampled], dtype=torch.int32, device=device),
@@ -2337,123 +2809,55 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     streaming=True,
                     finalize=finalize,
                 )
+                
                 if (step_i % max(self._print_per_n_chunk, 1)) == 0:
                     logging.info(f"[cos2.stream] sample_mel_frames={sample_mel.shape[-1]}")
                 step_i += 1
-                # sample_mel: [B, 80, T_mel_new]
-
-                # Model returns per-step cumulative frames w.r.t. prompt_token (not prompt_feat).
-                # We must take the delta vs previous model cumulative to avoid duplication.
-                T_all = int(sample_mel.shape[-1])
-                prev_session = int(self._mel_model_total_dict.get(uuid, 0))
-                if T_all <= prev_session:
-                    if (step_i % max(self._print_per_n_chunk, 1)) == 0:
-                        logging.info(f"[cos2.stream] uuid={uuid} T_all={T_all} prev_session={prev_session} -> delta=0 (skip)")
+                
+                # Compute mel delta (new frames only)
+                new_mel = self._compute_mel_delta(sample_mel, uuid, step_i)
+                if new_mel is None:
                     continue
-                start = prev_session
-                delta = T_all - prev_session
-                self._mel_model_total_dict[uuid] = T_all
-                emitted_prev = int(self._mel_total_len_dict.get(uuid, 0))
-                self._mel_total_len_dict[uuid] = emitted_prev + delta
+                
+                # Apply mel overlap-and-add
+                mel_for_vocoder, prev_mel = self._apply_mel_overlap(new_mel, prev_mel, finalize, uuid)
+                
                 if (step_i % max(self._print_per_n_chunk, 1)) == 0:
-                    logging.info(f"[cos2.stream] uuid={uuid} start={start} delta={delta} emitted_total(prev)={emitted_prev} emitted_total(now)={self._mel_total_len_dict[uuid]}")
-                new_mel = sample_mel[:, :, start:T_all]
-
-                # overlap-and-add on new frames and keep tail overlap for next chunk
-                if not finalize and self._mel_overlap_len > 0:
-                    ol = int(self._mel_overlap_len)
-                    prev_len = int(prev_mel.shape[-1]) if (prev_mel is not None and prev_mel.numel() > 0) else 0
-                    new_len = int(new_mel.shape[-1])
-                    overlap_effective = min(ol, prev_len, new_len)
-                    if overlap_effective > 0:
-                        # use the first overlap_effective weights from the first half and the first overlap_effective from the second half
-                        w = torch.tensor(self._mel_window, device=new_mel.device, dtype=new_mel.dtype)
-                        w1 = w[:overlap_effective].view(1, 1, overlap_effective)
-                        w2 = w[ol:ol+overlap_effective].view(1, 1, overlap_effective)
-                        new_mel[:, :, :overlap_effective] = new_mel[:, :, :overlap_effective] * w1 + prev_mel[:, :, -overlap_effective:] * w2
-                    # keep last min(ol, new_len) frames for next iteration
-                    keep = min(ol, new_len)
-                    self._mel_overlap_dict[uuid] = new_mel[:, :, -keep:]
-                    prev_mel = self._mel_overlap_dict[uuid]
-                    mel_for_vocoder = new_mel
-                else:
-                    mel_for_vocoder = new_mel
-                if (step_i % max(self._print_per_n_chunk, 1)) == 0:
-                    logging.info(f"[cos2.stream] mel_for_vocoder_frames={mel_for_vocoder.shape[-1]} ol={self._mel_overlap_len} total_mel={self._mel_total_len_dict[uuid]}")
-
-                # clear caches on finalize
+                    logging.info(
+                        f"[cos2.stream] mel_for_vocoder_frames={mel_for_vocoder.shape[-1]} "
+                        f"ol={self._mel_overlap_len} total_mel={self._mel_total_len_dict[uuid]}"
+                    )
+                
+                # Finalize: clear caches and log stats
                 if finalize:
-                    total = int(self._mel_total_len_dict.get(uuid, 0))
-                    # Build GT mel info and seconds if provided (GT mel is 22050Hz/hop256)
-                    gt_info = ""
-                    try:
-                        if gt_mel_len is not None:
-                            if isinstance(gt_mel_len, torch.Tensor):
-                                if gt_mel_len.numel() == 1:
-                                    _v_list = [int(gt_mel_len.view(-1)[0].item())]
-                                else:
-                                    _v_list = [int(x) for x in gt_mel_len.view(-1).tolist()]
-                            else:
-                                _v_list = [int(gt_mel_len)]
-                            gt_sec_list = [round(v * 256.0 / float(self.OUTPUT_SAMPLE_RATE), 3) for v in _v_list]
-                            _v = _v_list[0] if len(_v_list) == 1 else _v_list
-                            _s = gt_sec_list[0] if len(gt_sec_list) == 1 else gt_sec_list
-                            gt_info = f" gt_mel_len={_v} gt_sec={_s}"
-                    except Exception:
-                        gt_info = " gt_mel_len=NA"
-                    # Emitted seconds at 24k/hop480 (=50 fps)
-                    emitted_sec = round(total * (self._mel_hop / float(self._cos2_sr)), 3)
-                    try:
-                        e = embedding.detach().float() if isinstance(embedding, torch.Tensor) else None
-                        if e is not None:
-                            l2 = torch.norm(e, dim=1).mean().item() if e.ndim == 2 and e.size(0) > 0 else float(torch.norm(e).item())
-                            head = e[0, :8].tolist() if e.ndim == 2 and e.size(0) > 0 else []
-                            logging.info(f"[cos2.stream] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk shape={list(e.shape)} mean={e.mean().item():.5f} std={e.std().item():.5f} l2_mean={l2:.5f} head8={head}")
-                        else:
-                            logging.info(f"[cos2.stream] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk=NA")
-                    except Exception:
-                        logging.info(f"[cos2.stream] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk=ERR")
-                    self._mel_overlap_dict.pop(uuid, None)
-                    self._hift_cache_dict.pop(uuid, None)
-                    self._mel_total_len_dict.pop(uuid, None)
-
-                # 3) HiFT vocoder with cache to avoid glitch
+                    self._finalize_streaming_session(uuid, embedding, gt_mel_len)
+                
+                # HiFT vocoder with cache
                 speech_24k, source = self._hift.inference(speech_feat=mel_for_vocoder, cache_source=cache_src)
-
-                # update source cache
+                
+                # Update cache for next iteration
                 if not finalize:
                     cache_src = source[:, :, -self._source_cache_len:]
-                    self._hift_cache_dict[uuid] = {
-                        'source': cache_src,
-                    }
-                    # Do not drop tail samples; HiFT cache ensures continuity without duplication.
+                    self._hift_cache_dict[uuid] = {'source': cache_src}
                 else:
-                    # clear cache
                     cache_src = torch.zeros(batch_size, 1, 0, device=device)
-
-                # Accumulate 24k chunks; resample once at the end to avoid boundary artifacts
+                
                 wav_chunks.append(speech_24k)
-
+        
         finally:
-            # Restore original input_embedding if it was monkey-patched
+            # Restore original input_embedding
             if original_input_embedding is not None:
                 self.cos2_flow.input_embedding = original_input_embedding
-                # Explicitly clean up wrapped module to break circular reference
                 if wrapped_embedding_module is not None:
                     wrapped_embedding_module.adapter_instance = None
                     wrapped_embedding_module.original_embedding = None
                     del wrapped_embedding_module
-
-        # Concatenate all 24k chunks and resample once at the end (baseline non-overlap)
+        
+        # Concatenate and resample to output rate
         if len(wav_chunks) == 0:
             return torch.zeros(batch_size, 0, device=device)
         wav_24k = torch.cat(wav_chunks, dim=-1)
-        out_sr = self.OUTPUT_SAMPLE_RATE
-        if self._cos2_sr != out_sr:
-            wav = nemo_resample(wav_24k, self._cos2_sr, out_sr)
-        else:
-            wav = wav_24k
-        return wav
+        return self._resample_to_output(wav_24k)
 
 
     @torch.inference_mode()
@@ -2476,21 +2880,30 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             prompt_token: [B, Tp]
             prompt_feat: [B, Tp_mel, 80]
             embedding: [B, 192]
+            gt_mel_len: [B] or scalar, ground truth mel length for logging
         Returns:
             wav22050: [B, T_wav]
         """
+        # Fallback to vanilla streaming if no text tokens
         if text_tokens is None or text_tokens.numel() == 0:
-            return self.stream_inference(token, uuid, prompt_token, prompt_feat, embedding)
+            return self.stream_inference(token, uuid, prompt_token, prompt_feat, embedding, gt_mel_len)
 
         device = token.device
-        # resolve block_size/token_fps robustly
+        batch_size = token.shape[0]
+        
+        # Batch split: process each sample independently if batch > 1
+        if batch_size > 1:
+            args_dict = {
+                'text_tokens': text_tokens,
+                'prompt_token': prompt_token,
+                'prompt_feat': prompt_feat,
+                'embedding': embedding,
+                'gt_mel_len': gt_mel_len,
+            }
+            return self._process_batch_split(token, uuid, args_dict, 'stream_inference_with_text')
+        
+        # Single-sample processing: prepare device and modules
         block_size = self._determine_chunk_block_size()
-        try:
-            token_fps = float(getattr(self.cos2_flow, 'input_frame_rate', 25.0))
-        except Exception:
-            token_fps = 25.0
-
-        # Ensure modules on correct device
         self._ensure_device(device)
         self._lazy_init_hift()
         try:
@@ -2499,183 +2912,72 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             hift_dev = device
         if hift_dev != device:
             self._hift.to(device)
-
-        batch_size = token.shape[0]
-        if batch_size > 1:
-            wav_list = []
-            max_len = 0
-            for batch_idx in range(batch_size):
-                sample_uid = f"{uuid}#{batch_idx}"
-                sample_token = token[batch_idx : batch_idx + 1]
-                sample_ttxt = text_tokens[batch_idx : batch_idx + 1] if text_tokens is not None and hasattr(text_tokens, 'size') and text_tokens.size(0) == batch_size else text_tokens
-                sample_prompt_token = prompt_token[batch_idx : batch_idx + 1] if prompt_token is not None and hasattr(prompt_token, 'size') and prompt_token.size(0) == batch_size else prompt_token
-                sample_prompt_feat = prompt_feat[batch_idx : batch_idx + 1] if prompt_feat is not None and hasattr(prompt_feat, 'size') and prompt_feat.size(0) == batch_size else prompt_feat
-                sample_embedding = embedding[batch_idx : batch_idx + 1] if embedding is not None and hasattr(embedding, 'size') and embedding.size(0) == batch_size else embedding
-                sample_gt = gt_mel_len[batch_idx : batch_idx + 1] if (gt_mel_len is not None and isinstance(gt_mel_len, torch.Tensor) and gt_mel_len.size(0) == batch_size) else gt_mel_len
-                sample_wav = self.stream_inference_with_text(sample_token, sample_uid, sample_ttxt, sample_prompt_token, sample_prompt_feat, sample_embedding, sample_gt)
-                wav_list.append(sample_wav)
-                max_len = max(max_len, sample_wav.shape[1])
-            # right-pad to same length and stack
-            padded = []
-            for w in wav_list:
-                if w.shape[1] < max_len:
-                    pad = torch.zeros(w.shape[0], max_len - w.shape[1], device=w.device, dtype=w.dtype)
-                    w = torch.cat([w, pad], dim=1)
-                padded.append(w)
-            return torch.cat(padded, dim=0)
-
+        
+        # Initialize streaming cache and overlap buffers
+        prev_mel, cache_src = self._initialize_streaming_cache(uuid, prompt_feat, device)
+        cache_src = cache_src if cache_src.numel() > 0 else torch.zeros(batch_size, 1, 0, device=device)
+        context_len = int(getattr(self.cos2_flow.encoder.pre_lookahead_layer, 'pre_lookahead_len', 4))
+        
         wav_chunks = []
-        prev_mel = self._mel_overlap_dict[uuid]
-        hift_cache = self._hift_cache_dict[uuid]
-        if hift_cache is not None:
-            cache_src = hift_cache['source']
-        else:
-            cache_src = torch.zeros(batch_size, 1, 0, device=device)
-        # reset total mel frame counter for this streaming session (start from prompt_feat length if provided)
-        try:
-            init_total = int(prompt_feat.shape[1]) if (prompt_feat is not None and prompt_feat.numel() > 0) else 0
-        except Exception:
-            init_total = 0
-        self._mel_total_len_dict[uuid] = init_total
-        self._mel_model_total_dict[uuid] = 0
-
-        # Apply token embedding self-attention if enabled (via temporary monkey-patch)
         original_input_embedding, wrapped_embedding_module = self._apply_input_embedding_sa_monkey_patch()
 
         try:
-            # iterate with sliding window + text context
+            # Sliding window iteration with text context
             stride = int(self._stream_stride) if getattr(self, "_stream_stride", 0) and int(self._stream_stride) > 0 else block_size
             assert stride <= block_size, f"stride ({stride}) must be <= block_size ({block_size})"
+            
             T = token.size(1)
             step_i = 0
             for end in range(min(stride, T), T + 1, stride):
                 start = max(0, end - block_size)
                 token_win = token[:, start:end]
                 real_len = token_win.shape[1]
-
+                
+                # Build prompt history
                 prompt_token_hist = token[:, :start] if start > 0 else prompt_token
-                prompt_feat_hist = torch.cat([prompt_feat, prev_mel.transpose(1, 2)], dim=1) if (prev_mel is not None and prev_mel.numel() > 0) else prompt_feat
-
-                # Cross-text attention (if enabled) else fallback to prefix window
-                # Align text visibility to current speech token progress: text_end_idx = min(T_text, end)
+                prompt_feat_hist = (
+                    torch.cat([prompt_feat, prev_mel.transpose(1, 2)], dim=1)
+                    if (prev_mel is not None and prev_mel.numel() > 0)
+                    else prompt_feat
+                )
+                
+                # Build text context (cross-attention or fallback prefix)
                 text_end_idx = min(int(text_tokens.shape[1]), int(end))
-                if self._use_cross_text_attn:
-                    # KV from text up to text_end_idx, with per-batch mask
-                    kv = self.text_context_emb(torch.clamp(text_tokens[:, :text_end_idx], min=0, max=self._text_vocab_size - 1))  # [B, Lt, D]
-                    mask_kv = torch.ones(kv.shape[0], 1, kv.shape[1], dtype=torch.bool, device=kv.device)
-                    # Q from speech histories: use all past + current chunk tokens as self-attn context, then slice current chunk as multi-query
-                    token_hist = token[:, :end]
-                    # Use original embedding (not monkey-patched) for cross-attention query building
-                    # since we apply self-attention explicitly below
-                    input_emb_fn = original_input_embedding if original_input_embedding is not None else self.cos2_flow.input_embedding
-                    token_hist_emb = input_emb_fn(token_hist)  # [B, Lhist, D]
-                    Lhist = token_hist_emb.shape[1]
-                    tril = torch.tril(torch.ones((Lhist, Lhist), dtype=torch.bool, device=token_hist_emb.device))
-                    mask_speech_hist = tril.unsqueeze(0).expand(token_hist_emb.shape[0], -1, -1)
-                    speech_hist_attn, _ = self.speech_sa(query=token_hist_emb, key=token_hist_emb, value=token_hist_emb, mask=mask_speech_hist)
-                    speech_hist = self.speech_ln(speech_hist_attn)
-                    speech_hist = speech_hist + self.speech_ffn(speech_hist)
-                    # extract current chunk subrange [end-real_len:end]
-                    start_q = max(0, end - real_len)
-                    speech_query = speech_hist[:, start_q:end, :]  # [B, Lq, D]
-                    # Text refinement (self-attn+FFN)
-                    # Causal self-attn on text tokens up to text_end_idx
-                    Lt = kv.shape[1]
-                    tril = torch.tril(torch.ones((Lt, Lt), dtype=torch.bool, device=kv.device))
-                    mask_kv_causal = tril.unsqueeze(0).expand(kv.shape[0], -1, -1)
-                    kv_attn, _ = self.text_sa(query=kv, key=kv, value=kv, mask=mask_kv_causal)
-                    kv_ref = self.text_ln(kv_attn)
-                    kv_ref = kv_ref + self.text_ffn(kv_ref)
-                    # Cross-attn with multi-query; then pool last valid step to single vector per batch
-                    attn_out, attn_w = self.cross_text_attn(query=speech_query, key=kv_ref, value=kv_ref, mask=mask_kv)  # [B, Lq, D]
-                    if getattr(self, '_debug_xattn', False) and ((step_i % max(self._print_per_n_chunk, 1)) == 0):
-                        try:
-                            # attn_w expected shape [B,H,Q,K] or [B,Q,K]
-                            if isinstance(attn_w, torch.Tensor):
-                                if attn_w.dim() == 4:
-                                    attn_weights_debug = attn_w.mean(dim=1)
-                                elif attn_w.dim() == 3:
-                                    attn_weights_debug = attn_w
-                                else:
-                                    attn_weights_debug = None
-                            else:
-                                attn_weights_debug = None
-                            Bq = int(speech_query.shape[1]); Kt = int(kv_ref.shape[1])
-                            if attn_weights_debug is not None and real_len > 0:
-                                vec = attn_weights_debug[0, real_len - 1, :Kt]
-                                k = int(min(3, Kt))
-                                vec = torch.softmax(vec, dim=-1)
-                                vals, idxs = torch.topk(vec, k)
-                                logging.info(f"[cos2.infer.xattn] step={step_i} Q_len={Bq} K_len={Kt} topk_idx={idxs.tolist()} topk_val={[round(float(v),4) for v in vals.tolist()]}")
-                            else:
-                                logging.info(f"[cos2.infer.xattn] step={step_i} Q_len={Bq} K_len={Kt} (no attn_w)")
-                        except Exception as e:
-                            logging.info(f"[cos2.infer.xattn] warn: {e}")
-                    # Aggregate full-Q features to context_len via learned queries (no temporal pooling)
-                    q_ctx = self.ctx_queries.to(attn_out.device).unsqueeze(0).expand(attn_out.shape[0], -1, -1)  # [B,context_len,D]
-                    key_mask = torch.ones(attn_out.shape[0], 1, attn_out.shape[1], dtype=torch.bool, device=attn_out.device)
-                    ctx_raw, _ = self.q2ctx_attn(query=q_ctx, key=attn_out, value=attn_out, mask=key_mask)  # [B,context_len,D]
-                    text_ctx_processed = self.cross_ln(ctx_raw)
-                    text_ctx_processed = text_ctx_processed + self.cross_ffn(text_ctx_processed)
-                    context_len = int(getattr(self.cos2_flow.encoder.pre_lookahead_layer, 'pre_lookahead_len', 4))
-                    text_ctx = text_ctx_processed  # already [B, context_len, D]
-                else:
-                    emb = self.text_context_emb(torch.clamp(text_tokens[:, :text_end_idx], min=0, max=self._text_vocab_size - 1))
-                    context_len = int(getattr(self.cos2_flow.encoder.pre_lookahead_layer, 'pre_lookahead_len', 4))
-                    if emb.shape[1] < context_len:
-                        pad = torch.zeros(batch_size, context_len - emb.shape[1], emb.shape[2], device=emb.device, dtype=emb.dtype)
-                        emb_ctx = torch.cat([emb, pad], dim=1)
-                    else:
-                        emb_ctx = emb[:, -context_len:]
-                    text_ctx = emb_ctx
-
-                # upsample
+                token_hist = token[:, :end]
+                text_ctx = self._build_streaming_text_context(
+                    text_tokens, text_end_idx, token_hist, end, real_len, original_input_embedding, device
+                )
+                
+                # Upsample tokens
                 upsample_factor = self._compute_upsample_factor()
-                if upsample_factor > 1:
-                    token_upsampled = token_win.repeat_interleave(upsample_factor, dim=1)
-                    prompt_token_upsampled = prompt_token_hist.repeat_interleave(upsample_factor, dim=1) if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else prompt_token_hist
-                    real_len_upsampled = real_len * upsample_factor
-                    prompt_token_len_upsampled = (prompt_token_hist.shape[1] * upsample_factor) if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else 0
-                else:
-                    token_upsampled = token_win
-                    prompt_token_upsampled = prompt_token_hist
-                    real_len_upsampled = real_len
-                    prompt_token_len_upsampled = prompt_token_hist.shape[1] if (prompt_token_hist is not None and prompt_token_hist.numel() > 0) else 0
-
-                # optional fixed window padding (right-pad ids) for text-conditioned streaming
-                if self._fixed_window_pad:
-                    block_size_upsampled = int(block_size * upsample_factor)
-                    if token_upsampled.shape[1] < block_size_upsampled:
-                        pad_len = block_size_upsampled - token_upsampled.shape[1]
-                        pad_ids = token_upsampled[:, -1:].expand(-1, pad_len)
-                        token_upsampled = torch.cat([token_upsampled, pad_ids], dim=1)
-
+                token_upsampled, prompt_token_upsampled, real_len_upsampled, prompt_token_len_upsampled = self._upsample_tokens(
+                    token_win, prompt_token_hist, upsample_factor
+                )
+                
+                # Apply fixed window padding if needed
+                token_upsampled = self._apply_fixed_window_padding(token_upsampled, block_size, upsample_factor)
+                
                 finalize = end >= T
+                
+                # Periodic logging
                 if (step_i % max(self._print_per_n_chunk, 1)) == 0:
                     ctx_src = 'xattn' if self._use_cross_text_attn else 'prefix'
-                    try:
-                        if self._fixed_window_pad:
-                            pad_tok = max(0, int(block_size - real_len))
-                            pad_upsampled = max(0, int(block_size * upsample_factor - real_len_upsampled))
-                        else:
-                            pad_tok = 0
-                            pad_upsampled = 0
-                    except Exception:
-                        pad_tok = 0
-                        pad_upsampled = 0
+                    pad_tok = max(0, int(block_size - real_len)) if self._fixed_window_pad else 0
+                    pad_upsampled = max(0, int(block_size * upsample_factor - real_len_upsampled)) if self._fixed_window_pad else 0
                     logging.info(
-                        f"[cos2.stream+text] step={step_i} win=({start},{end}) stride={stride} token_real={real_len} up={upsample_factor} token_upsampled={token_upsampled.shape[1]} "
-                        f"pad_tok={pad_tok} pad_upsampled={pad_upsampled} text_end_idx={text_end_idx} text=[0:{text_end_idx}) q_pool=multi_query:ctx_attn ctx={ctx_src} context_len={context_len} finalize={finalize}"
+                        f"[cos2.stream+text] step={step_i} win=({start},{end}) stride={stride} token_real={real_len} "
+                        f"up={upsample_factor} token_upsampled={token_upsampled.shape[1]} pad_tok={pad_tok} pad_upsampled={pad_upsampled} "
+                        f"text_end_idx={text_end_idx} text=[0:{text_end_idx}) ctx={ctx_src} context_len={context_len} finalize={finalize}"
                     )
-
-                # Update token lengths in wrapped module before inference
+                
+                # Update token lengths for self-attention wrapper
                 if wrapped_embedding_module is not None:
                     wrapped_embedding_module.update_token_lengths(
                         token_len=real_len_upsampled,
                         prompt_token_len=prompt_token_len_upsampled
                     )
-
-                # Run CosyVoice2 flow with text context replacing semantic lookahead
+                
+                # Generate mel via CosyVoice2 flow with text context
                 sample_mel, _ = self.cos2_flow.inference(
                     token=token_upsampled,
                     token_len=torch.tensor([real_len_upsampled], dtype=torch.int32, device=device),
@@ -2689,134 +2991,44 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     use_text_context=True,
                     text_context=text_ctx,
                 )
-                # step index for logging
                 step_i += 1
-
-                # Same as non-text streaming: inference() returns cumulative frames w.r.t. prompt_token.
-                # Compute delta vs previous model cumulative frames.
-                T_all = int(sample_mel.shape[-1])
-                prev_session = int(self._mel_model_total_dict.get(uuid, 0))
-                if T_all <= prev_session:
-                    # try:
-                    #     logging.info(f"[cos2.stream+text] uuid={uuid} T_all={T_all} prev_session={prev_session} -> delta=0 (skip)")
-                    # except Exception:
-                    #     pass
+                
+                # Compute mel delta (new frames only)
+                new_mel = self._compute_mel_delta(sample_mel, uuid, step_i)
+                if new_mel is None:
                     continue
-                start = prev_session
-                delta = T_all - prev_session
-                self._mel_model_total_dict[uuid] = T_all
-                emitted_prev = int(self._mel_total_len_dict.get(uuid, 0))
-                self._mel_total_len_dict[uuid] = emitted_prev + delta
-                # try:
-                #     logging.info(f"[cos2.stream+text] uuid={uuid} start={start} delta={delta} emitted_total(prev)={emitted_prev} emitted_total(now)={self._mel_total_len_dict[uuid]}")
-                # except Exception:
-                #     pass
-                new_mel = sample_mel[:, :, start:T_all]
-
-                # overlap-and-add as usual
-                if not finalize and self._mel_overlap_len > 0:
-                    ol = int(self._mel_overlap_len)
-                    prev_len = int(prev_mel.shape[-1]) if (prev_mel is not None and prev_mel.numel() > 0) else 0
-                    new_len = int(new_mel.shape[-1])
-                    overlap_effective = min(ol, prev_len, new_len)
-                    if overlap_effective > 0:
-                        w = torch.tensor(self._mel_window, device=new_mel.device, dtype=new_mel.dtype)
-                        w1 = w[:overlap_effective].view(1, 1, overlap_effective)
-                        w2 = w[ol:ol+overlap_effective].view(1, 1, overlap_effective)
-                        new_mel[:, :, :overlap_effective] = new_mel[:, :, :overlap_effective] * w1 + prev_mel[:, :, -overlap_effective:] * w2
-                    keep = min(ol, new_len)
-                    self._mel_overlap_dict[uuid] = new_mel[:, :, -keep:]
-                    prev_mel = self._mel_overlap_dict[uuid]
-                    mel_for_vocoder = new_mel
-                else:
-                    mel_for_vocoder = new_mel
-
-                # clear caches on finalize
+                
+                # Apply mel overlap-and-add
+                mel_for_vocoder, prev_mel = self._apply_mel_overlap(new_mel, prev_mel, finalize, uuid)
+                
+                # Finalize: clear caches and log stats
                 if finalize:
-                    total = int(self._mel_total_len_dict.get(uuid, 0))
-                    try:
-                        e = embedding.detach().float() if isinstance(embedding, torch.Tensor) else None
-                        if e is not None:
-                            l2 = torch.norm(e, dim=1).mean().item() if e.ndim == 2 and e.size(0) > 0 else float(torch.norm(e).item())
-                            head = e[0, :8].tolist() if e.ndim == 2 and e.size(0) > 0 else []
-                            # Build GT mel info and seconds if provided (GT mel is 22050Hz/hop256)
-                            gt_info = ""
-                            try:
-                                if gt_mel_len is not None:
-                                    if isinstance(gt_mel_len, torch.Tensor):
-                                        if gt_mel_len.numel() == 1:
-                                            _v_list = [int(gt_mel_len.view(-1)[0].item())]
-                                        else:
-                                            _v_list = [int(x) for x in gt_mel_len.view(-1).tolist()]
-                                    else:
-                                        _v_list = [int(gt_mel_len)]
-                                    gt_sec_list = [round(v * 256.0 / float(self.OUTPUT_SAMPLE_RATE), 3) for v in _v_list]
-                                    _v = _v_list[0] if len(_v_list) == 1 else _v_list
-                                    _s = gt_sec_list[0] if len(gt_sec_list) == 1 else gt_sec_list
-                                    gt_info = f" gt_mel_len={_v} gt_sec={_s}"
-                            except Exception:
-                                gt_info = " gt_mel_len=NA"
-                            # Emitted seconds at 24k/hop480 (=50 fps)
-                            emitted_sec = round(total * (self._mel_hop / float(self._cos2_sr)), 3)
-                            logging.info(f"[cos2.stream+text] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk shape={list(e.shape)} mean={e.mean().item():.5f} std={e.std().item():.5f} l2_mean={l2:.5f} head8={head}")
-                        else:
-                            emitted_sec = round(total * (self._mel_hop / float(self._cos2_sr)), 3)
-                            logging.info(f"[cos2.stream+text] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec} | spk=NA")
-                    except Exception:
-                        # try to still include gt_info if available
-                        gt_info = ""
-                        try:
-                            if gt_mel_len is not None:
-                                if isinstance(gt_mel_len, torch.Tensor):
-                                    if gt_mel_len.numel() == 1:
-                                        _v_list = [int(gt_mel_len.view(-1)[0].item())]
-                                    else:
-                                        _v_list = [int(x) for x in gt_mel_len.view(-1).tolist()]
-                                else:
-                                    _v_list = [int(gt_mel_len)]
-                                gt_sec_list = [round(v * 256.0 / float(self.OUTPUT_SAMPLE_RATE), 3) for v in _v_list]
-                                _v = _v_list[0] if len(_v_list) == 1 else _v_list
-                                _s = gt_sec_list[0] if len(gt_sec_list) == 1 else gt_sec_list
-                                gt_info = f" gt_mel_len={_v} gt_sec={_s}"
-                        except Exception:
-                            pass
-                        emitted_sec = round(total * (self._mel_hop / float(self._cos2_sr)), 3)
-                        logging.info(f"[cos2.stream+text] uuid={uuid} finalize=True emitted_total={total} emitted_sec={emitted_sec}{gt_info} | spk=ERR")
-                    self._mel_overlap_dict.pop(uuid, None)
-                    self._hift_cache_dict.pop(uuid, None)
-                    self._mel_total_len_dict.pop(uuid, None)
-
-                # Vocoder with cache
+                    self._finalize_streaming_session(uuid, embedding, gt_mel_len)
+                
+                # HiFT vocoder with cache
                 speech_24k, source = self._hift.inference(speech_feat=mel_for_vocoder, cache_source=cache_src)
+                
+                # Update cache for next iteration
                 if not finalize:
                     cache_src = source[:, :, -self._source_cache_len:]
-                    self._hift_cache_dict[uuid] = {
-                        'source': cache_src,
-                    }
-                    # Do not drop tail samples; HiFT cache ensures continuity without duplication.
+                    self._hift_cache_dict[uuid] = {'source': cache_src}
                 else:
                     cache_src = torch.zeros(batch_size, 1, 0, device=device)
-
+                
                 wav_chunks.append(speech_24k)
-
+        
         finally:
-            # Restore original input_embedding if it was monkey-patched
+            # Restore original input_embedding
             if original_input_embedding is not None:
                 self.cos2_flow.input_embedding = original_input_embedding
-                # Explicitly clean up wrapped module to break circular reference
                 if wrapped_embedding_module is not None:
                     wrapped_embedding_module.adapter_instance = None
                     wrapped_embedding_module.original_embedding = None
                     del wrapped_embedding_module
-
+        
+        # Concatenate and resample to output rate
         wav_24k = torch.cat(wav_chunks, dim=-1)
-        out_sr = self.OUTPUT_SAMPLE_RATE
-        if self._cos2_sr != out_sr:
-            wav = nemo_resample(wav_24k, self._cos2_sr, out_sr)
-        else:
-            wav = wav_24k
-
-        return wav
+        return self._resample_to_output(wav_24k)
 
     @torch.inference_mode()
     def offline_inference(
@@ -2829,80 +3041,55 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         """Non-streaming inference: run CosyVoice2 flow in finalize=True once and vocoder once.
         Returns wav at 22050 Hz for direct comparison with streaming path.
         """
-        # debug: print speaker embedding stats for offline inference
+        # Debug: log speaker embedding stats
         try:
             e = embedding.detach().float() if isinstance(embedding, torch.Tensor) else None
             if e is not None:
                 l2 = torch.norm(e, dim=1).mean().item() if e.ndim == 2 and e.size(0) > 0 else float(torch.norm(e).item())
                 head = e[0, :8].tolist() if e.ndim == 2 and e.size(0) > 0 else []
-                logging.info(f"[cos2.offline] spk shape={list(e.shape)} mean={e.mean().item():.5f} std={e.std().item():.5f} l2_mean={l2:.5f} head8={head}")
+                logging.info(
+                    f"[cos2.offline] spk shape={list(e.shape)} mean={e.mean().item():.5f} "
+                    f"std={e.std().item():.5f} l2_mean={l2:.5f} head8={head}"
+                )
             else:
                 logging.info("[cos2.offline] spk=NA")
         except Exception:
             logging.info("[cos2.offline] spk=ERR")
-
+        
         device = token.device
+        batch_size = token.shape[0]
+        
         # Ensure modules on correct device
         self._ensure_device(device)
         self._lazy_init_hift()
         if next(self._hift.parameters()).device != device:
             self._hift.to(device)
-
-        batch_size = token.shape[0]
+        
+        # Process each sample in batch
         wavs = []
+        upsample_factor = self._compute_upsample_factor()
+        
         for batch_idx in range(batch_size):
-            sample_token = token[batch_idx : batch_idx + 1]
-            sample_prompt_token = prompt_token[batch_idx : batch_idx + 1] if prompt_token is not None and prompt_token.size(0) == batch_size else prompt_token
-            sample_prompt_feat = prompt_feat[batch_idx : batch_idx + 1] if prompt_feat is not None and prompt_feat.size(0) == batch_size else prompt_feat
-            sample_embedding = embedding[batch_idx : batch_idx + 1] if embedding is not None and embedding.size(0) == batch_size else embedding
-
-            # Option A: pre-upsample tokens so that encoder x2 gives desired token_mel_ratio (e.g., 4)
-            upsample_factor = self._compute_upsample_factor()
-            if upsample_factor > 1:
-                sample_token = sample_token.repeat_interleave(upsample_factor, dim=1)
-                sample_prompt_token = sample_prompt_token.repeat_interleave(upsample_factor, dim=1) if (sample_prompt_token is not None and sample_prompt_token.numel() > 0) else sample_prompt_token
-
-            # Apply token embedding self-attention if enabled (via temporary monkey-patch)
-            original_input_embedding, wrapped_embedding_module = self._apply_input_embedding_sa_monkey_patch()
-
-            try:
-                # Update token lengths in wrapped module before inference
-                if wrapped_embedding_module is not None:
-                    wrapped_embedding_module.update_token_lengths(
-                        token_len=sample_token.shape[1],
-                        prompt_token_len=sample_prompt_token.shape[1] if (sample_prompt_token is not None and sample_prompt_token.numel() > 0) else 0
-                    )
-                
-                # run flow once finalize=True to get full mel
-                sample_mel, _ = self.cos2_flow.inference(
-                token=sample_token,
-                token_len=torch.tensor([sample_token.shape[1]], dtype=torch.int32, device=device),
-                prompt_token=sample_prompt_token,
-                prompt_token_len=torch.tensor([sample_prompt_token.shape[1]], dtype=torch.int32, device=device),
-                prompt_feat=sample_prompt_feat,
-                prompt_feat_len=torch.tensor([sample_prompt_feat.shape[1]], dtype=torch.int32, device=device),
-                embedding=sample_embedding,
-                    streaming=False,
-                    finalize=True,
-                )
-            finally:
-                # Restore original input_embedding if it was monkey-patched
-                if original_input_embedding is not None:
-                    self.cos2_flow.input_embedding = original_input_embedding
-                    # Explicitly clean up wrapped module to break circular reference
-                    if wrapped_embedding_module is not None:
-                        wrapped_embedding_module.adapter_instance = None
-                        wrapped_embedding_module.original_embedding = None
-                        del wrapped_embedding_module
-            # one-shot vocoder to avoid boundary artifacts
+            # Extract sample from batch
+            sample_token, sample_prompt_token, sample_prompt_feat, sample_embedding = self._extract_batch_sample(
+                batch_idx, batch_size, token, prompt_token, prompt_feat, embedding, device
+            )
+            
+            # Upsample tokens for alignment
+            token_upsampled, prompt_token_upsampled, _, _ = self._upsample_tokens(
+                sample_token, sample_prompt_token, upsample_factor
+            )
+            
+            # Run flow inference once (finalize=True) for full mel
+            sample_mel = self._run_flow_inference_with_sa(
+                token_upsampled, prompt_token_upsampled, sample_prompt_feat, 
+                sample_embedding, device, streaming=False, finalize=True
+            )
+            
+            # One-shot vocoder to avoid boundary artifacts
             speech_24k, _ = self._hift.inference(speech_feat=sample_mel)
-            # resample once at the end
-            out_sr = self.OUTPUT_SAMPLE_RATE
-            if self._cos2_sr != out_sr:
-                wav = nemo_resample(speech_24k, self._cos2_sr, out_sr)
-            else:
-                wav = speech_24k
+            wav = self._resample_to_output(speech_24k)
             wavs.append(wav)
-
+        
         return torch.cat(wavs, dim=0)
 
