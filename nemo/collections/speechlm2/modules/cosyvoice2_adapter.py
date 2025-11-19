@@ -2046,6 +2046,8 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
     
     def _compute_mel_delta(self, sample_mel, uuid, step_i):
         """Compute mel delta (new frames) from cumulative model output.
+
+        NOTE: flow.inference() already compute the delta, so we don't need to compute it here.
         
         Args:
             sample_mel (torch.Tensor): Model output mel [B, 80, T_all]
@@ -2058,21 +2060,22 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         T_all = int(sample_mel.shape[-1])
         prev_session = int(self._mel_model_total_dict.get(uuid, 0))
         
-        if T_all <= prev_session:
-            if (step_i % max(self._print_per_n_chunk, 1)) == 0:
-                logging.info(f"[cos2.stream] uuid={uuid} T_all={T_all} prev_session={prev_session} -> delta=0 (skip)")
-            return None
+        # if T_all <= prev_session:
+        #     if (step_i % max(self._print_per_n_chunk, 1)) == 0:
+        #         logging.info(f"[cos2.stream] uuid={uuid} T_all={T_all} prev_session={prev_session} -> delta=0 (skip)")
+        #     return None
         
         start = prev_session
-        delta = T_all - prev_session
-        self._mel_model_total_dict[uuid] = T_all
+        delta = T_all
+        end = start + delta
+        self._mel_model_total_dict[uuid] = end
         emitted_prev = int(self._mel_total_len_dict.get(uuid, 0))
-        self._mel_total_len_dict[uuid] = emitted_prev + delta
+        self._mel_total_len_dict[uuid] = end
         
         if (step_i % max(self._print_per_n_chunk, 1)) == 0:
-            logging.info(f"[cos2.stream] uuid={uuid} start={start} delta={delta} emitted_total(prev)={emitted_prev} emitted_total(now)={self._mel_total_len_dict[uuid]}")
+            logging.info(f"[cos2.stream] uuid={uuid} mel_start={start} mel_delta={delta} mel_emitted_total(prev)={emitted_prev} mel_emitted_total(now)={self._mel_total_len_dict[uuid]}")
         
-        return sample_mel[:, :, start:T_all]
+        return sample_mel
     
     def _apply_mel_overlap(self, new_mel, prev_mel, finalize, uuid):
         """Apply mel overlap-and-add for smooth transitions.
@@ -2088,7 +2091,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 - mel_for_vocoder: Mel ready for vocoder [B, 80, T]
                 - updated_prev_mel: Updated overlap buffer for next iteration
         """
-        if not finalize and self._mel_overlap_len > 0:
+        if not finalize:
             ol = int(self._mel_overlap_len)
             prev_len = int(prev_mel.shape[-1]) if (prev_mel is not None and prev_mel.numel() > 0) else 0
             new_len = int(new_mel.shape[-1])
@@ -2748,6 +2751,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         # Initialize streaming cache and overlap buffers
         prev_mel, cache_src = self._initialize_streaming_cache(uuid, prompt_feat, device)
         cache_src = cache_src if cache_src.numel() > 0 else torch.zeros(batch_size, 1, 0, device=device)
+        prompt_feat_hist = prompt_feat
         
         wav_chunks = []
         original_input_embedding, wrapped_embedding_module = self._apply_input_embedding_sa_monkey_patch()
@@ -2767,9 +2771,9 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 # Build prompt history from past tokens and previous mel
                 prompt_token_hist = token[:, :start] if start > 0 else prompt_token
                 prompt_feat_hist = (
-                    torch.cat([prompt_feat, prev_mel.transpose(1, 2)], dim=1)
+                    torch.cat([prompt_feat_hist, prev_mel.transpose(1, 2)], dim=1)
                     if (prev_mel is not None and prev_mel.numel() > 0)
-                    else prompt_feat
+                    else prompt_feat_hist
                 )
                 
                 # Upsample tokens
@@ -2786,8 +2790,9 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 # Periodic logging
                 if (step_i % max(self._print_per_n_chunk, 1)) == 0:
                     logging.info(
-                        f"[cos2.stream] step={step_i} win=({start},{end}) stride={stride} "
-                        f"token_real={real_len} up={upsample_factor} token_upsampled={token_upsampled.shape[1]} finalize={finalize}"
+                        f"[cos2.stream] step={step_i} win=({start},{end}) stride={stride} start={start} end={end} "
+                        f"token_real={real_len} up={upsample_factor} token_upsampled={token_upsampled.shape[1]} finalize={finalize} "
+                        f"prompt_token_len={prompt_token_len_upsampled} prompt_feat_len={prompt_feat_hist.shape[1]}"
                     )
                 
                 # Update token lengths for self-attention wrapper
@@ -2825,7 +2830,10 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 if (step_i % max(self._print_per_n_chunk, 1)) == 0:
                     logging.info(
                         f"[cos2.stream] mel_for_vocoder_frames={mel_for_vocoder.shape[-1]} "
-                        f"ol={self._mel_overlap_len} total_mel={self._mel_total_len_dict[uuid]}"
+                        f"ol={self._mel_overlap_len} total_mel={self._mel_total_len_dict[uuid]} "
+                        f"new_mel={new_mel.shape[-1]} "
+                        f"prev_mel={prev_mel.shape[-1] if prev_mel is not None and prev_mel.numel() > 0 else 'None'} "
+                        f"prompt_feat_len={prompt_feat_hist.shape[1]}"
                     )
                 
                 # Finalize: clear caches and log stats
@@ -2917,6 +2925,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         prev_mel, cache_src = self._initialize_streaming_cache(uuid, prompt_feat, device)
         cache_src = cache_src if cache_src.numel() > 0 else torch.zeros(batch_size, 1, 0, device=device)
         context_len = int(getattr(self.cos2_flow.encoder.pre_lookahead_layer, 'pre_lookahead_len', 4))
+        prompt_feat_hist = prompt_feat
         
         wav_chunks = []
         original_input_embedding, wrapped_embedding_module = self._apply_input_embedding_sa_monkey_patch()
@@ -2936,9 +2945,9 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 # Build prompt history
                 prompt_token_hist = token[:, :start] if start > 0 else prompt_token
                 prompt_feat_hist = (
-                    torch.cat([prompt_feat, prev_mel.transpose(1, 2)], dim=1)
+                    torch.cat([prompt_feat_hist, prev_mel.transpose(1, 2)], dim=1)
                     if (prev_mel is not None and prev_mel.numel() > 0)
-                    else prompt_feat
+                    else prompt_feat_hist
                 )
                 
                 # Build text context (cross-attention or fallback prefix)
