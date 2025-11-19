@@ -1,6 +1,7 @@
 import os
 import sys
 import random
+import json
 from typing import Dict, Optional
 
 import torch
@@ -72,6 +73,12 @@ def setup_logging():
     for logger_name in loggers:
         # logging.info(logger_name)
         if logger_name == 'nemo_logger':
+            continue
+        
+        # Silence noisy loggers from third-party libraries
+        if logger_name == 'transformers.configuration_utils':
+            logger = logging.getLogger(logger_name)
+            logger.setLevel(logging.WARNING)  # Only show WARNING and above
             continue
 
         logger = logging.getLogger(logger_name)
@@ -293,6 +300,19 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             }
             overrides.update(self._cos2_config_override)
             configs = load_hyperpyyaml(f, overrides=overrides, overrides_must_match=False)
+            
+            # Log configs with special handling for torch modules to preserve multiline format
+            logging.info("=" * 80)
+            logging.info("CosyVoice2 config:")
+            for key, value in configs.items():
+                serialized_value = self._make_config_serializable(value, preserve_module_format=True)
+                if isinstance(serialized_value, str) and '\n' in serialized_value:
+                    # For multiline strings (e.g., torch modules), log separately to preserve format
+                    logging.info(f"  {key}:\n{serialized_value}")
+                else:
+                    # For other values, use JSON for pretty formatting
+                    logging.info(f"  {key}: {json.dumps(serialized_value, indent=4)}")
+            logging.info("=" * 80)
         # CosyVoice2 config exposes 'flow' module consistent with CausalMaskedDiffWithXvec
         self.cos2_flow = configs["flow"]
         # remember config path for later HiFT lazy init
@@ -438,6 +458,121 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             if os.path.isfile(cfg_path):
                 from nemo.collections.speechlm2.modules.flow_inference import AudioDecoder as LegacyAudioDecoder
                 self._fallback_infer = LegacyAudioDecoder(cfg_path, flow_ckpt, hift_ckpt, device=self.device)
+
+        self._log_self_variables()
+
+    def _make_config_serializable(self, obj, preserve_module_format=True):
+        """Convert config object to a serializable format for logging.
+        
+        Args:
+            obj: Object to serialize (can be dict, list, class instance, torch.nn.Module, etc.)
+            preserve_module_format: If True, preserve multiline format for torch modules
+            
+        Returns:
+            Serializable representation of the object
+        """
+        import torch.nn as nn
+        
+        if isinstance(obj, nn.Module):
+            # For torch modules, return string representation to preserve multiline format
+            if preserve_module_format:
+                return str(obj)
+            else:
+                # Fallback to class name if we want compact format
+                return f"{obj.__class__.__name__} instance"
+        elif hasattr(obj, '__dict__'):
+            # For class instances, return class name and relevant attributes
+            class_name = obj.__class__.__name__
+            try:
+                # Try to get a meaningful representation
+                if hasattr(obj, '__str__') and str(obj) != f"<{class_name} object at 0x{id(obj):x}>":
+                    return f"{class_name}: {str(obj)}"
+                else:
+                    return f"{class_name} instance"
+            except:
+                return f"{class_name} instance"
+        elif isinstance(obj, dict):
+            return {k: self._make_config_serializable(v, preserve_module_format) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [self._make_config_serializable(item, preserve_module_format) for item in obj]
+        else:
+            return obj
+
+    def _log_self_variables(self):
+        """Log all self variables for debugging purposes."""
+        logging.info("=== CosyVoice2AudioDecoder Self Variables ===")
+        
+        # Device and basic config
+        logging.info(f"device: {getattr(self, 'device', 'Not set')}")
+        logging.info(f"_cos2_config_path: {getattr(self, '_cos2_config_path', 'Not set')}")
+        logging.info(f"_cos2_sr: {getattr(self, '_cos2_sr', 'Not set')}")
+        
+        # Training and streaming config
+        logging.info(f"_stream_train_prob: {getattr(self, '_stream_train_prob', 'Not set')}")
+        logging.info(f"_use_text_context_train: {getattr(self, '_use_text_context_train', 'Not set')}")
+        logging.info(f"_token_overlap_len_cfg: {getattr(self, '_token_overlap_len_cfg', 'Not set')}")
+        logging.info(f"_token_overlap_len: {getattr(self, '_token_overlap_len', 'Not set')}")
+        logging.info(f"_fixed_window_pad: {getattr(self, '_fixed_window_pad', 'Not set')}")
+        logging.info(f"_stream_stride: {getattr(self, '_stream_stride', 'Not set')}")
+        logging.info(f"_stream_train_first_block_random: {getattr(self, '_stream_train_first_block_random', 'Not set')}")
+        
+        # Token embedding self-attention
+        logging.info(f"_use_token_emb_sa: {getattr(self, '_use_token_emb_sa', 'Not set')}")
+        
+        # Debug config
+        logging.info(f"_step: {getattr(self, '_step', 'Not set')}")
+        logging.info(f"_debug_every: {getattr(self, '_debug_every', 'Not set')}")
+        logging.info(f"_val_debug: {getattr(self, '_val_debug', 'Not set')}")
+        logging.info(f"_debug_text_align: {getattr(self, '_debug_text_align', 'Not set')}")
+        logging.info(f"_debug_xattn: {getattr(self, '_debug_xattn', 'Not set')}")
+        logging.info(f"_print_every_k_in_batch: {getattr(self, '_print_every_k_in_batch', 'Not set')}")
+        logging.info(f"_debug_blocks: {getattr(self, '_debug_blocks', 'Not set')}")
+        logging.info(f"_print_per_n_chunk: {getattr(self, '_print_per_n_chunk', 'Not set')}")
+        
+        # Cross-text attention config
+        logging.info(f"_use_cross_text_attn: {getattr(self, '_use_cross_text_attn', 'Not set')}")
+        logging.info(f"_cross_text_heads: {getattr(self, '_cross_text_heads', 'Not set')}")
+        logging.info(f"_cross_text_dropout: {getattr(self, '_cross_text_dropout', 'Not set')}")
+        logging.info(f"_cross_q_pool: {getattr(self, '_cross_q_pool', 'Not set')}")
+        
+        # Context and embedding dimensions
+        logging.info(f"_default_context_len: {getattr(self, '_default_context_len', 'Not set')}")
+        logging.info(f"_ctx_dim: {getattr(self, '_ctx_dim', 'Not set')}")
+        logging.info(f"_text_vocab_size: {getattr(self, '_text_vocab_size', 'Not set')}")
+        
+        # Text FFN config
+        logging.info(f"_text_ffn_hidden: {getattr(self, '_text_ffn_hidden', 'Not set')}")
+        logging.info(f"_text_ffn_dropout: {getattr(self, '_text_ffn_dropout', 'Not set')}")
+        
+        # Mel and audio processing
+        logging.info(f"_mel_hop: {getattr(self, '_mel_hop', 'Not set')}")
+        logging.info(f"_mel_overlap_len: {getattr(self, '_mel_overlap_len', 'Not set')}")
+        logging.info(f"_mel_cache_len: {getattr(self, '_mel_cache_len', 'Not set')}")
+        logging.info(f"_source_cache_len: {getattr(self, '_source_cache_len', 'Not set')}")
+        
+        # Fallback config
+        logging.info(f"_fallback_dir: {getattr(self, '_fallback_dir', 'Not set')}")
+        logging.info(f"_fallback_infer: {getattr(self, '_fallback_infer', 'Not set')}")
+        
+        # Module states
+        logging.info(f"cos2_flow: {type(getattr(self, 'cos2_flow', None))}")
+        logging.info(f"_hift: {type(getattr(self, '_hift', None))}")
+        logging.info(f"text_context_emb: {type(getattr(self, 'text_context_emb', None))}")
+        logging.info(f"cross_text_attn: {type(getattr(self, 'cross_text_attn', None)) if hasattr(self, 'cross_text_attn') else 'Not set'}")
+        logging.info(f"text_ffn: {type(getattr(self, 'text_ffn', None))}")
+        
+        # Cache dictionaries (show keys only for brevity)
+        mel_overlap_keys = list(getattr(self, '_mel_overlap_dict', {}).keys())
+        mel_total_keys = list(getattr(self, '_mel_total_len_dict', {}).keys())
+        mel_model_keys = list(getattr(self, '_mel_model_total_dict', {}).keys())
+        hift_cache_keys = list(getattr(self, '_hift_cache_dict', {}).keys())
+        
+        logging.info(f"_mel_overlap_dict keys: {mel_overlap_keys}")
+        logging.info(f"_mel_total_len_dict keys: {mel_total_keys}")
+        logging.info(f"_mel_model_total_dict keys: {mel_model_keys}")
+        logging.info(f"_hift_cache_dict keys: {hift_cache_keys}")
+        
+        logging.info("=== End Self Variables ===")
 
     def _lazy_init_hift(self):
         if self._hift is not None:
@@ -2146,6 +2281,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         try:
             # iterate with sliding window: step by stream_stride tokens; window length = block_size
             stride = int(self._stream_stride) if getattr(self, "_stream_stride", 0) and int(self._stream_stride) > 0 else block_size
+            assert stride <= block_size, f"stride ({stride}) must be <= block_size ({block_size})"
             T = token.size(1)
             step_i = 0
             for end in range(min(stride, T), T + 1, stride):
@@ -2409,6 +2545,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         try:
             # iterate with sliding window + text context
             stride = int(self._stream_stride) if getattr(self, "_stream_stride", 0) and int(self._stream_stride) > 0 else block_size
+            assert stride <= block_size, f"stride ({stride}) must be <= block_size ({block_size})"
             T = token.size(1)
             step_i = 0
             for end in range(min(stride, T), T + 1, stride):
