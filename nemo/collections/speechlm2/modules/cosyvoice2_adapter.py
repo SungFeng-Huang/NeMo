@@ -1203,7 +1203,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         return text_ctx_batch
     
     def _build_fallback_text_context(self, text_token_emb_full, text_chunk_ends, context_len, device_target):
-        """Build simple right-aligned text window per chunk using text_end_idx (fallback when cross-attn disabled).
+        """Build simple right-aligned text window per chunk using text_end_idx (fallback to right-most text context with pre_lookahead_len when cross-attn disabled).
         
         Args:
             text_token_emb_full (torch.Tensor): Full text embeddings [1, T_text, D]
@@ -1217,12 +1217,19 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         ctx_list = []
         for te in text_chunk_ends:
             text_end_idx = int(te)
+            # debug: print text_end_idx per per_n_chunk
+            if int(self._step) % max(self._print_per_n_chunk, 1) == 0:
+                logging.info(f"[cos2.train.fallback] step: {int(self._step)} text_end_idx: {text_end_idx} context_len: {context_len}")
             text_window_emb = text_token_emb_full[:, :text_end_idx]  # [1, N, D] take up to text_end_idx
             if text_window_emb.shape[1] < context_len:
                 pad = torch.zeros(1, context_len - text_window_emb.shape[1], text_window_emb.shape[2], device=device_target, dtype=text_window_emb.dtype)
                 text_ctx = torch.cat([text_window_emb, pad], dim=1)  # right-pad to context_len
-            else:
+            elif context_len > 0:
                 text_ctx = text_window_emb[:, -context_len:]  # take the most recent context_len tokens
+            else:
+                text_ctx = text_window_emb[:, :0]  # empty tensor
+            if int(self._step) % max(self._print_per_n_chunk, 1) == 0:
+                logging.info(f"[cos2.train.fallback] step: {int(self._step)} text_ctx: {text_ctx.shape}")
             ctx_list.append(text_ctx.squeeze(0))  # [context_len, D]
         if len(ctx_list) > 0:
             text_ctx_batch = torch.stack(ctx_list, dim=0)  # [num_chunks, context_len, D]
@@ -1782,7 +1789,6 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         if not isinstance(text_token_emb_full, torch.Tensor) or text_token_emb_full.numel() == 0:
             return None
         
-        context_len = self._default_context_len
         text_chunk_ends = [int(min(int(e), int(sample_text_token_len))) for e in token_chunk_ends]
         kv_hist_max = int(min(int(sample_text_token_len), text_token_emb_full.shape[1]))
         
@@ -1811,6 +1817,8 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 token_emb_original, num_chunks, kv_hist_max, text_chunk_ends, device_target, b_idx
             )
         elif not self._use_cross_text_attn:
+            # fallback to right-most text context with pre_lookahead_len as text context
+            context_len = self._default_context_len
             text_ctx_batch = self._build_fallback_text_context(text_token_emb_full, text_chunk_ends, context_len, device_target)
         else:
             text_ctx_batch = None
@@ -2751,6 +2759,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         # Initialize streaming cache and overlap buffers
         prev_mel, cache_src = self._initialize_streaming_cache(uuid, prompt_feat, device)
         cache_src = cache_src if cache_src.numel() > 0 else torch.zeros(batch_size, 1, 0, device=device)
+        context_len = int(getattr(self.cos2_flow.encoder.pre_lookahead_layer, 'pre_lookahead_len', 4))
         prompt_feat_hist = prompt_feat
         
         wav_chunks = []
@@ -2762,10 +2771,21 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             assert stride <= block_size, f"stride ({stride}) must be <= block_size ({block_size})"
             
             T = token.size(1)
+            upsample_factor = self._compute_upsample_factor()
             step_i = 0
-            for end in range(min(stride, T), T + 1, stride):
+            for end in range(min(stride, T), T + block_size, stride):
+                finalize = end >= T
+
+                # deal with real pre-lookahead length
+                pre_lookahead_len = context_len
+                if not finalize:
+                    if end + pre_lookahead_len > T:
+                        pre_lookahead_len = T - end
+                else:
+                    pre_lookahead_len = 0
+                
                 start = max(0, end - block_size)
-                token_win = token[:, start:end]
+                token_win = token[:, start:end+pre_lookahead_len]
                 real_len = token_win.shape[1]
                 
                 # Build prompt history from past tokens and previous mel
@@ -2777,18 +2797,17 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 )
                 
                 # Upsample tokens
-                upsample_factor = self._compute_upsample_factor()
                 token_upsampled, prompt_token_upsampled, real_len_upsampled, prompt_token_len_upsampled = self._upsample_tokens(
                     token_win, prompt_token_hist, upsample_factor
                 )
+                pre_lookahead_len_upsampled = pre_lookahead_len * upsample_factor
                 
                 # Apply fixed window padding if needed
                 token_upsampled = self._apply_fixed_window_padding(token_upsampled, block_size, upsample_factor)
                 
-                finalize = end >= T
-                
                 # Periodic logging
                 if (step_i % max(self._print_per_n_chunk, 1)) == 0:
+                    logging.info("="*100)
                     logging.info(
                         f"[cos2.stream] step={step_i} win=({start},{end}) stride={stride} start={start} end={end} "
                         f"token_real={real_len} up={upsample_factor} token_upsampled={token_upsampled.shape[1]} finalize={finalize} "
@@ -2803,6 +2822,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     )
                 
                 # Generate mel via CosyVoice2 flow
+                self.cos2_flow.pre_lookahead_len = pre_lookahead_len_upsampled  # mokey-patch: set pre_lookahead_len for flow inference
                 sample_mel, _ = self.cos2_flow.inference(
                     token=token_upsampled,
                     token_len=torch.tensor([real_len_upsampled], dtype=torch.int32, device=device),
@@ -2814,6 +2834,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     streaming=True,
                     finalize=finalize,
                 )
+                self.cos2_flow.pre_lookahead_len = context_len  # restore pre_lookahead_len for next iteration
                 
                 if (step_i % max(self._print_per_n_chunk, 1)) == 0:
                     logging.info(f"[cos2.stream] sample_mel_frames={sample_mel.shape[-1]}")
@@ -2894,6 +2915,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         """
         # Fallback to vanilla streaming if no text tokens
         if text_tokens is None or text_tokens.numel() == 0:
+            logging.info(f"[cos2.stream+text] no text tokens, fallback to vanilla streaming")
             return self.stream_inference(token, uuid, prompt_token, prompt_feat, embedding, gt_mel_len)
 
         device = token.device
@@ -2936,8 +2958,19 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             assert stride <= block_size, f"stride ({stride}) must be <= block_size ({block_size})"
             
             T = token.size(1)
+            upsample_factor = self._compute_upsample_factor()
             step_i = 0
-            for end in range(min(stride, T), T + 1, stride):
+            for end in range(min(stride, T), T + block_size, stride):
+                finalize = end >= T
+                pre_lookahead_len = context_len
+
+                # for text context, we don't really do pre-lookahead, but use the right-most text context with pre_lookahead_len as text context
+                # if not finalize:
+                #     if end + pre_lookahead_len > T:
+                #         pre_lookahead_len = T - end
+                # else:
+                #     pre_lookahead_len = 0
+                
                 start = max(0, end - block_size)
                 token_win = token[:, start:end]
                 real_len = token_win.shape[1]
@@ -2958,7 +2991,6 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 )
                 
                 # Upsample tokens
-                upsample_factor = self._compute_upsample_factor()
                 token_upsampled, prompt_token_upsampled, real_len_upsampled, prompt_token_len_upsampled = self._upsample_tokens(
                     token_win, prompt_token_hist, upsample_factor
                 )
@@ -2966,7 +2998,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 # Apply fixed window padding if needed
                 token_upsampled = self._apply_fixed_window_padding(token_upsampled, block_size, upsample_factor)
                 
-                finalize = end >= T
+                pre_lookahead_len_upsampled = pre_lookahead_len * upsample_factor
                 
                 # Periodic logging
                 if (step_i % max(self._print_per_n_chunk, 1)) == 0:
@@ -2987,6 +3019,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     )
                 
                 # Generate mel via CosyVoice2 flow with text context
+                self.cos2_flow.pre_lookahead_len = pre_lookahead_len_upsampled  # mokey-patch: set pre_lookahead_len for flow inference
                 sample_mel, _ = self.cos2_flow.inference(
                     token=token_upsampled,
                     token_len=torch.tensor([real_len_upsampled], dtype=torch.int32, device=device),
@@ -3000,6 +3033,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     use_text_context=True,
                     text_context=text_ctx,
                 )
+                self.cos2_flow.pre_lookahead_len = context_len  # restore pre_lookahead_len for next iteration
                 step_i += 1
                 
                 # Compute mel delta (new frames only)
