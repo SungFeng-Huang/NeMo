@@ -189,6 +189,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 token_overlap=int(self.cfg.get("cos2_token_overlap", 0)),
                 is_debug=bool(self.cfg.get("is_debug", False)),
                 print_per_n_chunk=int(self.cfg.get("print_per_n_chunk", 50)),
+                stream_train_first_block_random=bool(self.cfg.get("cos2_stream_train_first_block_random", False)),
                 stream_fixed_window_pad=bool(self.cfg.get("cos2_stream_fixed_window_pad", False)),
                 use_token_emb_sa=bool(self.cfg.get("cos2_use_token_emb_sa", False)),
             )
@@ -749,7 +750,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 response_speech_stream = None
                 if use_stream:
                     # choose between vanilla streaming or text-context streaming via config flag
-                    use_text_ctx = bool(getattr(self.cfg, 'cos2_use_text_context_infer', False) and getattr(self.audio_decoder, 'use_cross_text_attn', False))
+                    use_text_ctx = bool(getattr(self.cfg, 'cos2_use_text_context_infer', False))
                     if use_text_ctx and hasattr(self.audio_decoder, 'stream_inference_with_text'):
                         texts = dataset_batch.get("target_texts", [])
                         # logging.info(f"\n[validation_step] stream_inference_with_text true")
@@ -768,7 +769,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                                     text_tokens[i, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=self.device)
 
                         if text_tokens is not None and isinstance(text_tokens, torch.Tensor) and text_tokens.numel() > 0:
-                            # logging.info(f"[validation_step] stream_inference_with_text")
+                            logging.info(f"[validation_step] stream_inference_with_text, use_cross_text_attn={getattr(self.audio_decoder, 'use_cross_text_attn', False)}")
                             # logging.info(f"[validation_step] text_tokens: {text_tokens}")
                             # logging.info(f"[validation_step] spk_emb: {spk_emb}")
                             response_speech_stream = self.audio_decoder.stream_inference_with_text(
