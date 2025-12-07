@@ -642,11 +642,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # Flow matching训练的核心：
         # - inputs包含条件信息（梅尔频谱）和目标（语音token）
         # - audio_decoder.flow执行flow matching的前向传播和损失计算
-        loss = self.audio_decoder.flow(inputs, self.device)
+        loss_dict = self.audio_decoder.flow(inputs, self.device)
+        loss = loss_dict['loss']
+        reconstruction_loss = loss_dict['reconstruction_loss'] if loss_dict['reconstruction_loss'] is not None else 0.0
 
         # 记录训练指标
         ans = {
-            "loss": loss['loss'],  # Flow matching损失
+            "loss": loss,  # Flow matching损失
+            "reconstruction_loss": reconstruction_loss,  # Reconstruction loss
             "learning_rate": (
                 torch.as_tensor(self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0)
             ),
@@ -722,6 +725,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
     def validation_step(self, batch: dict, batch_idx: int, dataloader_idx: int = 0):
         outputs = {
             "loss": 0.0,
+            "reconstruction_loss": 0.0,
             "audio_list": [],
             "image_list": [],
         }

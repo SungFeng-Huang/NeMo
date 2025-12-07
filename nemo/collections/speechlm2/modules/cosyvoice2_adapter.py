@@ -327,6 +327,10 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         cosyvoice2_root = _infer_cosyvoice2_root(cos2_config_path)
         if cosyvoice2_root and os.path.isdir(cosyvoice2_root) and cosyvoice2_root not in sys.path:
             sys.path.insert(0, cosyvoice2_root)
+        from cosyvoice.transformer.encoder_layer import TransformerEncoderLayer
+        from cosyvoice.transformer.positionwise_feed_forward import PositionwiseFeedForward
+        from cosyvoice.utils.class_utils import COSYVOICE_EMB_CLASSES, COSYVOICE_ATTENTION_CLASSES
+        # Import MultiHeadedAttention for backward compatibility (used in other parts)
         from cosyvoice.transformer.attention import MultiHeadedAttention
 
         if load_hyperpyyaml is None:
@@ -480,6 +484,92 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             torch.nn.Linear(self._text_ffn_hidden, self._ctx_dim),
             torch.nn.Dropout(self._text_ffn_dropout),
         )
+
+        # query-based upsampling
+        self._use_query_based_upsampling = bool(configs.get('use_query_based_upsampling', False))
+        if self._use_query_based_upsampling:
+            attn_type = str(configs.get('speech_upsampling_attn_type', 'selfattn'))
+            pos_enc_type = str(configs.get('speech_upsampling_pos_enc_type', 'no_pos'))
+
+            # Log configuration consistency check
+            rel_pos_types = {'rel_pos', 'rel_pos_espnet'}
+            if attn_type == 'rel_selfattn' and pos_enc_type not in rel_pos_types:
+                logging.warning(
+                    f"[cos2.init] Using RelPositionMultiHeadedAttention (attn_type={attn_type}) "
+                    f"but pos_enc_type={pos_enc_type}. Consider setting pos_enc_type to one of {rel_pos_types} for consistency."
+                )
+            elif attn_type != 'rel_selfattn' and pos_enc_type in rel_pos_types:
+                logging.warning(
+                    f"[cos2.init] Using relative positional encoding (pos_enc_type={pos_enc_type}) "
+                    f"but attn_type={attn_type}. Consider setting attn_type='rel_selfattn' for consistency."
+                )
+            
+            # Upsample query tensor
+            self.speech_upsampling_query = torch.nn.Parameter(torch.randn(1, self._ctx_dim) * 0.02)
+            
+            # Create multiple transformer layers for upsampling
+            num_layers = int(configs.get('speech_upsampling_num_layers', 1))
+            self.speech_upsampling_transformer = torch.nn.ModuleList([
+                TransformerEncoderLayer(
+                    size=self._ctx_dim,
+                    self_attn=COSYVOICE_ATTENTION_CLASSES[attn_type](
+                        n_head=self._speech_sa_heads,
+                        n_feat=self._ctx_dim,
+                        dropout_rate=self._speech_sa_dropout,
+                    ),
+                    feed_forward=PositionwiseFeedForward(
+                        idim=self._ctx_dim,
+                        hidden_units=self._speech_ffn_hidden,
+                        dropout_rate=self._speech_ffn_dropout,
+                        activation=torch.nn.GELU(),
+                    ),
+                    dropout_rate=self._speech_sa_dropout,
+                    normalize_before=True,  # Pre-LN for better stability
+                )
+                for _ in range(num_layers)
+            ])
+            
+            # Create positional encoding module using class_utils
+            self.speech_upsampling_pos_enc = COSYVOICE_EMB_CLASSES[pos_enc_type](
+                d_model=self._ctx_dim,
+                dropout_rate=0.0,  # Dropout already in transformer layer
+            )
+
+            # Downsample mask tensor
+            self.speech_upsampling_downsample_mask_query = torch.nn.Parameter(torch.randn(1, self._ctx_dim) * 0.02)
+
+            # Create multiple transformer layers for downsampling
+            num_downsample_layers = int(configs.get('speech_upsampling_num_downsample_layers', num_layers))
+            self.speech_upsampling_downsample_transformer = torch.nn.ModuleList([
+                TransformerEncoderLayer(
+                    size=self._ctx_dim,
+                    self_attn=COSYVOICE_ATTENTION_CLASSES[attn_type](
+                        n_head=self._speech_sa_heads,
+                        n_feat=self._ctx_dim,
+                        dropout_rate=self._speech_sa_dropout,
+                    ),
+                    feed_forward=PositionwiseFeedForward(
+                        idim=self._ctx_dim,
+                        hidden_units=self._speech_ffn_hidden,
+                        dropout_rate=self._speech_ffn_dropout,
+                        activation=torch.nn.GELU(),
+                    ),
+                    dropout_rate=self._speech_sa_dropout,
+                    normalize_before=True,  # Pre-LN for better stability
+                )
+                for _ in range(num_downsample_layers)
+            ])
+            self._reconstruction_loss_weight = float(configs.get('reconstruction_loss_weight', 1.0))
+            
+            logging.info(
+                f"[cos2.init] Query-based upsampling transformer initialized with "
+                f"attn_type={attn_type}, pos_enc_type={pos_enc_type}, "
+                f"num_layers={num_layers}, num_downsample_layers={num_downsample_layers}, reconstruction_loss_weight={self._reconstruction_loss_weight}"
+            )
+        self._use_query_based_speech_sa = bool(configs.get('use_query_based_speech_sa', False))
+        if self._use_query_based_speech_sa:
+            self.speech_sa_query = torch.nn.Parameter(torch.randn(1, self._ctx_dim) * 0.02)
+            # use self.speech_sa to compute the query-based speech self-attention
 
 
 
@@ -1283,6 +1373,56 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         
         return speech_hidden
     
+    class _InputEmbeddingWithPrecomputedQueryUpsampling(torch.nn.Module):
+        """Wrapper for input_embedding that returns precomputed query-based upsampled embeddings.
+        
+        Used in streaming inference when query-based upsampling is enabled.
+        The full sequence is precomputed once to get global information, then
+        chunked retrieval is done during streaming.
+        """
+        def __init__(self, original_embedding, precomputed_emb_full, precomputed_prompt_emb, upsample_factor):
+            super().__init__()
+            self.original_embedding = original_embedding
+            self.precomputed_emb_full = precomputed_emb_full  # [B, T_upsampled, D]
+            self.precomputed_prompt_emb = precomputed_prompt_emb  # [B, Tp_upsampled, D] or None
+            self.upsample_factor = upsample_factor
+            
+        def forward(self, token):
+            """Return precomputed embeddings based on token IDs (used as indices).
+            
+            Args:
+                token: [B, L] - concatenated [prompt_token, current_token]
+                       In streaming, L = len(prompt) + len(current_chunk)
+            
+            Returns:
+                embeddings: [B, L, D] from precomputed cache
+            """
+            B, L = token.shape
+            device = token.device
+            
+            # Determine how much is prompt vs current token
+            if self.precomputed_prompt_emb is not None and self.precomputed_prompt_emb.numel() > 0:
+                prompt_len_upsampled = self.precomputed_prompt_emb.shape[1]
+                # Concatenate: [prompt_emb, relevant portion of full_emb]
+                # The token tensor contains [prompt_ids (Tp), current_ids (Lc)]
+                # We need to return [prompt_emb (Tp_up), current_emb (Lc_up)]
+                # where Tp_up = Tp * upsample_factor, Lc_up = Lc * upsample_factor
+                
+                # The total L should equal prompt_len_upsampled + some portion of precomputed_emb_full
+                # Extract the corresponding slice from precomputed_emb_full
+                if L > prompt_len_upsampled:
+                    current_len = L - prompt_len_upsampled
+                    current_emb = self.precomputed_emb_full[:, :current_len, :]
+                    result = torch.cat([self.precomputed_prompt_emb, current_emb], dim=1)
+                else:
+                    # Only prompt (shouldn't happen in normal streaming)
+                    result = self.precomputed_prompt_emb[:, :L, :]
+            else:
+                # No prompt, just use precomputed_emb_full
+                result = self.precomputed_emb_full[:, :L, :]
+            
+            return result
+    
     class _InputEmbeddingWithSA(torch.nn.Module):
         """Wrapper module for input_embedding that applies self-attention.
         
@@ -1408,6 +1548,226 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         self.cos2_flow.input_embedding = wrapped_embedding_module
         
         return original_input_embedding, wrapped_embedding_module
+
+    def _build_speech_hidden_with_query_based_upsampling(self, token_data, token_mask, upsample_f):
+        """Build speech hidden with query-based upsampling.
+        
+        Args:
+            token_data (torch.Tensor): Token data for conditioning [B, T_tok, D]
+            token_mask (torch.Tensor): Token mask [B, T_tok, 1]
+            upsample_f (int): Upsampling factor used for token alignment
+        
+        Returns:
+            tuple: (upsampled_token_data, upsampled_token_mask)
+                - upsampled_token_data: [B, T_tok * upsample_f, D]
+                - upsampled_token_mask: [B, T_tok * upsample_f, 1]
+        """
+        logging.info(f"[cos2.train.query_based_upsampling] upsample_f: {upsample_f}")
+        B, T_tok, D = token_data.shape
+        assert D == self.speech_upsampling_query.shape[1], "Dimension mismatch between token_data and speech_upsampling_query"
+        upsampling_query_token = self.speech_upsampling_query.unsqueeze(0).repeat(B, T_tok, 1) # [B, T_tok, D]
+
+        # stack upsample_token and token_data along the second dimension to make interleaved sequence
+        logging.info(f"[cos2.train.query_based_upsampling] token_data: {token_data.shape} upsampling_query_token: {upsampling_query_token.shape}")
+        token_stack = [token_data] + [upsampling_query_token] * (upsample_f)
+        token_stack_interleaved = torch.stack(token_stack, dim=2).view(B, T_tok * (upsample_f + 1), D).contiguous() # [B, T_tok * (upsample_f + 1), D]
+
+        logging.info(f"[cos2.train.query_based_upsampling] token_stack_interleaved: {token_stack_interleaved.shape}")
+        # Prepare mask for TransformerEncoderLayer
+        # Original mask: [B, T_tok, 1], need to expand to [B, T_tok*(upsample_f+1), 1]
+        sa_mask_expanded = token_mask.repeat_interleave(upsample_f + 1, dim=1)  # [B, T_tok*(upsample_f+1), 1]
+        
+        # TransformerEncoderLayer expects mask in shape [B, 1, T] or [B, T, T] for attention
+        # Using [B, 1, T] format (broadcasting across all positions)
+        sa_mask = sa_mask_expanded.transpose(1, 2)  # [B, 1, T_tok*(upsample_f+1)]
+        
+        logging.info(f"[cos2.train.query_based_upsampling] sa_mask: {sa_mask.shape}")
+        
+        # Use TransformerEncoderLayer (includes self-attention + layer norm + FFN)
+        # Generate positional encoding using the configured module
+        _, pos_emb = self.speech_upsampling_pos_enc(token_stack_interleaved)
+        mask_pad = torch.ones((0, 0, 0), dtype=torch.bool, device=token_stack_interleaved.device)
+        
+        # Apply multiple transformer layers
+        token_interleaved_hidden = token_stack_interleaved
+        for layer_idx, transformer_layer in enumerate(self.speech_upsampling_transformer):
+            token_interleaved_hidden, _, _, _ = transformer_layer(
+                x=token_interleaved_hidden,
+                mask=sa_mask,
+                pos_emb=pos_emb,
+                mask_pad=mask_pad,
+            )
+            logging.info(f"[cos2.train.query_based_upsampling] After layer {layer_idx}: {token_interleaved_hidden.shape}")
+
+        logging.info(f"[cos2.train.query_based_upsampling] token_interleaved_hidden: {token_interleaved_hidden.shape}")
+        upsampled_token_mask = token_mask.repeat_interleave(upsample_f, dim=1)
+        # Reshape to extract query positions: [B, T_tok, (upsample_f+1), D] -> extract last upsample_f positions
+        token_interleaved_reshaped = token_interleaved_hidden.view(B, T_tok, upsample_f + 1, D)
+        upsampled_token_data = token_interleaved_reshaped[:, :, 1:, :].contiguous().view(B, T_tok * upsample_f, D) * upsampled_token_mask # [B, T_tok * upsample_f, D]
+
+        logging.info(f"[cos2.train.query_based_upsampling] upsampled_token_data: {upsampled_token_data.shape} upsampled_token_mask: {upsampled_token_mask.shape}")
+
+        reconstruction_loss = None
+        if len(self.speech_upsampling_downsample_transformer) > 0:
+            reconstructed_token_data, _ = self._build_speech_hidden_with_query_based_downsampling(
+                upsampled_token_data, token_mask, upsample_f
+            )  # [B, T_tok, D]
+            logging.info(f"[cos2.train.query_based_upsampling] reconstructed_token_data: {reconstructed_token_data.shape}")
+            # calculate reconstruction loss
+            reconstruction_loss = F.mse_loss(token_data, reconstructed_token_data)
+            logging.info(f"[cos2.train.query_based_upsampling] reconstruction_loss: {reconstruction_loss}")
+
+        return upsampled_token_data, upsampled_token_mask, reconstruction_loss
+
+    def _build_speech_hidden_with_query_based_downsampling(self, upsampled_token_data, token_mask, upsample_f):
+        """Build speech hidden with query-based downsampling.
+        
+        Args:
+            token_data (torch.Tensor): Token data for conditioning [B, T_tok*upsample_f, D]
+            token_mask (torch.Tensor): Token mask [B, T_tok, 1]
+            upsample_f (int): Upsampling factor used for token alignment
+
+        Returns:
+            tuple: (downsampled_token_data, downsampled_token_mask)
+                - downsampled_token_data: [B, T_tok, D]
+                - downsampled_token_mask: [B, T_tok, 1]
+        """
+        logging.info(f"[cos2.train.query_based_downsampling] upsample_f: {upsample_f}")
+        B, T_tok_upsampled, D = upsampled_token_data.shape
+        T_tok = T_tok_upsampled // upsample_f
+        assert D == self.speech_upsampling_downsample_mask_query.shape[1], "Dimension mismatch between token_data and speech_upsampling_downsample_mask_query"
+        downsampling_mask_token = self.speech_upsampling_downsample_mask_query.unsqueeze(0).unsqueeze(0).repeat(B, T_tok, 1, 1) # [B, T_tok, 1, D]
+
+        # stack downsample_token and token_data along the second dimension to make interleaved sequence
+        logging.info(f"[cos2.train.query_based_downsampling] upsampled_token_data: {upsampled_token_data.shape} downsampling_mask_token: {downsampling_mask_token.shape}")
+        token_data = upsampled_token_data.view(B, T_tok, upsample_f, D).contiguous()
+        token_concat_interleaved = torch.cat([downsampling_mask_token, token_data], dim=2).view(B, T_tok * (upsample_f + 1), D).contiguous() # [B, T_tok * (upsample_f + 1), D]
+
+        logging.info(f"[cos2.train.query_based_downsampling] token_concat_interleaved: {token_concat_interleaved.shape}")
+        # Prepare mask for TransformerEncoderLayer
+        # Original mask: [B, T_tok, 1], need to expand to [B, T_tok*(downsample_f+1), 1]
+        sa_mask_expanded = token_mask.repeat_interleave(upsample_f + 1, dim=1)  # [B, T_tok*(upsample_f+1), 1]
+        sa_mask = sa_mask_expanded.transpose(1, 2)  # [B, 1, T_tok*(upsample_f+1)]
+
+        logging.info(f"[cos2.train.query_based_downsampling] sa_mask: {sa_mask.shape}")
+
+        # Use TransformerEncoderLayer (includes self-attention + layer norm + FFN)
+        # Generate positional encoding using the configured module
+        _, pos_emb = self.speech_upsampling_pos_enc(token_concat_interleaved)
+        mask_pad = torch.ones((0, 0, 0), dtype=torch.bool, device=token_concat_interleaved.device)
+
+        # Apply multiple transformer layers
+        token_interleaved_hidden = token_concat_interleaved
+        for layer_idx, transformer_layer in enumerate(self.speech_upsampling_downsample_transformer):
+            token_interleaved_hidden, _, _, _ = transformer_layer(
+                x=token_interleaved_hidden,
+                mask=sa_mask,
+                pos_emb=pos_emb,
+                mask_pad=mask_pad,
+            )
+            logging.info(f"[cos2.train.query_based_downsampling] After layer {layer_idx}: {token_interleaved_hidden.shape}")
+
+        logging.info(f"[cos2.train.query_based_downsampling] token_interleaved_hidden: {token_interleaved_hidden.shape}")
+        downsampled_token_mask = token_mask
+        # Reshape to extract query positions: [B, T_tok, (upsample_f+1), D] -> extract first upsample_f positions
+        token_interleaved_reshaped = token_interleaved_hidden.view(B, T_tok, upsample_f + 1, D)
+        downsampled_token_data = token_interleaved_reshaped[:, :, 0, :].contiguous().view(B, T_tok, D) * downsampled_token_mask # [B, T_tok, D]
+        logging.info(f"[cos2.train.query_based_downsampling] downsampled_token_data: {downsampled_token_data.shape} downsampled_token_mask: {downsampled_token_mask.shape}")
+        return downsampled_token_data, downsampled_token_mask
+
+    def _precompute_query_based_upsampling_for_streaming(self, token, prompt_token, upsample_factor, device):
+        """Precompute query-based upsampling for entire sequence before streaming.
+        
+        This function processes the full token sequence with global self-attention
+        to obtain rich contextual embeddings, which are then used during chunked streaming.
+        
+        Args:
+            token: [B, T_tok] full token sequence
+            prompt_token: [B, Tp] prompt tokens or empty tensor
+            upsample_factor: upsampling factor (typically 2)
+            device: target device
+            
+        Returns:
+            tuple: (precomputed_emb_full, precomputed_prompt_emb)
+                - precomputed_emb_full: [B, T_tok * upsample_factor, D] 
+                - precomputed_prompt_emb: [B, Tp * upsample_factor, D] or None
+        """
+        from cosyvoice.utils.mask import make_pad_mask
+        
+        B = token.shape[0]
+        T_tok = token.shape[1]
+        
+        logging.info(f"[cos2.stream.query_upsample] Precomputing query-based upsampling for full sequence: token={token.shape}")
+        
+        # Process main token sequence
+        token_clamped = torch.clamp(token, min=0)
+        token_len = torch.full((B,), T_tok, dtype=torch.int32, device=device)
+        token_mask = (~make_pad_mask(token_len, T_tok)).float().unsqueeze(-1).to(device)
+        
+        # Embed tokens
+        token_emb = self.cos2_flow.input_embedding(token_clamped) * token_mask  # [B, T_tok, D]
+        logging.info(f"[cos2.stream.query_upsample] token_emb: {token_emb.shape}")
+        
+        # Apply query-based upsampling
+        precomputed_emb_full, _, _ = self._build_speech_hidden_with_query_based_upsampling(
+            token_emb, token_mask, upsample_factor
+        )  # [B, T_tok * upsample_factor, D]
+        
+        logging.info(f"[cos2.stream.query_upsample] precomputed_emb_full: {precomputed_emb_full.shape}")
+        
+        # Process prompt tokens if they exist
+        precomputed_prompt_emb = None
+        if prompt_token is not None and prompt_token.numel() > 0:
+            Tp = prompt_token.shape[1]
+            if Tp > 0:
+                prompt_token_clamped = torch.clamp(prompt_token, min=0)
+                prompt_len = torch.full((B,), Tp, dtype=torch.int32, device=device)
+                prompt_mask = (~make_pad_mask(prompt_len, Tp)).float().unsqueeze(-1).to(device)
+                
+                # Embed prompt tokens
+                prompt_emb = self.cos2_flow.input_embedding(prompt_token_clamped) * prompt_mask  # [B, Tp, D]
+                logging.info(f"[cos2.stream.query_upsample] prompt_emb: {prompt_emb.shape}")
+                
+                # Apply query-based upsampling to prompt
+                precomputed_prompt_emb, _, _ = self._build_speech_hidden_with_query_based_upsampling(
+                    prompt_emb, prompt_mask, upsample_factor
+                )  # [B, Tp * upsample_factor, D]
+                
+                logging.info(f"[cos2.stream.query_upsample] precomputed_prompt_emb: {precomputed_prompt_emb.shape}")
+        
+        return precomputed_emb_full, precomputed_prompt_emb
+    
+    def _apply_query_upsampling_monkey_patch(self, precomputed_emb_full, precomputed_prompt_emb, upsample_factor):
+        """Apply monkey patch to use precomputed query-based upsampled embeddings.
+        
+        Args:
+            precomputed_emb_full: [B, T_upsampled, D] precomputed embeddings for main sequence
+            precomputed_prompt_emb: [B, Tp_upsampled, D] or None, precomputed prompt embeddings
+            upsample_factor: upsampling factor
+            
+        Returns:
+            tuple: (original_input_embedding, wrapped_embedding_module)
+        """
+        original_input_embedding = self.cos2_flow.input_embedding
+        
+        # Create wrapper that returns precomputed embeddings
+        wrapped_embedding_module = self._InputEmbeddingWithPrecomputedQueryUpsampling(
+            original_embedding=original_input_embedding,
+            precomputed_emb_full=precomputed_emb_full,
+            precomputed_prompt_emb=precomputed_prompt_emb,
+            upsample_factor=upsample_factor
+        )
+        
+        # Move to same device as original
+        if hasattr(original_input_embedding, 'weight'):
+            wrapped_embedding_module = wrapped_embedding_module.to(original_input_embedding.weight.device)
+        
+        # Apply monkey patch
+        self.cos2_flow.input_embedding = wrapped_embedding_module
+        
+        logging.info(f"[cos2.stream.query_upsample] Applied monkey patch for precomputed embeddings")
+        
+        return original_input_embedding, wrapped_embedding_module
     
     def _process_non_text_path(self, token_data, token_len_data, text_tokens_data, upsample_f, is_token_emb_sa, is_streaming, device_target):
         """Process non-text training: single pass without text context injection.
@@ -1422,21 +1782,34 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             device_target (torch.device): Target device for computations
             
         Returns:
-            tuple: (hidden, hidden_mask) where:
+            tuple: (hidden, hidden_mask, reconstruction_loss) where:
                 - hidden (torch.Tensor): Encoded hidden states from encoder [B, T_h, 80]
                 - hidden_mask (torch.Tensor): Encoder output masks [B, 1, T_h] or similar
+                - reconstruction_loss (torch.Tensor): Reconstruction loss [1]
         """
         from cosyvoice.utils.mask import make_pad_mask
+
+        reconstruction_loss = None
         
         # upsample entire sequence if needed
-        if upsample_f > 1:
-            token_data = token_data.repeat_interleave(upsample_f, dim=1)
+        if self._use_query_based_upsampling:
+            # before upsampling, token embedding with padding mask
+            token_mask = (~make_pad_mask(token_len_data)).float().unsqueeze(-1).to(device_target)
+            token_data = torch.clamp(token_data, min=0)
+            token_data = self.cos2_flow.input_embedding(token_data) * token_mask
+            # after upsampling, token embedding with padding mask
+            token_data, token_mask, reconstruction_loss = self._build_speech_hidden_with_query_based_upsampling(token_data, token_mask, upsample_f)
+            if reconstruction_loss is not None:
+                logging.info(f"[cos2.train.nonstream] reconstruction_loss: {reconstruction_loss.item()}")
             token_len_data = token_len_data * upsample_f
-        
-        # token embedding with padding mask
-        token_mask = (~make_pad_mask(token_len_data)).float().unsqueeze(-1).to(device_target)
-        token_data = torch.clamp(token_data, min=0)
-        token_data = self.cos2_flow.input_embedding(token_data) * token_mask
+        else:
+            if upsample_f > 1:
+                token_len_data = token_len_data * upsample_f
+                token_data = token_data.repeat_interleave(upsample_f, dim=1)
+            # token embedding with padding mask
+            token_mask = (~make_pad_mask(token_len_data)).float().unsqueeze(-1).to(device_target)
+            token_data = torch.clamp(token_data, min=0)
+            token_data = self.cos2_flow.input_embedding(token_data) * token_mask
 
         if is_token_emb_sa:
             # Use b_idx=0 for non-streaming path (batch-level processing)
@@ -1457,9 +1830,9 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             except Exception:
                 pass
         
-        return hidden, hidden_mask
+        return hidden, hidden_mask, reconstruction_loss
     
-    def _build_condition_and_compute_loss(self, hidden_encoded, hidden_encoded_mask, feat_data, feat_len_data, embedding_data, is_streaming):
+    def _build_condition_and_compute_loss(self, hidden_encoded, hidden_encoded_mask, feat_data, feat_len_data, embedding_data, is_streaming, reconstruction_loss):
         """Build partial cond prefix and compute decoder loss.
         
         Args:
@@ -1469,10 +1842,11 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             feat_len_data (torch.Tensor): Feature length for conditioning [B]
             embedding_data (torch.Tensor): Embedding data for decoder
             is_streaming (bool): Whether in streaming mode
-            
+            reconstruction_loss (torch.Tensor): Reconstruction loss [1] or None
+
         Returns:
             tuple: (loss, lengths) where:
-                - loss (torch.Tensor): Computed decoder loss
+                - loss (torch.Tensor): Computed decoder loss + reconstruction loss * reconstruction_loss_weight
                 - lengths (torch.Tensor): Sequence lengths [B]
         """
         from cosyvoice.utils.mask import make_pad_mask
@@ -1515,6 +1889,9 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             cond=conds_chw,
             streaming=bool(is_streaming),
         )
+
+        if reconstruction_loss is not None:
+            loss += reconstruction_loss * self._reconstruction_loss_weight
         
         return loss, lengths
     
@@ -2100,25 +2477,41 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 - updated_prev_mel: Updated overlap buffer for next iteration
         """
         if not finalize:
+            # NOTE: current self._mel_overlap_len=0, so overlap_effective is always 0
             ol = int(self._mel_overlap_len)
             prev_len = int(prev_mel.shape[-1]) if (prev_mel is not None and prev_mel.numel() > 0) else 0
             new_len = int(new_mel.shape[-1])
             overlap_effective = min(ol, prev_len, new_len)
             
-            if overlap_effective > 0:
+            # Clone to avoid in-place modification
+            mel_for_vocoder = new_mel.clone()
+            
+            if overlap_effective > 0 and prev_mel is not None:
+                # Create fade-in/fade-out windows
+                # Hamming window: [0, ..., 1, ..., 0] with length 2*ol
                 w = torch.tensor(self._mel_window, device=new_mel.device, dtype=new_mel.dtype)
-                w1 = w[:overlap_effective].view(1, 1, overlap_effective)
+                
+                # Fade-in window: takes the rising part of the Hamming window
+                # w1 should go from 0 to 1 over overlap_effective frames
+                w1 = w[ol-overlap_effective:ol].view(1, 1, overlap_effective)
+                
+                # Fade-out window: takes the falling part of the Hamming window
+                # w2 should go from 1 to 0 over overlap_effective frames
                 w2 = w[ol:ol+overlap_effective].view(1, 1, overlap_effective)
-                new_mel[:, :, :overlap_effective] = (
+                
+                # Apply cross-fade: new fades in, prev fades out
+                mel_for_vocoder[:, :, :overlap_effective] = (
                     new_mel[:, :, :overlap_effective] * w1 + prev_mel[:, :, -overlap_effective:] * w2
                 )
             
-            # Keep last overlap_effective frames for next iteration
+            # Keep last ol frames (or all if shorter) for next iteration
+            # Use ol instead of overlap_effective to ensure consistency
             keep = min(ol, new_len)
-            updated_prev_mel = new_mel[:, :, -keep:]
+            updated_prev_mel = mel_for_vocoder[:, :, -keep:].clone()
             self._mel_overlap_dict[uuid] = updated_prev_mel
-            return new_mel, updated_prev_mel
+            return mel_for_vocoder, updated_prev_mel
         else:
+            # No overlap needed for final chunk
             return new_mel, prev_mel
     
     def _finalize_streaming_session(self, uuid, embedding, gt_mel_len):
@@ -2605,17 +2998,17 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             hidden, hidden_mask = self._pad_and_concatenate_batch(hidden_list, mask_list)
         else:
             # Non-streaming training: single pass with (global) text context prefix
-            hidden, hidden_mask = self._process_non_text_path(token, token_len, text_tokens, upsample_factor, self._use_token_emb_sa, streaming, device)
+            hidden, hidden_mask, reconstruction_loss = self._process_non_text_path(token, token_len, text_tokens, upsample_factor, self._use_token_emb_sa, streaming, device)
 
         # Build partial cond prefix and compute decoder loss
-        loss, lengths = self._build_condition_and_compute_loss(hidden, hidden_mask, feat, feat_len, embedding, streaming)
+        loss, lengths = self._build_condition_and_compute_loss(hidden, hidden_mask, feat, feat_len, embedding, streaming, reconstruction_loss)
 
         # Print periodic training-time debug information
         self._print_training_debug_info(loss, streaming, token_len, num_tokens_original, hidden, lengths, upsample_factor, token)
         
         # advance internal step counter after prints
         self._step += 1
-        return {'loss': loss}
+        return {'loss': loss, 'reconstruction_loss': reconstruction_loss}
 
     @torch.inference_mode()
     def token2wav(
@@ -2763,7 +3156,28 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         prompt_feat_hist = prompt_feat
         
         wav_chunks = []
-        original_input_embedding, wrapped_embedding_module = self._apply_input_embedding_sa_monkey_patch()
+        
+        # Compute upsampling factor
+        upsample_factor = self._compute_upsample_factor()
+        
+        # Precompute query-based upsampling for entire sequence if enabled
+        # This provides global information before chunked streaming
+        original_input_embedding = None
+        wrapped_embedding_module = None
+        
+        if self._use_query_based_upsampling:
+            logging.info(f"[cos2.stream] Query-based upsampling enabled, precomputing full sequence...")
+            precomputed_emb_full, precomputed_prompt_emb = self._precompute_query_based_upsampling_for_streaming(
+                token, prompt_token, upsample_factor, device
+            )
+            # Apply monkey patch to use precomputed embeddings
+            original_input_embedding, wrapped_embedding_module = self._apply_query_upsampling_monkey_patch(
+                precomputed_emb_full, precomputed_prompt_emb, upsample_factor
+            )
+            logging.info(f"[cos2.stream] Precomputation complete, starting chunked streaming with precomputed embeddings")
+        elif self._use_token_emb_sa:
+            # Apply token embedding SA monkey patch if enabled (original behavior)
+            original_input_embedding, wrapped_embedding_module = self._apply_input_embedding_sa_monkey_patch()
 
         try:
             # Sliding window iteration
@@ -2771,7 +3185,6 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             assert stride <= block_size, f"stride ({stride}) must be <= block_size ({block_size})"
             
             T = token.size(1)
-            upsample_factor = self._compute_upsample_factor()
             step_i = 0
             for end in range(min(stride, T), T + block_size, stride):
                 finalize = end >= T
@@ -2815,7 +3228,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     )
                 
                 # Update token lengths for self-attention wrapper
-                if wrapped_embedding_module is not None:
+                if self._use_token_emb_sa and wrapped_embedding_module is not None:
                     wrapped_embedding_module.update_token_lengths(
                         token_len=real_len_upsampled,
                         prompt_token_len=prompt_token_len_upsampled
@@ -2857,21 +3270,19 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                         f"prompt_feat_len={prompt_feat_hist.shape[1]}"
                     )
                 
-                # Finalize: clear caches and log stats
-                if finalize:
-                    self._finalize_streaming_session(uuid, embedding, gt_mel_len)
-                
                 # HiFT vocoder with cache
                 speech_24k, source = self._hift.inference(speech_feat=mel_for_vocoder, cache_source=cache_src)
+                wav_chunks.append(speech_24k)
                 
-                # Update cache for next iteration
                 if not finalize:
+                    # Update cache for next iteration
                     cache_src = source[:, :, -self._source_cache_len:]
                     self._hift_cache_dict[uuid] = {'source': cache_src}
                 else:
-                    cache_src = torch.zeros(batch_size, 1, 0, device=device)
-                
-                wav_chunks.append(speech_24k)
+                    # Finalize: clear caches and log stats
+                    self._finalize_streaming_session(uuid, embedding, gt_mel_len)
+                    # Break immediately after finalize to avoid processing beyond sequence
+                    break
         
         finally:
             # Restore original input_embedding
@@ -2950,7 +3361,28 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         prompt_feat_hist = prompt_feat
         
         wav_chunks = []
-        original_input_embedding, wrapped_embedding_module = self._apply_input_embedding_sa_monkey_patch()
+        
+        # Compute upsampling factor
+        upsample_factor = self._compute_upsample_factor()
+        
+        # Precompute query-based upsampling for entire sequence if enabled
+        # This provides global information before chunked streaming
+        original_input_embedding = None
+        wrapped_embedding_module = None
+        
+        if self._use_query_based_upsampling:
+            logging.info(f"[cos2.stream+text] Query-based upsampling enabled, precomputing full sequence...")
+            precomputed_emb_full, precomputed_prompt_emb = self._precompute_query_based_upsampling_for_streaming(
+                token, prompt_token, upsample_factor, device
+            )
+            # Apply monkey patch to use precomputed embeddings
+            original_input_embedding, wrapped_embedding_module = self._apply_query_upsampling_monkey_patch(
+                precomputed_emb_full, precomputed_prompt_emb, upsample_factor
+            )
+            logging.info(f"[cos2.stream+text] Precomputation complete, starting chunked streaming with precomputed embeddings")
+        elif self._use_token_emb_sa:
+            # Apply token embedding SA monkey patch if enabled (original behavior)
+            original_input_embedding, wrapped_embedding_module = self._apply_input_embedding_sa_monkey_patch()
 
         try:
             # Sliding window iteration with text context
@@ -2958,7 +3390,6 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             assert stride <= block_size, f"stride ({stride}) must be <= block_size ({block_size})"
             
             T = token.size(1)
-            upsample_factor = self._compute_upsample_factor()
             step_i = 0
             for end in range(min(stride, T), T + block_size, stride):
                 finalize = end >= T
@@ -3012,7 +3443,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     )
                 
                 # Update token lengths for self-attention wrapper
-                if wrapped_embedding_module is not None:
+                if self._use_token_emb_sa and wrapped_embedding_module is not None:
                     wrapped_embedding_module.update_token_lengths(
                         token_len=real_len_upsampled,
                         prompt_token_len=prompt_token_len_upsampled
@@ -3044,21 +3475,19 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 # Apply mel overlap-and-add
                 mel_for_vocoder, prev_mel = self._apply_mel_overlap(new_mel, prev_mel, finalize, uuid)
                 
-                # Finalize: clear caches and log stats
-                if finalize:
-                    self._finalize_streaming_session(uuid, embedding, gt_mel_len)
-                
                 # HiFT vocoder with cache
                 speech_24k, source = self._hift.inference(speech_feat=mel_for_vocoder, cache_source=cache_src)
+                wav_chunks.append(speech_24k)
                 
                 # Update cache for next iteration
                 if not finalize:
                     cache_src = source[:, :, -self._source_cache_len:]
                     self._hift_cache_dict[uuid] = {'source': cache_src}
                 else:
-                    cache_src = torch.zeros(batch_size, 1, 0, device=device)
-                
-                wav_chunks.append(speech_24k)
+                    # Finalize: clear caches and log stats
+                    self._finalize_streaming_session(uuid, embedding, gt_mel_len)
+                    # Break immediately after finalize to avoid processing beyond sequence
+                    break
         
         finally:
             # Restore original input_embedding
