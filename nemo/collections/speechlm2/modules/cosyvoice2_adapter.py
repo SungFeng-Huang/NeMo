@@ -488,6 +488,10 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         # query-based upsampling
         self._use_query_based_upsampling = bool(configs.get('use_query_based_upsampling', False))
         if self._use_query_based_upsampling:
+            num_layers_config = configs.get('speech_upsampling_num_layers', 1)
+            num_layers = 0 if num_layers_config == '' else int(num_layers_config)
+            assert num_layers > 0, "num_layers must be greater than 0"
+
             attn_type = str(configs.get('speech_upsampling_attn_type', 'selfattn'))
             pos_enc_type = str(configs.get('speech_upsampling_pos_enc_type', 'no_pos'))
 
@@ -508,7 +512,6 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             self.speech_upsampling_query = torch.nn.Parameter(torch.randn(1, self._ctx_dim) * 0.02)
             
             # Create multiple transformer layers for upsampling
-            num_layers = int(configs.get('speech_upsampling_num_layers', 1))
             self.speech_upsampling_transformer = torch.nn.ModuleList([
                 TransformerEncoderLayer(
                     size=self._ctx_dim,
@@ -539,38 +542,94 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             self.speech_upsampling_downsample_mask_query = torch.nn.Parameter(torch.randn(1, self._ctx_dim) * 0.02)
 
             # Create multiple transformer layers for downsampling
-            num_downsample_layers = int(configs.get('speech_upsampling_num_downsample_layers', num_layers))
-            self.speech_upsampling_downsample_transformer = torch.nn.ModuleList([
-                TransformerEncoderLayer(
-                    size=self._ctx_dim,
-                    self_attn=COSYVOICE_ATTENTION_CLASSES[attn_type](
-                        n_head=self._speech_sa_heads,
-                        n_feat=self._ctx_dim,
+            num_downsample_layers_config = configs.get('speech_upsampling_num_downsample_layers', 0)
+            num_downsample_layers = 0 if num_downsample_layers_config == '' else int(num_downsample_layers_config)
+            if num_downsample_layers > 0:
+                self.speech_upsampling_downsample_transformer = torch.nn.ModuleList([
+                    TransformerEncoderLayer(
+                        size=self._ctx_dim,
+                        self_attn=COSYVOICE_ATTENTION_CLASSES[attn_type](
+                            n_head=self._speech_sa_heads,
+                            n_feat=self._ctx_dim,
+                            dropout_rate=self._speech_sa_dropout,
+                        ),
+                        feed_forward=PositionwiseFeedForward(
+                            idim=self._ctx_dim,
+                            hidden_units=self._speech_ffn_hidden,
+                            dropout_rate=self._speech_ffn_dropout,
+                            activation=torch.nn.GELU(),
+                        ),
                         dropout_rate=self._speech_sa_dropout,
-                    ),
-                    feed_forward=PositionwiseFeedForward(
-                        idim=self._ctx_dim,
-                        hidden_units=self._speech_ffn_hidden,
-                        dropout_rate=self._speech_ffn_dropout,
-                        activation=torch.nn.GELU(),
-                    ),
-                    dropout_rate=self._speech_sa_dropout,
-                    normalize_before=True,  # Pre-LN for better stability
-                )
-                for _ in range(num_downsample_layers)
-            ])
-            self._reconstruction_loss_weight = float(configs.get('reconstruction_loss_weight', 1.0))
+                        normalize_before=True,  # Pre-LN for better stability
+                    )
+                    for _ in range(num_downsample_layers)
+                ])
+                self._reconstruction_loss_weight = float(configs.get('reconstruction_loss_weight', 1.0))
+            else:
+                self.speech_upsampling_downsample_transformer = None
+                self._reconstruction_loss_weight = 0.0
+
+            # Guess-ahead downsample mask tensor
+            self.speech_upsampling_guess_ahead_downsample_mask = torch.nn.Parameter(torch.randn(1, self._ctx_dim) * 0.02)
+
+            # Create multiple transformer layers for guess-ahead downsampling
+            num_guess_ahead_downsample_layers_config = configs.get('speech_upsampling_num_guess_ahead_downsample_layers', 0)
+            num_guess_ahead_downsample_layers = 0 if num_guess_ahead_downsample_layers_config == '' else int(num_guess_ahead_downsample_layers_config)
             
+            if num_guess_ahead_downsample_layers > 0:
+                # Parse num_steps_guess_ahead - always convert to list for unified processing
+                num_steps_guess_ahead_config = str(configs.get('num_steps_guess_ahead', 1))
+                delimiter = '-'
+                if delimiter not in num_steps_guess_ahead_config:
+                    # Single value - convert to single-element list
+                    self._num_steps_guess_ahead = [int(num_steps_guess_ahead_config)]
+                else:
+                    # Multiple values - parse as list
+                    self._num_steps_guess_ahead = [int(step) for step in num_steps_guess_ahead_config.split(delimiter)]
+                
+                # Validate all num_steps_guess_ahead values
+                for step in self._num_steps_guess_ahead:
+                    assert step > 0, f"num_steps_guess_ahead must be greater than 0, got {step}"
+                
+                # Create separate transformer for each num_steps_guess_ahead
+                self.speech_upsampling_guess_ahead_downsample_transformer = torch.nn.ModuleList([
+                    torch.nn.ModuleList([
+                        TransformerEncoderLayer(
+                            size=self._ctx_dim,
+                            self_attn=COSYVOICE_ATTENTION_CLASSES[attn_type](
+                                n_head=self._speech_sa_heads,
+                                n_feat=self._ctx_dim,
+                                dropout_rate=self._speech_sa_dropout,
+                            ),
+                            feed_forward=PositionwiseFeedForward(
+                                idim=self._ctx_dim,
+                                hidden_units=self._speech_ffn_hidden,
+                                dropout_rate=self._speech_ffn_dropout,
+                                activation=torch.nn.GELU(),
+                            ),
+                            dropout_rate=self._speech_sa_dropout,
+                            normalize_before=True,  # Pre-LN for better stability
+                        )
+                        for _ in range(num_guess_ahead_downsample_layers)
+                    ])
+                    for _ in range(len(self._num_steps_guess_ahead))
+                ])
+                self._guess_ahead_downsample_loss_weight = float(configs.get('guess_ahead_downsample_loss_weight', 1.0))
+            else:
+                self.speech_upsampling_guess_ahead_downsample_transformer = None
+                self._guess_ahead_downsample_loss_weight = 0.0
+
             logging.info(
                 f"[cos2.init] Query-based upsampling transformer initialized with "
                 f"attn_type={attn_type}, pos_enc_type={pos_enc_type}, "
                 f"num_layers={num_layers}, num_downsample_layers={num_downsample_layers}, reconstruction_loss_weight={self._reconstruction_loss_weight}"
             )
+
+
         self._use_query_based_speech_sa = bool(configs.get('use_query_based_speech_sa', False))
         if self._use_query_based_speech_sa:
             self.speech_sa_query = torch.nn.Parameter(torch.randn(1, self._ctx_dim) * 0.02)
             # use self.speech_sa to compute the query-based speech self-attention
-
 
 
         self._cos2_sr = int(configs.get("sample_rate", self.DEFAULT_COSYVOICE2_SAMPLE_RATE)) if isinstance(configs, dict) else self.DEFAULT_COSYVOICE2_SAMPLE_RATE
@@ -987,13 +1046,17 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             block_size = 2  # safety fallback
         return block_size
 
+    @property
+    def _token_mel_ratio(self):
+        return float(getattr(self.cos2_flow, 'token_mel_ratio', self.DEFAULT_TOKEN_MEL_RATIO))
+
     def _compute_upsample_factor(self):
         """Compute upsampling factor for token alignment.
         
         Returns:
             upsample_factor (int): Upsampling factor (typically 2)
         """
-        token_mel_ratio = float(getattr(self.cos2_flow, 'token_mel_ratio', self.DEFAULT_TOKEN_MEL_RATIO))
+        token_mel_ratio = self._token_mel_ratio
         enc_up = self.ENCODER_UPSAMPLE_FACTOR
         upsample_factor = max(1, int(round(token_mel_ratio / enc_up)))
         return upsample_factor
@@ -1551,6 +1614,9 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
 
     def _build_speech_hidden_with_query_based_upsampling(self, token_data, token_mask, upsample_f):
         """Build speech hidden with query-based upsampling.
+
+        Input interleaved sequence: emb_{1} q_{1,1} q_{1,2} emb_{2} q_{2,1} q_{2,2} ... emb_{T_tok} q_{T_tok,1} q_{T_tok,2}
+        Target: q-former-based upsampled token data
         
         Args:
             token_data (torch.Tensor): Token data for conditioning [B, T_tok, D]
@@ -1608,7 +1674,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         logging.info(f"[cos2.train.query_based_upsampling] upsampled_token_data: {upsampled_token_data.shape} upsampled_token_mask: {upsampled_token_mask.shape}")
 
         reconstruction_loss = None
-        if len(self.speech_upsampling_downsample_transformer) > 0:
+        if self.speech_upsampling_downsample_transformer is not None:
             reconstructed_token_data, _ = self._build_speech_hidden_with_query_based_downsampling(
                 upsampled_token_data, token_mask, upsample_f
             )  # [B, T_tok, D]
@@ -1617,10 +1683,48 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             reconstruction_loss = F.mse_loss(token_data, reconstructed_token_data)
             logging.info(f"[cos2.train.query_based_upsampling] reconstruction_loss: {reconstruction_loss}")
 
-        return upsampled_token_data, upsampled_token_mask, reconstruction_loss
+        guess_ahead_downsample_loss = None
+        if self.speech_upsampling_guess_ahead_downsample_transformer is not None:
+            # Process guess-ahead downsample for each num_steps_guess_ahead value
+            from cosyvoice.utils.mask import make_pad_mask
+            device = token_data.device
+            token_len = token_mask.sum(dim=1).squeeze(-1).int()
+            
+            guess_ahead_downsample_losses = []
+            for idx, num_steps_guess_ahead in enumerate(self._num_steps_guess_ahead):
+                # Create mask for current num_steps_guess_ahead (ignore the last num_steps_guess_ahead tokens)
+                guess_ahead_downsample_mask_len = token_len - num_steps_guess_ahead
+                guess_ahead_downsample_mask_len = torch.clamp(guess_ahead_downsample_mask_len, min=0)
+                guess_ahead_downsample_mask_mask = (~make_pad_mask(guess_ahead_downsample_mask_len, T_tok)).float().unsqueeze(-1).to(device)
+                
+                # Get corresponding transformer for this num_steps_guess_ahead
+                transformer = self.speech_upsampling_guess_ahead_downsample_transformer[idx]
+                
+                guess_ahead_downsampled_token_data, _ = self._build_speech_hidden_with_guess_ahead_downsampling(
+                    upsampled_token_data, guess_ahead_downsample_mask_mask, upsample_f, 
+                    num_steps_guess_ahead, transformer
+                )  # [B, T_tok, D]
+                logging.info(f"[cos2.train.query_based_upsampling] num_steps_guess_ahead={num_steps_guess_ahead}, guess_ahead_downsampled_token_data: {guess_ahead_downsampled_token_data.shape}")
+                
+                # Calculate guess-ahead downsample loss for current num_steps_guess_ahead
+                guess_ahead_downsampled_token_data_shifted = guess_ahead_downsampled_token_data[:, :-num_steps_guess_ahead, :]
+                guess_ahead_downsampled_target = token_data * guess_ahead_downsample_mask_mask
+                guess_ahead_downsampled_target_shifted = guess_ahead_downsampled_target[:, num_steps_guess_ahead:, :]
+                current_loss = F.mse_loss(guess_ahead_downsampled_target_shifted, guess_ahead_downsampled_token_data_shifted)
+                guess_ahead_downsample_losses.append(current_loss)
+                logging.info(f"[cos2.train.query_based_upsampling] num_steps_guess_ahead={num_steps_guess_ahead}, guess_ahead_downsample_loss: {current_loss}")
+            
+            # Average all guess-ahead downsample losses
+            guess_ahead_downsample_loss = sum(guess_ahead_downsample_losses) / len(guess_ahead_downsample_losses)
+            logging.info(f"[cos2.train.query_based_upsampling] averaged guess_ahead_downsample_loss: {guess_ahead_downsample_loss}")
+
+        return upsampled_token_data, upsampled_token_mask, reconstruction_loss, guess_ahead_downsample_loss
 
     def _build_speech_hidden_with_query_based_downsampling(self, upsampled_token_data, token_mask, upsample_f):
         """Build speech hidden with query-based downsampling.
+
+        Input interleaved sequence: m_{1} q_{1,1} q_{1,2} m_{2} q_{2,1} q_{2,2} ... m_{T_tok} q_{T_tok,1} q_{T_tok,2}
+        Target: masked-predicting token_data
         
         Args:
             token_data (torch.Tensor): Token data for conditioning [B, T_tok*upsample_f, D]
@@ -1675,6 +1779,73 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         logging.info(f"[cos2.train.query_based_downsampling] downsampled_token_data: {downsampled_token_data.shape} downsampled_token_mask: {downsampled_token_mask.shape}")
         return downsampled_token_data, downsampled_token_mask
 
+    def _build_speech_hidden_with_guess_ahead_downsampling(self, upsampled_token_data, guess_ahead_downsample_mask_mask, upsample_f, 
+                                                            num_steps_guess_ahead, transformer):
+        """Build speech hidden with guess-ahead downsampling.
+
+        Guess-ahead downsampling is a technique that predicts the next few tokens in the sequence
+        using the current tokens and the guess-ahead downsample mask.
+
+        Input interleaved sequence: q_{1,1} q_{1,2} m_{t+1} q_{2,1} q_{2,2} m_{t+2} ... q_{T_tok-t,1} q_{T_tok-t,2} m_{T_tok} [... q_{T_tok-1,1} q_{T_tok-1,2} m_{T_tok+t-1} q_{T_tok,1} q_{T_tok,2} m_{T_tok+t}]
+        Target: t-step ahead masked-predicting token_data, deal with masking to ommit unused part and prevent shorter then t sequence
+        
+        Args:
+            upsampled_token_data (torch.Tensor): Upsampled token data [B, T_tok*upsample_f, D]
+            guess_ahead_downsample_mask_mask (torch.Tensor): Guess-ahead downsample mask mask [B, T_tok - num_steps_guess_ahead, 1]
+            upsample_f (int): Upsampling factor used for token alignment
+            num_steps_guess_ahead (int): Number of steps to guess ahead for this specific transformer
+            transformer (torch.nn.ModuleList): Transformer layers for this specific num_steps_guess_ahead
+
+        Returns:
+            tuple: (downsampled_token_data, downsampled_token_mask)
+                - downsampled_token_data: [B, T_tok, D]
+                - downsampled_token_mask: [B, T_tok, 1]
+        """
+        logging.info(f"[cos2.train.guess_ahead_downsampling] upsample_f: {upsample_f}")
+        B, T_tok_upsampled, D = upsampled_token_data.shape
+        T_tok = T_tok_upsampled // upsample_f
+        assert D == self.speech_upsampling_guess_ahead_downsample_mask.shape[1], "Dimension mismatch between token_data and speech_upsampling_guess_ahead_downsample_mask"
+        guess_ahead_downsample_mask = self.speech_upsampling_guess_ahead_downsample_mask.unsqueeze(0).unsqueeze(0).repeat(B, T_tok, 1, 1) # [B, T_tok, 1, D]
+        
+        # stack guess_ahead_downsample_mask and token_data along the second dimension to make interleaved sequence
+        logging.info(f"[cos2.train.guess_ahead_downsampling] upsampled_token_data: {upsampled_token_data.shape} guess_ahead_downsample_mask: {guess_ahead_downsample_mask.shape}")
+        token_data = upsampled_token_data.view(B, T_tok, upsample_f, D).contiguous()
+        token_concat_interleaved = torch.cat([token_data, guess_ahead_downsample_mask], dim=2).view(B, T_tok * (upsample_f + 1), D).contiguous() # [B, T_tok * (upsample_f + 1), D]
+
+        logging.info(f"[cos2.train.guess_ahead_downsampling] token_concat_interleaved: {token_concat_interleaved.shape}")
+
+        # Prepare mask for TransformerEncoderLayer
+        # Original mask: [B, T_tok, 1], need to expand to [B, T_tok*(downsample_f+1), 1]
+        sa_mask_expanded = guess_ahead_downsample_mask_mask.repeat_interleave(upsample_f + 1, dim=1)  # [B, T_tok*(upsample_f+1), 1]
+        sa_mask = sa_mask_expanded.transpose(1, 2)  # [B, 1, T_tok*(upsample_f+1)]
+
+        logging.info(f"[cos2.train.guess_ahead_downsampling] sa_mask: {sa_mask.shape}")
+
+        # Use TransformerEncoderLayer (includes self-attention + layer norm + FFN)
+        # Generate positional encoding using the configured module
+
+        _, pos_emb = self.speech_upsampling_pos_enc(token_concat_interleaved)
+        mask_pad = torch.ones((0, 0, 0), dtype=torch.bool, device=token_concat_interleaved.device)
+
+        # Apply multiple transformer layers
+        token_interleaved_hidden = token_concat_interleaved
+        for layer_idx, transformer_layer in enumerate(transformer):
+            token_interleaved_hidden, _, _, _ = transformer_layer(
+                x=token_interleaved_hidden,
+                mask=sa_mask,
+                pos_emb=pos_emb,
+                mask_pad=mask_pad,
+            )
+            logging.info(f"[cos2.train.guess_ahead_downsampling] num_steps_guess_ahead={num_steps_guess_ahead}, After layer {layer_idx}: {token_interleaved_hidden.shape}")
+
+        logging.info(f"[cos2.train.guess_ahead_downsampling] token_interleaved_hidden: {token_interleaved_hidden.shape}")
+        downsampled_token_mask = guess_ahead_downsample_mask_mask
+        # Reshape to extract query positions: [B, T_tok, (upsample_f+1), D] -> extract last upsample_f positions
+        token_interleaved_reshaped = token_interleaved_hidden.view(B, T_tok, upsample_f + 1, D)
+        downsampled_token_data = token_interleaved_reshaped[:, :, -1, :].contiguous().view(B, T_tok, D) * downsampled_token_mask # [B, T_tok, D]
+        logging.info(f"[cos2.train.guess_ahead_downsampling] downsampled_token_data: {downsampled_token_data.shape} downsampled_token_mask: {downsampled_token_mask.shape}")
+        return downsampled_token_data, downsampled_token_mask
+
     def _precompute_query_based_upsampling_for_streaming(self, token, prompt_token, upsample_factor, device):
         """Precompute query-based upsampling for entire sequence before streaming.
         
@@ -1709,7 +1880,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         logging.info(f"[cos2.stream.query_upsample] token_emb: {token_emb.shape}")
         
         # Apply query-based upsampling
-        precomputed_emb_full, _, _ = self._build_speech_hidden_with_query_based_upsampling(
+        precomputed_emb_full, _, _, _ = self._build_speech_hidden_with_query_based_upsampling(
             token_emb, token_mask, upsample_factor
         )  # [B, T_tok * upsample_factor, D]
         
@@ -1729,7 +1900,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 logging.info(f"[cos2.stream.query_upsample] prompt_emb: {prompt_emb.shape}")
                 
                 # Apply query-based upsampling to prompt
-                precomputed_prompt_emb, _, _ = self._build_speech_hidden_with_query_based_upsampling(
+                precomputed_prompt_emb, _, _, _ = self._build_speech_hidden_with_query_based_upsampling(
                     prompt_emb, prompt_mask, upsample_factor
                 )  # [B, Tp * upsample_factor, D]
                 
@@ -1769,7 +1940,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         
         return original_input_embedding, wrapped_embedding_module
     
-    def _process_non_text_path(self, token_data, token_len_data, text_tokens_data, upsample_f, is_token_emb_sa, is_streaming, device_target):
+    def _process_non_text_path(self, token_data, token_len_data, text_tokens_data, upsample_f, is_token_emb_sa, is_streaming, device_target, num_decoding_left_chunks):
         """Process non-text training: single pass without text context injection.
         
         Args:
@@ -1780,16 +1951,19 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             is_token_emb_sa (bool): Whether to use token embedding self-attention
             is_streaming (bool): Whether in streaming mode
             device_target (torch.device): Target device for computations
-            
+            num_decoding_left_chunks (int): Number of left chunks for decoding
+
         Returns:
             tuple: (hidden, hidden_mask, reconstruction_loss) where:
                 - hidden (torch.Tensor): Encoded hidden states from encoder [B, T_h, 80]
-                - hidden_mask (torch.Tensor): Encoder output masks [B, 1, T_h] or similar
+                - hidden_mask (torch.Tensor): Encoder output padding masks [B, 1, T_h]
                 - reconstruction_loss (torch.Tensor): Reconstruction loss [1]
         """
         from cosyvoice.utils.mask import make_pad_mask
 
         reconstruction_loss = None
+        guess_ahead_downsample_loss = None
+        chunked_training = False
         
         # upsample entire sequence if needed
         if self._use_query_based_upsampling:
@@ -1798,9 +1972,11 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             token_data = torch.clamp(token_data, min=0)
             token_data = self.cos2_flow.input_embedding(token_data) * token_mask
             # after upsampling, token embedding with padding mask
-            token_data, token_mask, reconstruction_loss = self._build_speech_hidden_with_query_based_upsampling(token_data, token_mask, upsample_f)
+            token_data, token_mask, reconstruction_loss, guess_ahead_downsample_loss = self._build_speech_hidden_with_query_based_upsampling(token_data, token_mask, upsample_f)
             if reconstruction_loss is not None:
                 logging.info(f"[cos2.train.nonstream] reconstruction_loss: {reconstruction_loss.item()}")
+            if guess_ahead_downsample_loss is not None:
+                logging.info(f"[cos2.train.nonstream] guess_ahead_downsample_loss: {guess_ahead_downsample_loss.item()}")
             token_len_data = token_len_data * upsample_f
         else:
             if upsample_f > 1:
@@ -1811,12 +1987,15 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             token_data = torch.clamp(token_data, min=0)
             token_data = self.cos2_flow.input_embedding(token_data) * token_mask
 
-        if is_token_emb_sa:
-            # Use b_idx=0 for non-streaming path (batch-level processing)
-            token_data = self._build_speech_hidden_with_non_causal_attention(token_data, token_len_data, b_idx=0)
+            # NOTE: token_emb_sa currently not used with query-based upsampling
+            if is_token_emb_sa:
+                # Use b_idx=0 for non-streaming path (batch-level processing)
+                token_data = self._build_speech_hidden_with_non_causal_attention(token_data, token_len_data, b_idx=0)
         
         # Non-streaming: strictly no context injection (pre_lookahead disabled in training)
-        hidden, hidden_mask = self.cos2_flow.encoder(token_data, token_len_data, streaming=is_streaming)
+        # is_streaming is True: use chunked-streaming training
+        # is_streaming is False: use non-causal full-mask training
+        hidden, hidden_mask = self.cos2_flow.encoder(token_data, token_len_data, streaming=is_streaming, num_decoding_left_chunks=num_decoding_left_chunks)
         hidden = self.cos2_flow.encoder_proj(hidden)  # [B, T_h, 80]
         
         # Lightweight debug: confirm non-streaming path does not use context
@@ -1830,9 +2009,9 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             except Exception:
                 pass
         
-        return hidden, hidden_mask, reconstruction_loss
+        return hidden, hidden_mask, reconstruction_loss, guess_ahead_downsample_loss
     
-    def _build_condition_and_compute_loss(self, hidden_encoded, hidden_encoded_mask, feat_data, feat_len_data, embedding_data, is_streaming, reconstruction_loss):
+    def _build_condition_and_compute_loss(self, hidden_encoded, hidden_encoded_mask, feat_data, feat_len_data, embedding_data, is_streaming, reconstruction_loss, guess_ahead_downsample_loss):
         """Build partial cond prefix and compute decoder loss.
         
         Args:
@@ -1843,6 +2022,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             embedding_data (torch.Tensor): Embedding data for decoder
             is_streaming (bool): Whether in streaming mode
             reconstruction_loss (torch.Tensor): Reconstruction loss [1] or None
+            guess_ahead_downsample_loss (torch.Tensor): Guess-ahead downsample loss [1] or None
 
         Returns:
             tuple: (loss, lengths) where:
@@ -1867,7 +2047,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             index = random.randint(0, int(0.3 * j))
             conds[i, :index] = feat_data[i, :index]
 
-        # Build mask based on encoder masks -> lengths
+        # Build mask based on encoder padding masks -> lengths
         if isinstance(hidden_encoded_mask, torch.Tensor):  # [B,1,T_h] bool
             lengths = hidden_encoded_mask.sum(dim=-1).squeeze(1)
             mask = (~make_pad_mask(lengths)).to(hidden_encoded)
@@ -1893,6 +2073,9 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         if reconstruction_loss is not None:
             loss += reconstruction_loss * self._reconstruction_loss_weight
         
+        if guess_ahead_downsample_loss is not None:
+            loss += guess_ahead_downsample_loss * self._guess_ahead_downsample_loss_weight
+
         return loss, lengths
     
     def _print_training_debug_info(
@@ -1936,7 +2119,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 ratio_upsampled = (num_hidden_frames_valid / max(num_tokens_upsampled_current, 1)) if num_tokens_upsampled_current > 0 else 0.0
                 ratio_original = (num_hidden_frames_valid / max(num_tokens_original0, 1)) if num_tokens_original0 > 0 else 0.0
                 token_fps = getattr(self.cos2_flow, 'input_frame_rate', 'NA')
-                token_mel_ratio = getattr(self.cos2_flow, 'token_mel_ratio', 'NA')
+                token_mel_ratio = self._token_mel_ratio
                 try:
                     _loss_val = float(loss_val.detach().item())
                 except Exception:
@@ -2291,10 +2474,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         except Exception:
             mem_alloc, mem_reserved = 0, 0
         
-        try:
-            token_mel_ratio_dbg = float(getattr(self.cos2_flow, 'token_mel_ratio', 4.0))
-        except Exception:
-            token_mel_ratio_dbg = 4.0
+        token_mel_ratio_dbg = self._token_mel_ratio
         
         try:
             sum_lens = int(sum(chunk_lengths)) if chunk_lengths and len(chunk_lengths) > 0 else 0
@@ -2917,7 +3097,9 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         text_tokens = batch.get('text_tokens', None) if isinstance(batch, dict) else None
         context_len = int(getattr(self.cos2_flow.encoder.pre_lookahead_layer, 'pre_lookahead_len', 4))
 
-        from cosyvoice.utils.mask import make_pad_mask  # local import after sys.path patch
+        # Determine chunk block size
+        block_size = self._determine_chunk_block_size()
+        num_decoding_left_chunks = int(getattr(self.cos2_flow.decoder.estimator, "num_decoding_left_chunks", -1))
 
         if bool(streaming) and self._use_text_context_train:
             # Streaming-like training: per-sample, per-chunk encode with sliding text window
@@ -2930,9 +3112,6 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 sample_token_ids, sample_token_len, sample_text_token_ids, sample_text_token_len = self._extract_sample_tokens_and_text(
                     batch, batch_idx, text_tokens, num_tokens_original, batch_size, device
                 )
-                
-                # Determine chunk block size
-                block_size = self._determine_chunk_block_size()
                 
                 # Precompute upsampled token and text embeddings
                 token_emb_full, num_tokens_upsampled, text_token_emb_full = self._precompute_token_and_text_embeddings(
@@ -2998,17 +3177,17 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             hidden, hidden_mask = self._pad_and_concatenate_batch(hidden_list, mask_list)
         else:
             # Non-streaming training: single pass with (global) text context prefix
-            hidden, hidden_mask, reconstruction_loss = self._process_non_text_path(token, token_len, text_tokens, upsample_factor, self._use_token_emb_sa, streaming, device)
+            hidden, hidden_mask, reconstruction_loss, guess_ahead_downsample_loss = self._process_non_text_path(token, token_len, text_tokens, upsample_factor, self._use_token_emb_sa, streaming, device, num_decoding_left_chunks)
 
         # Build partial cond prefix and compute decoder loss
-        loss, lengths = self._build_condition_and_compute_loss(hidden, hidden_mask, feat, feat_len, embedding, streaming, reconstruction_loss)
+        loss, lengths = self._build_condition_and_compute_loss(hidden, hidden_mask, feat, feat_len, embedding, streaming, reconstruction_loss, guess_ahead_downsample_loss)
 
         # Print periodic training-time debug information
         self._print_training_debug_info(loss, streaming, token_len, num_tokens_original, hidden, lengths, upsample_factor, token)
         
         # advance internal step counter after prints
         self._step += 1
-        return {'loss': loss, 'reconstruction_loss': reconstruction_loss}
+        return {'loss': loss, 'reconstruction_loss': reconstruction_loss, 'guess_ahead_downsample_loss': guess_ahead_downsample_loss}
 
     @torch.inference_mode()
     def token2wav(
@@ -3202,7 +3381,12 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 real_len = token_win.shape[1]
                 
                 # Build prompt history from past tokens and previous mel
-                prompt_token_hist = token[:, :start] if start > 0 else prompt_token
+                # prompt_token + all tokens before start
+                prompt_token_hist = (
+                    torch.cat([prompt_token, token[:, :start]], dim=1)
+                    if start > 0 else prompt_token
+                )
+                # prompt_feat + all previous generated mel (progressively appended to prompt_feat_hist)
                 prompt_feat_hist = (
                     torch.cat([prompt_feat_hist, prev_mel.transpose(1, 2)], dim=1)
                     if (prev_mel is not None and prev_mel.numel() > 0)
@@ -3406,8 +3590,13 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 token_win = token[:, start:end]
                 real_len = token_win.shape[1]
                 
-                # Build prompt history
-                prompt_token_hist = token[:, :start] if start > 0 else prompt_token
+                # Build prompt history from past tokens and previous mel
+                # prompt_token + all tokens before start
+                prompt_token_hist = (
+                    torch.cat([prompt_token, token[:, :start]], dim=1)
+                    if start > 0 else prompt_token
+                )
+                # prompt_feat + all previous generated mel (progressively appended to prompt_feat_hist)
                 prompt_feat_hist = (
                     torch.cat([prompt_feat_hist, prev_mel.transpose(1, 2)], dim=1)
                     if (prev_mel is not None and prev_mel.numel() > 0)
@@ -3509,9 +3698,20 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         prompt_token: torch.Tensor = torch.zeros(1, 0, dtype=torch.int64),
         prompt_feat: torch.Tensor = torch.zeros(1, 0, 80),
         embedding: torch.Tensor = torch.zeros(1, 192),
+        return_mel: bool = False,
     ) -> torch.Tensor:
         """Non-streaming inference: run CosyVoice2 flow in finalize=True once and vocoder once.
         Returns wav at 22050 Hz for direct comparison with streaming path.
+
+        Args:
+            token: [B, T_tok]
+            prompt_token: [B, Tp]
+            prompt_feat: [B, Tp_mel, 80]
+            embedding: [B, 192]
+            return_mel: bool, whether to return mel
+        Returns:
+            wav22050: [B, T_wav]
+            mel: [B, 80, T_mel] if return_mel is True
         """
         # Debug: log speaker embedding stats
         try:
@@ -3539,6 +3739,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         
         # Process each sample in batch
         wavs = []
+        mels = []
         upsample_factor = self._compute_upsample_factor()
         
         for batch_idx in range(batch_size):
@@ -3562,6 +3763,11 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             speech_24k, _ = self._hift.inference(speech_feat=sample_mel)
             wav = self._resample_to_output(speech_24k)
             wavs.append(wav)
+            if return_mel:
+                mels.append(sample_mel)
         
-        return torch.cat(wavs, dim=0)
+        if return_mel:
+            return torch.cat(wavs, dim=0), torch.cat(mels, dim=0)
+        else:
+            return torch.cat(wavs, dim=0)
 

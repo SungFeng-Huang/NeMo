@@ -645,11 +645,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         loss_dict = self.audio_decoder.flow(inputs, self.device)
         loss = loss_dict['loss']
         reconstruction_loss = loss_dict['reconstruction_loss'] if loss_dict['reconstruction_loss'] is not None else 0.0
+        guess_ahead_downsample_loss = loss_dict['guess_ahead_downsample_loss'] if loss_dict['guess_ahead_downsample_loss'] is not None else 0.0
 
         # 记录训练指标
         ans = {
             "loss": loss,  # Flow matching损失
             "reconstruction_loss": reconstruction_loss,  # Reconstruction loss
+            "guess_ahead_downsample_loss": guess_ahead_downsample_loss,  # Guess-ahead downsample loss
             "learning_rate": (
                 torch.as_tensor(self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0)
             ),
@@ -736,7 +738,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             inputs = self.prepare_inputs(dataset_batch)
 
             batch = inputs['speech_token'].shape[0]
-
+            speech_token_len = inputs['speech_token_len']
 
             this_uuid = str(uuid.uuid4())
 
@@ -746,8 +748,44 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             # debug: print speaker embedding during validation/inference
             self._debug_log_spk(spk_emb, "validation:spk_emb")
 
+            use_history_prompt = bool(getattr(self.cfg, 'use_history_prompt', False))
 
             with fp32_precision(), torch.no_grad():
+                # Always run offline (non-streaming) inference for comparison
+                if hasattr(self.audio_decoder, 'offline_inference'):
+                    response_speech_offline = self.audio_decoder.offline_inference(
+                        inputs['speech_token'],
+                        prompt_token=flow_prompt_speech_token.to(self.device),
+                        prompt_feat=prompt_speech_feat.to(self.device),
+                        embedding=spk_emb,
+                        return_mel=use_history_prompt,
+                    )
+                    if use_history_prompt:
+                        response_speech_offline, response_mel_offline = response_speech_offline
+                        response_mel_offline = response_mel_offline.transpose(1, 2).contiguous()
+                        print(f"response_mel_offline shape: {response_mel_offline.shape}")
+                        print(f"speech_token_len: {speech_token_len}")
+                        print(f"self.audio_decoder._token_mel_ratio: {self.audio_decoder._token_mel_ratio}")
+
+                        response_mel_offline_len = (speech_token_len * self.audio_decoder._token_mel_ratio).int()
+                        chunk_size = self.audio_decoder._determine_chunk_block_size()
+                        mel_chunk_size = int(chunk_size * self.audio_decoder._token_mel_ratio)
+
+                        last_chunk_mel = torch.cat([response_mel_offline[i, response_mel_offline_len[i]-mel_chunk_size:response_mel_offline_len[i]].unsqueeze(0) for i in range(batch)], dim=0)
+                        last_chunk_token = torch.cat([inputs['speech_token'][i, speech_token_len[i]-chunk_size:speech_token_len[i]].unsqueeze(0) for i in range(batch)], dim=0)
+                        
+                        shuffled_idx = torch.randperm(response_mel_offline.shape[0])
+                        
+                        prompt_speech_feat = torch.cat([prompt_speech_feat, last_chunk_mel[shuffled_idx]], dim=1)
+                        flow_prompt_speech_token = torch.cat([flow_prompt_speech_token, last_chunk_token[shuffled_idx]], dim=1)
+                else:
+                    # fallback to non-streaming token2wav
+                    response_speech_offline, _ = self.audio_decoder.token2wav(inputs['speech_token'],
+                                                                               uuid=this_uuid,
+                                                                               prompt_token=flow_prompt_speech_token.to(self.device),
+                                                                               prompt_feat=prompt_speech_feat.to(self.device),
+                                                                               embedding=spk_emb,
+                                                                               finalize=True)
 
                 # Run both streaming and non-streaming inference for AB comparison
                 use_stream = bool(getattr(self.cfg, 'streaming_infer', False)) and hasattr(self.audio_decoder, 'stream_inference')
@@ -805,22 +843,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                             embedding=spk_emb,
                             gt_mel_len=inputs['speech_feat_len'],
                         )
-                # Always run offline (non-streaming) inference for comparison
-                if hasattr(self.audio_decoder, 'offline_inference'):
-                    response_speech_offline = self.audio_decoder.offline_inference(
-                        inputs['speech_token'],
-                        prompt_token=flow_prompt_speech_token.to(self.device),
-                        prompt_feat=prompt_speech_feat.to(self.device),
-                        embedding=spk_emb,
-                    )
-                else:
-                    # fallback to non-streaming token2wav
-                    response_speech_offline, _ = self.audio_decoder.token2wav(inputs['speech_token'],
-                                                                               uuid=this_uuid,
-                                                                               prompt_token=flow_prompt_speech_token.to(self.device),
-                                                                               prompt_feat=prompt_speech_feat.to(self.device),
-                                                                               embedding=spk_emb,
-                                                                               finalize=True)
 
 
                 # Save both versions for AB debugging
