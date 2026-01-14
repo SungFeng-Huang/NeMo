@@ -631,6 +631,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             self.speech_sa_query = torch.nn.Parameter(torch.randn(1, self._ctx_dim) * 0.02)
             # use self.speech_sa to compute the query-based speech self-attention
 
+        self._use_stride_delayed_cond = bool(configs.get('use_stride_delayed_cond', False))
 
         self._cos2_sr = int(configs.get("sample_rate", self.DEFAULT_COSYVOICE2_SAMPLE_RATE)) if isinstance(configs, dict) else self.DEFAULT_COSYVOICE2_SAMPLE_RATE
         # Lazy-initialized vocoder (HiFT)
@@ -1049,6 +1050,23 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
     @property
     def _token_mel_ratio(self):
         return float(getattr(self.cos2_flow, 'token_mel_ratio', self.DEFAULT_TOKEN_MEL_RATIO))
+
+    @property
+    def _block_size(self):
+        return int(self._determine_chunk_block_size())
+
+    @property
+    def _stride(self):
+        stride = int(self._stream_stride) if getattr(self, "_stream_stride", 0) and int(self._stream_stride) > 0 else self._block_size
+        return stride
+
+    @property
+    def _mel_stride(self):
+        return int(self._token_mel_ratio * self._stride)
+
+    @property
+    def _num_decoding_left_chunks(self):
+        return int(getattr(self.cos2_flow, 'num_decoding_left_chunks', -1))
 
     def _compute_upsample_factor(self):
         """Compute upsampling factor for token alignment.
@@ -2044,8 +2062,12 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         for i, j in enumerate(feat_len_data):
             if random.random() < 0.5:
                 continue
-            index = random.randint(0, int(0.3 * j))
-            conds[i, :index] = feat_data[i, :index]
+            j = int(j.item())
+            if self._use_stride_delayed_cond:
+                conds[i, self._mel_stride:j] = feat_data[i, :j-self._mel_stride]
+            else:
+                index = random.randint(0, int(0.3 * j))
+                conds[i, :index] = feat_data[i, :index]
 
         # Build mask based on encoder padding masks -> lengths
         if isinstance(hidden_encoded_mask, torch.Tensor):  # [B,1,T_h] bool
@@ -2985,6 +3007,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 )
             
             # Run flow inference
+            stride_delay = None if not self._use_stride_delayed_cond else torch.zeros(token.shape[0], self._mel_stride, self.MEL_DIM, device=device)
             inference_kwargs = {
                 'token': token,
                 'token_len': torch.tensor([token_len], dtype=torch.int32, device=device),
@@ -2995,6 +3018,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 'embedding': embedding,
                 'streaming': streaming,
                 'finalize': finalize,
+                'stride_delay': stride_delay,
             }
             
             # Add text context if provided
@@ -3098,7 +3122,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
         context_len = int(getattr(self.cos2_flow.encoder.pre_lookahead_layer, 'pre_lookahead_len', 4))
 
         # Determine chunk block size
-        block_size = self._determine_chunk_block_size()
+        block_size = self._block_size
         num_decoding_left_chunks = int(getattr(self.cos2_flow.decoder.estimator, "num_decoding_left_chunks", -1))
 
         if bool(streaming) and self._use_text_context_train:
@@ -3318,7 +3342,6 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             return self._process_batch_split(token, uuid, args_dict, 'stream_inference')
         
         # Single-sample processing: prepare device and modules
-        block_size = self._determine_chunk_block_size()
         self._ensure_device(device)
         self._lazy_init_hift()
         try:
@@ -3360,12 +3383,12 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
 
         try:
             # Sliding window iteration
-            stride = int(self._stream_stride) if getattr(self, "_stream_stride", 0) and int(self._stream_stride) > 0 else block_size
-            assert stride <= block_size, f"stride ({stride}) must be <= block_size ({block_size})"
+            stride = self._stride
+            assert stride <= self._block_size, f"stride ({stride}) must be <= block_size ({self._block_size})"
             
             T = token.size(1)
             step_i = 0
-            for end in range(min(stride, T), T + block_size, stride):
+            for end in range(min(stride, T), T + self._block_size, stride):
                 finalize = end >= T
 
                 # deal with real pre-lookahead length
@@ -3376,7 +3399,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 else:
                     pre_lookahead_len = 0
                 
-                start = max(0, end - block_size)
+                start = max(0, end - self._block_size)
                 token_win = token[:, start:end+pre_lookahead_len]
                 real_len = token_win.shape[1]
                 
@@ -3400,7 +3423,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 pre_lookahead_len_upsampled = pre_lookahead_len * upsample_factor
                 
                 # Apply fixed window padding if needed
-                token_upsampled = self._apply_fixed_window_padding(token_upsampled, block_size, upsample_factor)
+                token_upsampled = self._apply_fixed_window_padding(token_upsampled, self._block_size, upsample_factor)
                 
                 # Periodic logging
                 if (step_i % max(self._print_per_n_chunk, 1)) == 0:
@@ -3419,6 +3442,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     )
                 
                 # Generate mel via CosyVoice2 flow
+                stride_delay = None if not self._use_stride_delayed_cond else torch.zeros(token.shape[0], self._mel_stride, self.MEL_DIM, device=device)
                 self.cos2_flow.pre_lookahead_len = pre_lookahead_len_upsampled  # mokey-patch: set pre_lookahead_len for flow inference
                 sample_mel, _ = self.cos2_flow.inference(
                     token=token_upsampled,
@@ -3430,6 +3454,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     embedding=embedding,
                     streaming=True,
                     finalize=finalize,
+                    stride_delay=stride_delay,
                 )
                 self.cos2_flow.pre_lookahead_len = context_len  # restore pre_lookahead_len for next iteration
                 
@@ -3528,7 +3553,6 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
             return self._process_batch_split(token, uuid, args_dict, 'stream_inference_with_text')
         
         # Single-sample processing: prepare device and modules
-        block_size = self._determine_chunk_block_size()
         self._ensure_device(device)
         self._lazy_init_hift()
         try:
@@ -3570,12 +3594,12 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
 
         try:
             # Sliding window iteration with text context
-            stride = int(self._stream_stride) if getattr(self, "_stream_stride", 0) and int(self._stream_stride) > 0 else block_size
-            assert stride <= block_size, f"stride ({stride}) must be <= block_size ({block_size})"
+            stride = self._stride
+            assert stride <= self._block_size, f"stride ({stride}) must be <= block_size ({self._block_size})"
             
             T = token.size(1)
             step_i = 0
-            for end in range(min(stride, T), T + block_size, stride):
+            for end in range(min(stride, T), T + self._block_size, stride):
                 finalize = end >= T
                 pre_lookahead_len = context_len
 
@@ -3586,7 +3610,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 # else:
                 #     pre_lookahead_len = 0
                 
-                start = max(0, end - block_size)
+                start = max(0, end - self._block_size)
                 token_win = token[:, start:end]
                 real_len = token_win.shape[1]
                 
@@ -3616,15 +3640,15 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 )
                 
                 # Apply fixed window padding if needed
-                token_upsampled = self._apply_fixed_window_padding(token_upsampled, block_size, upsample_factor)
+                token_upsampled = self._apply_fixed_window_padding(token_upsampled, self._block_size, upsample_factor)
                 
                 pre_lookahead_len_upsampled = pre_lookahead_len * upsample_factor
                 
                 # Periodic logging
                 if (step_i % max(self._print_per_n_chunk, 1)) == 0:
                     ctx_src = 'xattn' if self._use_cross_text_attn else 'prefix'
-                    pad_tok = max(0, int(block_size - real_len)) if self._fixed_window_pad else 0
-                    pad_upsampled = max(0, int(block_size * upsample_factor - real_len_upsampled)) if self._fixed_window_pad else 0
+                    pad_tok = max(0, int(self._block_size - real_len)) if self._fixed_window_pad else 0
+                    pad_upsampled = max(0, int(self._block_size * upsample_factor - real_len_upsampled)) if self._fixed_window_pad else 0
                     logging.info(
                         f"[cos2.stream+text] step={step_i} win=({start},{end}) stride={stride} token_real={real_len} "
                         f"up={upsample_factor} token_upsampled={token_upsampled.shape[1]} pad_tok={pad_tok} pad_upsampled={pad_upsampled} "
@@ -3640,6 +3664,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                 
                 # Generate mel via CosyVoice2 flow with text context
                 self.cos2_flow.pre_lookahead_len = pre_lookahead_len_upsampled  # mokey-patch: set pre_lookahead_len for flow inference
+                stride_delay = None if not self._use_stride_delayed_cond else torch.zeros(token.shape[0], self._mel_stride, self.MEL_DIM, device=device)
                 sample_mel, _ = self.cos2_flow.inference(
                     token=token_upsampled,
                     token_len=torch.tensor([real_len_upsampled], dtype=torch.int32, device=device),
@@ -3652,6 +3677,7 @@ class CosyVoice2AudioDecoder(torch.nn.Module):
                     finalize=finalize,
                     use_text_context=True,
                     text_context=text_ctx,
+                    stride_delay=stride_delay,
                 )
                 self.cos2_flow.pre_lookahead_len = context_len  # restore pre_lookahead_len for next iteration
                 step_i += 1
